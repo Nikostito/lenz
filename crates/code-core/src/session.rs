@@ -295,6 +295,10 @@ pub enum Command {
     SetRelativeLineNumbers(bool),
     /// The caret line's commit, faint after the line's end (author, date and summary); remembered.
     SetInlineBlame(bool),
+    /// macOS-style word motion: Option+Left/Right move by word, and word stops cross the spaces between words; remembered.
+    SetMacWordMotion(bool),
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
+    SetNameLetterSearch(bool),
     SetVimEnabled(bool),
     VimKey(keymap::KeyPress),
     /// Show a project file or folder (project-relative) in the explorer, opening the folders above it.
@@ -647,6 +651,10 @@ pub enum CommandId {
     SoftWrap,
     RelativeLineNumbers,
     VimMode,
+    /// Option+Left/Right move by word (macOS), word stops crossing spaces; remembered, off by default.
+    MacWordMotion,
+    /// Search Everywhere's All tab finds files by letters in order in their name; remembered, off by default.
+    NameLetterSearch,
     /// Pin the enclosing declarations at the top of each pane; remembered.
     StickyScroll,
     /// The path and declarations bar above each pane's text; remembered.
@@ -950,7 +958,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 251] = [
+    pub const ALL: [CommandId; 253] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -971,6 +979,8 @@ impl CommandId {
         Self::SoftWrap,
         Self::RelativeLineNumbers,
         Self::VimMode,
+        Self::MacWordMotion,
+        Self::NameLetterSearch,
         Self::StickyScroll,
         Self::Breadcrumbs,
         Self::FocusBreadcrumbs,
@@ -1375,6 +1385,8 @@ impl CommandId {
             Self::ResolveConflicts => "Resolve Conflicts in Lenz Diff",
             Self::AnnotateBlame => "Annotate with Git Blame",
             Self::InlineBlame => "Inline Blame",
+            Self::MacWordMotion => "macOS Word Motion",
+            Self::NameLetterSearch => "Search Everywhere: Letters in File Names",
             Self::CloseAnnotations => "Close Annotations",
             Self::NarrowAnnotations => "Narrow Annotation Gutter",
             Self::WidenAnnotations => "Widen Annotation Gutter",
@@ -2645,6 +2657,8 @@ impl State {
             CommandId::FileIcons => Some(self.settings.file_icons),
             CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.annotating())),
             CommandId::InlineBlame => Some(self.settings.inline_blame),
+            CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
+            CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
                 let indent = self.project_preferences()?.indent;
                 Some(indent == match id { CommandId::IndentTabs => Some(Indent::Tabs), CommandId::IndentTwoSpaces => Some(Indent::Spaces(2)), CommandId::IndentFourSpaces => Some(Indent::Spaces(4)), _ => None })
@@ -3411,7 +3425,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -4978,6 +4992,16 @@ impl Session {
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
+            Command::SetMacWordMotion(on) => {
+                self.state.settings.mac_word_motion = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetNameLetterSearch(on) => {
+                self.state.settings.name_letter_search = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
             Command::SetInlineBlame(on) => {
                 self.state.settings.inline_blame = on;
                 self.save_settings();
@@ -5446,6 +5470,7 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::MoveCaret(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 if doc.source_meta().image().is_some() && !t.image_source { return Effect::default(); }
                 let s = t.selection().unwrap_or_else(|| {
@@ -5460,8 +5485,8 @@ impl Session {
                     Motion::Right if s.anchor != s.head => s.anchor.max(s.head),
                     Motion::Left if s.head <= range.start && line > 0 => doc.reader_line_range(visible.step(line,-1)).end,
                     Motion::Right if s.head >= range.end && visible.step(line,1) > line => doc.reader_line_range(visible.step(line,1)).start,
-                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion)),
-                    _ => moved(&doc, &visible, s.head, motion),
+                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion, spaces)),
+                    _ => moved(&doc, &visible, s.head, motion, spaces),
                 };
                 let head = if visible.hidden(doc.line_of(head)) { doc.reader_line_range(visible.shown(doc.line_of(head))).end } else { head };
                 t.place_selection(Some(Selection {anchor:head,head}));
@@ -5480,12 +5505,13 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::Extend(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 let s = t.selection().unwrap_or_else(|| {
                     let origin = if wrap_cols.is_none() { doc.reader_line_range(t.top_line).start } else { 0 };
                     Selection { anchor: origin, head: origin }
                 });
-                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion));
+                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion, spaces));
                 let line = doc.line_of(head);
                 // Keep the head on screen as far as the core knows the view: at or below the top line, and below the
                 // sticky lines.
@@ -8814,6 +8840,7 @@ impl Session {
             symbols: if !query.is_empty() && matches!(scope, navigation::Scope::All | navigation::Scope::Symbols) { self.state.index.snapshot() } else { Vec::new() },
             recent,
             actions: if matches!(scope, navigation::Scope::All | navigation::Scope::Actions) { self.actions() } else { Vec::new() },
+            name_letters: self.state.settings.name_letter_search,
         };
         // Recent files are bounded to fifty entries; populate immediately for Ctrl-E followed by Enter.
         if scope == navigation::Scope::Recent {
@@ -10358,6 +10385,10 @@ struct Settings {
     relative_line_numbers: bool,
     /// The caret line's commit shows faintly after the line's end.
     inline_blame: bool,
+    /// Option+Left/Right move by word (macOS) and word stops cross the spaces between words.
+    mac_word_motion: bool,
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order.
+    name_letter_search: bool,
     vim_enabled: bool,
     /// The enclosing declarations stay pinned at the top of each pane.
     sticky_scroll: bool,
@@ -10388,7 +10419,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, inline_blame: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
@@ -10544,7 +10575,8 @@ fn projection_current(state: &State, request: &crate::projection::Request) -> bo
         && state.projection_view(request).is_some()
 }
 
-fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion) -> usize {
+/// `spaces`: word stops cross the spaces between words (macOS Word Motion).
+fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion, spaces: bool) -> usize {
     let line = doc.line_of(head);
     let range = doc.reader_line_range(line);
     let column = |l: usize| {
@@ -10571,8 +10603,8 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
         Motion::Down => range.end,
         Motion::WordLeft if head <= range.start => if line > 0 { doc.reader_line_range(v.step(line, -1)).end } else { 0 },
         Motion::WordRight if head >= range.end => if v.step(line, 1) > line { doc.reader_line_range(v.step(line, 1)).start } else { head },
-        Motion::WordLeft => word_stop(doc, head, true),
-        Motion::WordRight => word_stop(doc, head, false),
+        Motion::WordLeft => word_stop(doc, head, true, spaces),
+        Motion::WordRight => word_stop(doc, head, false, spaces),
         // Home goes to the line's first non-blank character, and from there to its start, as in IntelliJ.
         Motion::LineStart => {
             let text = skip_on(doc, range.start, range.end, |c| c == ' ' || c == '\t');
@@ -10584,21 +10616,21 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
     }
 }
 
-/// The previous (`backward`) or next word stop within the head's line: the far end of the run of word characters or
-/// other symbols beside the head, with the spaces between them crossed too, as macOS's Option+arrows and VS Code's
-/// Ctrl+arrows go: from the end of `width: 80` the stops are `80`, `:` and `width`. At the line's edge the head
-/// stays; spaces running to it end there.
-pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool) -> usize {
+/// The previous (`backward`) or next word stop within the head's line: the far end of the run of spaces, word
+/// characters or other symbols beside the head. With `spaces` (macOS Word Motion) the spaces between words are crossed
+/// too, as macOS's Option+arrows go: from the end of `width: 80` the stops are `80`, `:` and `width`. At the line's
+/// edge the head stays; spaces running to it end there.
+pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool, spaces: bool) -> usize {
     let range = doc.reader_line_range(doc.line_of(head));
     if backward {
         if head <= range.start { return head; }
-        let head = skip_back(doc, head, range.start, char::is_whitespace);
+        let head = if spaces { skip_back(doc, head, range.start, char::is_whitespace) } else { head };
         if head <= range.start { return head; }
         let kind = doc.range(doc.previous_char_boundary(head)..head).and_then(|t| t.chars().next()).map_or(0, word_class);
         skip_back(doc, head, range.start, |c| word_class(c) == kind)
     } else {
         if head >= range.end { return head; }
-        let head = skip_on(doc, head, range.end, char::is_whitespace);
+        let head = if spaces { skip_on(doc, head, range.end, char::is_whitespace) } else { head };
         if head >= range.end { return head; }
         let kind = doc.range(head..doc.next_char_boundary(head)).and_then(|t| t.chars().next()).map_or(0, word_class);
         skip_on(doc, head, range.end, |c| word_class(c) == kind)

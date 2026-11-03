@@ -55,6 +55,8 @@ pub(crate) struct Snapshot {
     pub symbols: Vec<(Arc<str>, Arc<[Indexed]>)>,
     pub recent: Vec<PathBuf>,
     pub actions: Vec<Action>,
+    /// Search Everywhere: Letters in File Names is on.
+    pub name_letters: bool,
 }
 pub(crate) fn rank(snapshot: Snapshot, scope: Scope, query: &str, current: impl Fn() -> bool) -> Option<(Vec<Row>, usize)> {
     rank_with_total(snapshot, scope, query, current, None)
@@ -68,9 +70,10 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
     // The mixed list keeps word-start matches only; a single scope stays fully fuzzy. ponytail: the file count past the
     // ranked cap still includes scattered matches; filter inside project::rank if that total must be exact.
     let loose = |q: &str, text: &str| scope != Scope::All || lenz_content::fuzzy::word_starts(q, text);
-    // Files there also match a query whose characters appear in order in the file name, letters left out
-    // (`i_summary` finds `invoice_summary.csv`): a file name is short, so a scattered match there is not noise.
-    let loose_file = |q: &str, path: &str| loose(q, path) || lenz_content::fuzzy::name_subsequence(q, path);
+    // With Letters in File Names on, files there also match a query whose characters appear in order in the file name,
+    // letters left out (`i_summary` finds `invoice_summary.csv`): a file name is short, so that is not noise.
+    let name_letters = snapshot.name_letters;
+    let loose_file = |q: &str, path: &str| loose(q, path) || name_letters && lenz_content::fuzzy::name_subsequence(q, path);
     if scope == Scope::Recent {
         for (i, path) in snapshot.recent.iter().take(LIMIT).enumerate() {
             if !current() { return None; }
@@ -148,7 +151,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
     fn snapshot() -> Snapshot {
-        Snapshot {root: Some("/project".into()), files: vec![vec![Entry::new("src/NetworkParserEngine.rs"),Entry::new("test/NetworkParserEngine.rs"),Entry::new("src/Other.rs")].into()], symbols: Vec::new(), recent: vec!["/project/src/Other.rs".into()], actions: vec![Action {id: CommandId::SoftWrap,label: "Soft Wrap",disabled: None,on: Some(false),shortcut: None}]}
+        Snapshot {root: Some("/project".into()), files: vec![vec![Entry::new("src/NetworkParserEngine.rs"),Entry::new("test/NetworkParserEngine.rs"),Entry::new("src/Other.rs")].into()], symbols: Vec::new(), recent: vec!["/project/src/Other.rs".into()], actions: vec![Action {id: CommandId::SoftWrap,label: "Soft Wrap",disabled: None,on: Some(false),shortcut: None}], name_letters: false}
     }
     #[test]
     fn filename_subsequence_disambiguates_paths_and_preserves_line_column() {
@@ -177,18 +180,20 @@ mod tests {
         let (rows, count) = rank(snapshot(), Scope::All, "npe", || true).unwrap();
         assert_eq!((rows.len(), count), (2, 2));
         assert_eq!(rank(snapshot(), Scope::Files, "etw", || true).unwrap().0.len(), 2);
-        assert!(rank(snapshot(), Scope::All, "zzz", || true).unwrap().0.is_empty());
+        assert!(rank(snapshot(), Scope::All, "etw", || true).unwrap().0.is_empty());
     }
     #[test]
-    fn everywhere_finds_files_by_letters_in_order_in_their_name() {
-        let snap = || Snapshot {root: Some("/project".into()), files: vec![vec![Entry::new("billing/invoice_summary.csv"), Entry::new("billing/summary.csv"), Entry::new("sums/invoice.csv")].into()], symbols: Vec::new(), recent: Vec::new(), actions: Vec::new()};
-        for query in ["invoice_sum", "i_summary", "invc_smry"] {
-            let (rows, _) = rank(snap(), Scope::All, query, || true).unwrap();
+    fn everywhere_finds_files_by_letters_in_order_in_their_name_when_that_is_on() {
+        let snap = |name_letters| Snapshot {root: Some("/project".into()), files: vec![vec![Entry::new("billing/invoice_summary.csv"), Entry::new("billing/summary.csv"), Entry::new("sums/invoice.csv")].into()], symbols: Vec::new(), recent: Vec::new(), actions: Vec::new(), name_letters};
+        for query in ["i_summary", "invc_smry"] {
+            assert!(rank(snap(false), Scope::All, query, || true).unwrap().0.is_empty(), "off by default: {query}");
+            let (rows, _) = rank(snap(true), Scope::All, query, || true).unwrap();
             assert_eq!(rows.first().map(|r| r.label.as_str()), Some("invoice_summary.csv"), "{query}");
         }
+        assert_eq!(rank(snap(false), Scope::All, "invoice_sum", || true).unwrap().0.first().map(|r| r.label.as_str()), Some("invoice_summary.csv"), "word starts as before");
         // Letters spread over the folders and the name are still only for the Files scope.
-        assert!(rank(snap(), Scope::All, "smivc", || true).unwrap().0.is_empty());
-        assert_eq!(rank(snap(), Scope::Files, "smivc", || true).unwrap().0.len(), 1);
+        assert!(rank(snap(true), Scope::All, "smivc", || true).unwrap().0.is_empty());
+        assert_eq!(rank(snap(true), Scope::Files, "smivc", || true).unwrap().0.len(), 1);
     }
     #[test]
     #[ignore = "release-only ranking and cancellation benchmark"]
@@ -199,7 +204,7 @@ mod tests {
             let name = format!("ReaderSearchPanel{i}");
             Indexed::new(Declaration {kind:DeclKind::Function,name:name.into(),name_range:0..1,range:0..1,first_line:i,last_line:i,depth:0,parent:None},i,0)
         }).collect::<Vec<_>>().into();
-        let make = || Snapshot {root:Some("/project".into()),files:vec![files.clone()],symbols:vec![(Arc::from("symbols.rs"),symbols.clone())],recent:Vec::new(),actions:Vec::new()};
+        let make = || Snapshot {root:Some("/project".into()),files:vec![files.clone()],symbols:vec![(Arc::from("symbols.rs"),symbols.clone())],recent:Vec::new(),actions:Vec::new(),name_letters:false};
         let mut old = Vec::new(); let mut file = Vec::new(); let mut all = Vec::new();
         for trial in 0..12 {
             let start = Instant::now();

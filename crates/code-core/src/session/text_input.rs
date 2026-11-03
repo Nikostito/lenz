@@ -164,12 +164,13 @@ impl Session {
         if self.text_action_disabled(CommandId::Delete).is_some() { return Effect::default(); }
         let Some((tab, expected, ranges)) = self.selection_ranges() else { return Effect::default() };
         let Some(source) = self.state.source(tab) else { return Effect::default() };
+        let spaces = self.state.settings.mac_word_motion;
         // An empty selection takes the neighbouring character (a CRLF pair as one), as a caret alone does.
         let mut removals: Vec<std::ops::Range<usize>> = ranges.into_iter().map(|range| {
             if !range.is_empty() { return range; }
             let at = range.start;
             // Ctrl+Backspace / Ctrl+Delete: to the word stop; at the line's edge, the line break as below.
-            let stop = if word { super::word_stop(source, at, backward) } else { at };
+            let stop = if word { super::word_stop(source, at, backward, spaces) } else { at };
             if stop != at { return stop.min(at)..stop.max(at); }
             if backward {
                 if source.range(at.saturating_sub(2)..at).as_deref() == Some("\r\n") { at - 2..at } else { source.previous_char_boundary(at)..at }

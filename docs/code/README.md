@@ -39,17 +39,16 @@ Folder…**, the recent folders and the files recently opened without a folder; 
 folder or file ([terminal](tui.md)).
 
 Keys (the default IntelliJ keymap; see [Keymaps](#keymaps)): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
-all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (a run of word characters or of symbols,
-spaces going with it: from the end of `width: 80` the stops are `80`, `:` and `width`; Shift selects),
+all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
 Ctrl+Shift+Home/End select to the file's start/end, Home goes to the first non-blank character and then the line start
-while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's,
-and Option+Left/Right move by word, Shift selecting; Back/Forward are Cmd+[ / Cmd+] there), Ctrl+Backspace / Ctrl+Delete delete to the word
+while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's;
+Option+Left/Right are Back/Forward unless **macOS Word Motion** is on, below), Ctrl+Backspace / Ctrl+Delete delete to the word
 stop (also Alt+Backspace / Alt+Delete, macOS's Option), Ctrl+W / Ctrl+Shift+W extend / shrink the selection, Ctrl+- / Ctrl+= collapse /
 expand, Ctrl+Shift+- / Ctrl+Shift+= collapse / expand all, arrows move the cursor, PageUp/PageDown/Home/End scroll,
 Ctrl+P find file (`name:line`), Ctrl+G go to line, Ctrl+F find (Tab: replace, Enter replaces, Alt+A replaces all), F3 / Shift+F3 next / previous match, Ctrl+Shift+F search,
 Alt+Z soft wrap, Ctrl+Shift+. breadcrumbs, Ctrl+Shift+O outline, Ctrl+T declarations, F12 / Ctrl-click definition,
 Alt+F12 peek, Ctrl+Shift+B type definition, Ctrl+Alt+B implementations, Shift+F12 usages, Ctrl+Alt+H call hierarchy,
-Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: Cmd+[ / Cmd+]) back/forward,
+Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: also Cmd+[ / Cmd+]) back/forward,
 F11 toggle bookmark, Ctrl+F11 bookmark key, Shift+F11 bookmarks, Ctrl+Shift+0–9 / Alt+0–9 set / go to a numbered
 bookmark, Ctrl+E recent files, Ctrl+Alt+E recent locations, Ctrl+Shift+V Markdown source/preview, F10 command menu,
 Ctrl+Shift+A find action; Escape closes a menu or cancels a pending definition. Ctrl+Alt+Down / Up add a cursor on the next / previous line in both keymaps (also **Add Cursor Below / Above** in the Edit menu), Alt+J selects the word under the caret and then its next occurrence, and Escape, a click or a caret move returns to one cursor; several selections are edited and undone together ([limits](tui.md)). Tab / Shift+Tab indent and outdent the selected lines with the file's EditorConfig or project step, Ctrl+/ (or Alt+/) comments, Ctrl+Shift+Down / Up move lines (VS Code keymap: Alt+Down / Up) and Alt+Shift+Down / Up duplicate them ([structural edits](tui.md)). In the GUI, Close Window
@@ -92,6 +91,11 @@ own answers are not chords: the recovered-draft dialog keeps `r`, `d` and Esc in
 **Recover Unsaved Draft…** command stays in the File menu without a preset chord, like Close Window.
 
 ### Vim editing and relative line numbers
+
+**macOS Word Motion** (Edit → Editing Preferences, or Find Action) makes Option+Left/Right move by word on macOS,
+Shift selecting, with Back/Forward on Cmd+[ / Cmd+] (and the mouse's side buttons). Word stops then cross the spaces
+between words, for Ctrl+arrows and word deletion too: from the end of `width: 80` the stops are `80`, `:` and
+`width`. It is off by default and remembered; off, every key behaves as before.
 
 **Vim Editing** (Edit → Editing Preferences, or F10) enables built-in Normal, Insert, Visual and linewise Visual modes;
 the status bar shows the current mode and pending command. It is off by default and remembered independently
@@ -248,8 +252,9 @@ keystroke typed in a Markdown file. Native macOS and Wayland, and physical termi
 
 **Search Everywhere** follows [IntelliJ's name-navigation pattern](https://www.jetbrains.com/help/idea/searching-everywhere.html):
 one popup with **All / Files / Symbols / Actions** tabs, a query, fuzzy matches and secondary paths/details. The All
-tab keeps symbols and actions at word starts (`nsr` finds `NewSearchResult`, not `inspector`) and lists files whose name
-holds the query's letters in order (`i_summary` finds `invoice_summary.csv`); a single tab matches any letters in order.
+tab keeps matches at word starts (`nsr` finds `NewSearchResult`, not `inspector`); a single tab matches any letters in order.
+With **Search Everywhere: Letters in File Names** on (Find Action; off by default, remembered), the All tab also lists
+files whose name holds the query's letters in order (`i_summary` finds `invoice_summary.csv`).
 Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three categories. Direct shortcuts are:
 
 | Search | Shortcut |

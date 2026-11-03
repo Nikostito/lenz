@@ -300,8 +300,8 @@ pub struct ReaderView {
     themes_started: bool,
     pub modal: Option<Modal>,
     double_shift: code_core::navigation::DoubleShift,
-    /// macOS's keys: Option+Left/Right move by word in the text (Back/Forward stay on Cmd+[ / Cmd+]), and text boxes
-    /// take Cmd+arrows to their ends. Tests turn it on elsewhere.
+    /// macOS's keys: with macOS Word Motion on, Option+Left/Right move by word in the text (Back/Forward stay on
+    /// Cmd+[ / Cmd+]). Tests turn it on elsewhere.
     mac_keys: bool,
     navigation_drawn: Option<(u64, usize, usize)>,
     /// Popup viewport and fractional wheel steps, independent of the highlighted option.
@@ -1827,12 +1827,13 @@ impl ReaderView {
         if self.tree_focus && self.tree_key(key, ctrl, cx) {
             return;
         }
-        // macOS: Option+Left/Right move by word, Shift selecting, as there natively and in IntelliJ's macOS keymap.
-        if self.mac_keys && k.modifiers.alt && !ctrl && matches!(key, "left" | "right") {
+        // macOS Word Motion: Option+Left/Right move by word, Shift selecting, as there natively and in IntelliJ's macOS
+        // keymap. Off (the default), they stay Back/Forward.
+        if self.mac_keys && self.session.state().mac_word_motion() && k.modifiers.alt && !ctrl && matches!(key, "left" | "right") {
             let motion = if key == "left" { Motion::WordLeft } else { Motion::WordRight };
             return self.dispatch(if shift { Command::Extend(motion) } else { Command::MoveCaret(motion) }, cx);
         }
-        // Back/Forward: Alt+Left/Right (not on macOS, above), and Cmd+[ / Cmd+] as on macOS.
+        // Back/Forward: Alt+Left/Right (unless macOS Word Motion took them, above), and Cmd+[ / Cmd+] as on macOS.
         match (key, k.modifiers.alt && !ctrl, k.modifiers.platform) {
             ("left", true, _) | ("[", _, true) => return self.run(CommandId::Back, window, cx),
             ("right", true, _) | ("]", _, true) => return self.run(CommandId::Forward, window, cx),
@@ -1900,7 +1901,7 @@ impl ReaderView {
             // next-occurrence chords come from the keymap, above, so a preset or an override moves them.
             ("escape", false, false) if self.session.disabled(CommandId::CollapseSelections).is_none() => self.run(CommandId::CollapseSelections, window, cx),
             // macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the document's, as there natively and in
-            // IntelliJ's macOS keymap; Shift selects. Option+arrows move by word (`mac_keys`, before Back/Forward).
+            // IntelliJ's macOS keymap; Shift selects. With macOS Word Motion, Option+arrows move by word (before Back/Forward).
             (arrow @ ("left" | "right" | "up" | "down"), true, shift) if k.modifiers.platform && !k.modifiers.control => {
                 let motion = match arrow { "left" => Motion::LineStart, "right" => Motion::LineEnd, "up" => Motion::DocumentStart, _ => Motion::DocumentEnd };
                 self.dispatch(if shift { Command::Extend(motion) } else { Command::MoveCaret(motion) }, cx);

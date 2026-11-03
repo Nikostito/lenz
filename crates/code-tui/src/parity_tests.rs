@@ -281,11 +281,11 @@ fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut Test
     tui.enable_draft_input_for_test();
     let (ctrl, shift) = (KeyModifiers::CONTROL, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
     for (gui_key, code, modifiers, anchor, head) in [
+        ("ctrl-right", KeyCode::Right, ctrl, 4, 4),
         ("ctrl-right", KeyCode::Right, ctrl, 7, 7),
-        ("ctrl-right", KeyCode::Right, ctrl, 11, 11),
-        ("ctrl-shift-right", KeyCode::Right, shift, 11, 13),
-        ("ctrl-shift-right", KeyCode::Right, shift, 11, 15),
-        ("ctrl-shift-left", KeyCode::Left, shift, 11, 14),
+        ("ctrl-shift-right", KeyCode::Right, shift, 7, 8),
+        ("ctrl-shift-right", KeyCode::Right, shift, 7, 11),
+        ("ctrl-shift-left", KeyCode::Left, shift, 7, 8),
         ("home", KeyCode::Home, KeyModifiers::NONE, 4, 4),
         ("home", KeyCode::Home, KeyModifiers::NONE, 0, 0),
         ("ctrl-shift-end", KeyCode::End, shift, 0, original.len()),
@@ -302,32 +302,66 @@ fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut Test
         visual.simulate_keystrokes(gui_key);
         assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor, head }), "{gui_key}");
     }
-    // macOS: Option+Left/Right move by word in both (a terminal reports Option as Alt); Back stays on Cmd+[ there.
-    gui.update(&mut visual, |view, _| view.set_mac_keys_for_test(true));
-    tui.mac_keys = true;
-    for (gui_key, code, head) in [("alt-right", KeyCode::Right, 7), ("alt-right", KeyCode::Right, 11), ("alt-left", KeyCode::Left, 8), ("alt-left", KeyCode::Left, 4)] {
-        visual.simulate_keystrokes(gui_key);
-        tui.handle(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)));
-        assert_eq!(tui.session.state().selection(), Some(code_core::session::Selection { anchor: head, head }), "{gui_key}");
-        assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
-    }
-    visual.simulate_keystrokes("alt-shift-right");
-    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor: 4, head: 7 }), "Option+Shift selects by word");
-    visual.simulate_keystrokes("cmd-up");
-    tui.handle(Event::Key(KeyEvent::new(KeyCode::Home, ctrl)));
-    // Ctrl+Backspace / Ctrl+Delete delete to the word stop, spaces going with the word; Alt+Backspace too (macOS's
-    // Option, a terminal's fallback).
+    // Ctrl+Backspace / Ctrl+Delete delete to the word stop; Alt+Backspace too (macOS's Option, a terminal's fallback).
     for (gui_key, code, modifiers, text) in [
         ("ctrl-right", KeyCode::Right, ctrl, original),
+        ("ctrl-right", KeyCode::Right, ctrl, original),
         ("ctrl-backspace", KeyCode::Backspace, ctrl, "     foo = 1;\nend\n"),
-        ("ctrl-delete", KeyCode::Delete, ctrl, "     = 1;\nend\n"),
-        ("alt-backspace", KeyCode::Backspace, KeyModifiers::ALT, " = 1;\nend\n"),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "    foo = 1;\nend\n"),
+        ("alt-backspace", KeyCode::Backspace, KeyModifiers::ALT, "foo = 1;\nend\n"),
     ] {
         visual.simulate_keystrokes(gui_key);
         tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
         assert_eq!(snapshot(tui.session.state()).text.as_deref(), Some(text), "{gui_key}");
         assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
     }
+    assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+}
+
+/// macOS Word Motion: off (the default), Option+Left/Right stay Back/Forward; on, they move by word in both adapters,
+/// spaces going with the word.
+#[gpui::test]
+fn mac_word_motion_moves_by_word_with_option_arrows_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("words.txt");
+    let original = "    let foo = 1;\nend\n";
+    std::fs::write(&path, original).unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(path.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().current_source().is_none()) || tui.session.state().current_source().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    visual.update(|window, cx| { let _ = window.draw(cx); });
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    gui.update(&mut visual, |view, _| view.set_mac_keys_for_test(true));
+    tui.mac_keys = true;
+    let caret = |head| Some(code_core::session::Selection { anchor: head, head });
+    visual.simulate_keystrokes("ctrl-home alt-right");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), caret(0), "off: Option+Right is Forward");
+    assert_eq!(tui.session.state().selection(), caret(0), "off: Alt+Right is Forward");
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetMacWordMotion(true), cx));
+    tui.dispatch(Command::SetMacWordMotion(true));
+    for (gui_key, code, head) in [("alt-right", KeyCode::Right, 7), ("alt-right", KeyCode::Right, 11), ("alt-left", KeyCode::Left, 8), ("alt-left", KeyCode::Left, 4)] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)));
+        assert_eq!(tui.session.state().selection(), caret(head), "{gui_key}");
+        assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
+    }
+    visual.simulate_keystrokes("alt-shift-right");
+    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor: 4, head: 7 }), "Option+Shift selects by word");
     assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
 }
 
