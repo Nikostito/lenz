@@ -229,6 +229,10 @@ Both adapters build their menus, labels, availability and disabled reasons from 
 - The command palette opens with `:` or F10 instead of Ctrl/Cmd+Shift+P; `f` opens the file finder and Alt-0 is Focus.
 - **Diff options…** opens the ⚙ menu, or the palette's Diff group when the button has folded into `⋯`.
 - Alt-Left/Right outside a repository only says that Back and Forward work in repository views.
+- Lenz Code on macOS: Option+Left/Right move by word in the text when the emulator sends Option as Alt (Esc-prefixed
+  arrows); Terminal.app's default Esc b / Esc f arrive as Alt+B / Alt+F instead. Option+Shift+Left/Right keep moving the
+  tab, so select by word with Ctrl+Shift+Left/Right, and Back/Forward stay in the menus there. Cmd+arrows do not reach a
+  terminal, so Search Everywhere's query has no to-the-ends key (Ctrl+A clears it).
 - The Version Picker's **Take ‹version›** buttons and the Conflict List's **File actions ▾** are toolbar items.
 - Terminal text selection and Linux primary selection belong to the emulator. Clipboard copy uses OSC 52 and needs terminal support; it transports exact text, and source control characters are drawn visibly.
 - Images are limited to cell geometry and colors, except where kitty graphics or Sixel apply as described above.

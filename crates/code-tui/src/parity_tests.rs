@@ -193,6 +193,67 @@ fn several_cursors_replay_the_same_text_and_selections_in_both_adapters(cx: &mut
     assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
 }
 
+/// Search Everywhere's query edits at its caret in both adapters: arrows by character, Alt (Option) or Ctrl by word,
+/// Backspace and Delete by character or with Alt or Ctrl by word.
+#[gpui::test]
+fn search_everywhere_edits_its_query_at_the_caret_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(path.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().current_source().is_none()) || tui.session.state().current_source().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let query = |s: &Session| s.state().navigation().map(|n| n.query.clone());
+    let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+    visual.simulate_keystrokes("ctrl-k");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('k'), ctrl)));
+    for c in "sketch pad".chars() {
+        visual.simulate_keystrokes(if c == ' ' { "space".to_string() } else { c.to_string() }.as_str());
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none)));
+    }
+    for (gui_key, code, modifiers, expected) in [
+        ("left", KeyCode::Left, none, "sketch pad"),
+        ("left", KeyCode::Left, none, "sketch pad"),
+        ("x", KeyCode::Char('x'), none, "sketch pxad"),
+        ("alt-left", KeyCode::Left, alt, "sketch pxad"),
+        ("_", KeyCode::Char('_'), none, "sketch _pxad"),
+        ("ctrl-left", KeyCode::Left, ctrl, "sketch _pxad"),
+        ("ctrl-left", KeyCode::Left, ctrl, "sketch _pxad"),
+        ("delete", KeyCode::Delete, none, "ketch _pxad"),
+        ("alt-right", KeyCode::Right, alt, "ketch _pxad"),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "ketch"),
+        ("backspace", KeyCode::Backspace, none, "ketc"),
+        ("left", KeyCode::Left, none, "ketc"),
+        ("alt-backspace", KeyCode::Backspace, alt, "c"),
+        ("ctrl-backspace", KeyCode::Backspace, ctrl, "c"),
+        ("right", KeyCode::Right, none, "c"),
+        ("ctrl-backspace", KeyCode::Backspace, ctrl, ""),
+    ] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+        assert_eq!(query(&tui.session).as_deref(), Some(expected), "{gui_key}");
+        assert_eq!(gui.read_with(&visual, |view, _| query(view.session())), query(&tui.session), "{gui_key}");
+    }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('a'), none)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('b'), none)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, none)));
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    let (cursor, row) = (terminal.get_cursor_position().unwrap(), terminal.backend().buffer().content().chunks(100).map(|r| r.iter().map(|c| c.symbol()).collect::<String>()).find(|r| r.contains("› ab")).expect("the query row"));
+    assert_eq!(cursor.x as usize, row[..row.find("› ab").unwrap()].chars().count() + 3, "the terminal cursor sits between a and b");
+    assert_eq!(std::fs::read(path).unwrap(), b"fn main() {}\n");
+}
+
 /// IntelliJ's word and document motions: Ctrl+arrows by word, Shift selects, Home toggles the indent, Ctrl+Up/Down scroll.
 #[gpui::test]
 fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut TestAppContext) {
@@ -220,11 +281,11 @@ fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut Test
     tui.enable_draft_input_for_test();
     let (ctrl, shift) = (KeyModifiers::CONTROL, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
     for (gui_key, code, modifiers, anchor, head) in [
-        ("ctrl-right", KeyCode::Right, ctrl, 4, 4),
         ("ctrl-right", KeyCode::Right, ctrl, 7, 7),
-        ("ctrl-shift-right", KeyCode::Right, shift, 7, 8),
-        ("ctrl-shift-right", KeyCode::Right, shift, 7, 11),
-        ("ctrl-shift-left", KeyCode::Left, shift, 7, 8),
+        ("ctrl-right", KeyCode::Right, ctrl, 11, 11),
+        ("ctrl-shift-right", KeyCode::Right, shift, 11, 13),
+        ("ctrl-shift-right", KeyCode::Right, shift, 11, 15),
+        ("ctrl-shift-left", KeyCode::Left, shift, 11, 14),
         ("home", KeyCode::Home, KeyModifiers::NONE, 4, 4),
         ("home", KeyCode::Home, KeyModifiers::NONE, 0, 0),
         ("ctrl-shift-end", KeyCode::End, shift, 0, original.len()),
@@ -241,13 +302,26 @@ fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut Test
         visual.simulate_keystrokes(gui_key);
         assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor, head }), "{gui_key}");
     }
-    // Ctrl+Backspace / Ctrl+Delete delete to the word stop; Alt+Backspace too (macOS's Option, a terminal's fallback).
+    // macOS: Option+Left/Right move by word in both (a terminal reports Option as Alt); Back stays on Cmd+[ there.
+    gui.update(&mut visual, |view, _| view.set_mac_keys_for_test(true));
+    tui.mac_keys = true;
+    for (gui_key, code, head) in [("alt-right", KeyCode::Right, 7), ("alt-right", KeyCode::Right, 11), ("alt-left", KeyCode::Left, 8), ("alt-left", KeyCode::Left, 4)] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)));
+        assert_eq!(tui.session.state().selection(), Some(code_core::session::Selection { anchor: head, head }), "{gui_key}");
+        assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
+    }
+    visual.simulate_keystrokes("alt-shift-right");
+    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor: 4, head: 7 }), "Option+Shift selects by word");
+    visual.simulate_keystrokes("cmd-up");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Home, ctrl)));
+    // Ctrl+Backspace / Ctrl+Delete delete to the word stop, spaces going with the word; Alt+Backspace too (macOS's
+    // Option, a terminal's fallback).
     for (gui_key, code, modifiers, text) in [
         ("ctrl-right", KeyCode::Right, ctrl, original),
-        ("ctrl-right", KeyCode::Right, ctrl, original),
         ("ctrl-backspace", KeyCode::Backspace, ctrl, "     foo = 1;\nend\n"),
-        ("ctrl-delete", KeyCode::Delete, ctrl, "    foo = 1;\nend\n"),
-        ("alt-backspace", KeyCode::Backspace, KeyModifiers::ALT, "foo = 1;\nend\n"),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "     = 1;\nend\n"),
+        ("alt-backspace", KeyCode::Backspace, KeyModifiers::ALT, " = 1;\nend\n"),
     ] {
         visual.simulate_keystrokes(gui_key);
         tui.handle(Event::Key(KeyEvent::new(code, modifiers)));

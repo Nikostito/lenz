@@ -3479,6 +3479,39 @@ fn about_opens_from_the_application_menu_with_its_logo_and_closes_to_the_documen
     assert!(a.session.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap() == "first\n"));
 }
 
+#[test]
+fn inline_blame_shows_the_caret_lines_commit_faintly_after_its_end() {
+    use lenz_content::git::testing::{commit_all, repo, write};
+    let r = repo();
+    write(r.path(), "a.txt", "one\ntwo\n");
+    commit_all(r.path(), "First line");
+    let mut a = app(r.path());
+    a.dispatch(Command::Open(r.path().join("a.txt")));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "off by default");
+    // The command list reaches the setting.
+    key(&mut a, KeyCode::Char(':'), KeyModifiers::NONE);
+    for c in "inline blame".chars() { key(&mut a, KeyCode::Char(c), KeyModifiers::NONE); }
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(a.session.state().inline_blame(), "on");
+    let tab = a.session.state().active().unwrap().id();
+    settle(&mut a, |a| a.session.state().caret_blame(tab).is_some());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<(u16, String)> = (0..20).map(|y| (y, (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())).filter(|(_, row)| row.contains(" • First line")).collect();
+    assert_eq!(rows.len(), 1, "only the caret line");
+    let (y, row) = &rows[0];
+    assert!(row.contains("two  t, "), "two cells after the line's end: {row}");
+    let x = (3..100u16).find(|&x| ["o", " ", " ", "t"].iter().enumerate().all(|(i, s)| buffer[(x - 3 + i as u16, *y)].symbol() == *s)).unwrap();
+    assert_eq!(buffer[(x, *y)].fg, crate::render::color(a.session.state().palette().dim), "faint");
+    assert_eq!(a.session.state().active().unwrap().annotation_cols(), 0, "no annotation column");
+    key(&mut a, KeyCode::Right, KeyModifiers::SHIFT);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "not over a selection");
+    assert_eq!(std::fs::read(r.path().join("a.txt")).unwrap(), b"one\ntwo\n");
+}
+
 /// An app on a git repository with `a.txt` (two lines) committed as "First line", annotated with Alt+B.
 fn annotated_app() -> (tempfile::TempDir, App, String) {
     use lenz_content::git::testing::{commit_all, git, repo, write};

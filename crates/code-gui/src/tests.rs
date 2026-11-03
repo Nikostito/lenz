@@ -5719,6 +5719,41 @@ fn click_navigation_row(f: &Fixture, v: &mut VisualTestContext, row: usize) {
 }
 
 #[gpui::test]
+fn the_search_everywhere_query_edits_at_its_caret_by_character_word_and_end(cx: &mut TestAppContext) {
+    let f = fixture(cx, Some(("main.rs", b"fn sample() {}\n")));
+    settle(cx, &f, |r| r.session.state().current_source().is_some());
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(500.0)));
+    let field = |v: &mut VisualTestContext| f.view.read_with(v, |r, _| {
+        let caret = match r.modal { Some(Modal::Navigation { caret, .. }) => caret, _ => panic!("the search closed") };
+        let query = r.session.state().navigation().unwrap().query.clone();
+        let caret = caret.unwrap_or(query.len());
+        (query, caret)
+    });
+    v.simulate_keystrokes("ctrl-k s k e t c h space p a d");
+    assert_eq!(field(&mut v), ("sketch pad".into(), 10));
+    v.simulate_keystrokes("left left x");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 9), "typing goes in at the caret");
+    v.simulate_keystrokes("alt-left");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 7), "Option+Left to the word's start");
+    v.simulate_keystrokes("alt-left alt-right");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 6), "Option+Right to the word's end");
+    v.simulate_keystrokes("cmd-left _");
+    assert_eq!(field(&mut v), ("_sketch pxad".into(), 1), "Cmd+Left to the start");
+    v.simulate_keystrokes("ctrl-right delete");
+    assert_eq!(field(&mut v), ("_sketchpxad".into(), 7), "Ctrl+Right by word, Delete the character after");
+    v.simulate_keystrokes("cmd-right cmd-backspace");
+    assert_eq!(field(&mut v), (String::new(), 0), "Cmd+Backspace takes the word before the caret");
+    v.simulate_keystrokes("a space b c space d alt-backspace");
+    assert_eq!(field(&mut v), ("a bc ".into(), 5));
+    v.simulate_keystrokes("home");
+    assert!(f.view.read_with(&v, |r, _| matches!(r.modal, Some(Modal::Navigation { at: 0, .. }))), "Home still picks the first row");
+    draw(&mut v);
+    v.simulate_keystrokes("escape");
+    assert!(f.view.read_with(&v, |r, _| r.modal.is_none()));
+}
+
+#[gpui::test]
 fn unified_search_switches_categories_preserving_query_and_runs_actions(cx: &mut TestAppContext) {
     use code_core::navigation::Scope;
     let source = b"fn sample() {}\n";
@@ -6336,6 +6371,42 @@ fn blame_fixture(cx: &mut TestAppContext) -> (Fixture, String) {
 fn annotated(v: &ReaderView) -> bool {
     let s = v.session();
     s.state().active().is_some_and(|t| s.annotation(t.id(), 1).is_some())
+}
+
+#[gpui::test]
+fn inline_blame_paints_the_caret_lines_commit_faintly_after_its_end(cx: &mut TestAppContext) {
+    let (f, _) = blame_fixture(cx);
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(400.0)));
+    draw(&mut v);
+    let blamed = |v: &ReaderView| v.session().state().active().and_then(|t| v.session().state().caret_blame(t.id())).is_some();
+    v.simulate_keystrokes("down");
+    draw(&mut v);
+    assert!(f.view.read_with(&v, |r, _| r.inline_problem_labels().is_empty()), "off by default");
+    // Find Action reaches the setting, as the View menu does.
+    v.simulate_keystrokes("ctrl-shift-a i n l i n e space b l a m e");
+    drop(v);
+    settle(cx, &f, |r| r.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|row| row.label == "Inline Blame")));
+    let mut v = visual(cx, &f);
+    v.simulate_keystrokes("enter");
+    assert!(f.view.read_with(&v, |r, _| r.session().state().inline_blame()), "on");
+    drop(v);
+    settle(cx, &f, blamed);
+    let mut v = visual(cx, &f);
+    draw(&mut v);
+    let (painted, dim, cols) = f.view.read_with(&v, |r, _| (r.inline_problem_labels(), r.session().state().palette().dim, r.session().state().active().unwrap().annotation_cols()));
+    assert_eq!(painted.len(), 1, "only the caret line: {painted:?}");
+    let (line, text, color) = &painted[0];
+    assert_eq!((*line, color), (1, &dim), "the second line, faint");
+    assert!(text.ends_with(" • First line") && text.starts_with("t, "), "{text}");
+    assert_eq!(cols, 0, "no annotation column");
+    v.simulate_keystrokes("up");
+    draw(&mut v);
+    assert_eq!(f.view.read_with(&v, |r, _| r.inline_problem_labels().into_iter().map(|(line, ..)| line).collect::<Vec<_>>()), [0], "it follows the caret");
+    v.simulate_keystrokes("shift-right");
+    draw(&mut v);
+    assert!(f.view.read_with(&v, |r, _| r.inline_problem_labels().is_empty()), "not over a selection");
+    assert_eq!(std::fs::read(f.dir.path().join("a.txt")).unwrap(), b"one\ntwo\n");
 }
 
 #[gpui::test]

@@ -342,7 +342,8 @@ impl Session {
             CommandId::PreviousProblem => Command::StepProblem(false),
             CommandId::AutoCompletion => Command::SetAutoCompletion(!state.auto_completion()),
             CommandId::FileIcons => Command::SetFileIcons(!state.file_icons()),
-            CommandId::AnnotateBlame => Command::SetAnnotate(state.active().is_none_or(|t| t.blame.is_none())),
+            CommandId::AnnotateBlame => Command::SetAnnotate(state.active().is_none_or(|t| !t.annotating())),
+            CommandId::InlineBlame => Command::SetInlineBlame(!state.inline_blame()),
             CommandId::NarrowAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols().saturating_sub(2), commit: true },
             CommandId::WidenAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols() + 2, commit: true },
             CommandId::CloseAnnotations => Command::SetAnnotate(false),
@@ -559,7 +560,7 @@ impl CommandId {
             Self::DocumentationOnHover | Self::AutoCompletion | Self::InlayTypes | Self::InlayParameters | Self::SemanticHighlighting => return G::Hints,
             Self::LocateFile | Self::CopyExplorerName | Self::CopyExplorerFullPath | Self::CopyExplorerRelativePath | Self::CopyExplorerEntry | Self::PasteExplorerEntry | Self::CancelExplorerCopy | Self::ExplorerHistory | Self::RenameExplorerEntry | Self::MoveExplorerEntry | Self::DeleteExplorerEntry | Self::DeleteExplorerPermanently | Self::RestoreDeleted | Self::FoldersFirst | Self::AllByName => return G::Explorer,
             Self::CsvTable | Self::CsvHeader | Self::CsvFilter | Self::CsvSort | Self::CsvClearFilter | Self::CsvMoveLeft | Self::CsvMoveRight | Self::CsvDropColumn | Self::CsvEditCell => return G::Csv,
-            Self::AnnotateBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision => return G::Annotations,
+            Self::AnnotateBlame | Self::InlineBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision => return G::Annotations,
             Self::GitBranches | Self::NewBranch | Self::CheckoutRevision => return G::Branches,
             Self::CompareWithRevision | Self::CompareWithBase | Self::ShowBranchChanges | Self::CompareWithWorktree => return G::GitCompare,
             Self::InspectChange | Self::ShowChangeDiff | Self::RevertChange | Self::CloseChange => return G::Changes,
@@ -588,7 +589,7 @@ impl CommandId {
             | Self::ImageSource | Self::MarkdownSource | Self::PreviewBeside | Self::ToggleExplorer | Self::LocateFile | Self::NewExplorerFile | Self::NewExplorerFolder
             | Self::CopyExplorerName | Self::CopyExplorerFullPath | Self::CopyExplorerRelativePath | Self::CopyExplorerEntry | Self::PasteExplorerEntry | Self::CancelExplorerCopy | Self::ExplorerHistory
             | Self::RenameExplorerEntry | Self::MoveExplorerEntry | Self::DeleteExplorerEntry | Self::DeleteExplorerPermanently | Self::RestoreDeleted
-            | Self::FoldersFirst | Self::AllByName | Self::AnnotateBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision | Self::SplitRight | Self::SplitDown | Self::Unsplit
+            | Self::FoldersFirst | Self::AllByName | Self::AnnotateBlame | Self::InlineBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision | Self::SplitRight | Self::SplitDown | Self::Unsplit
             | Self::FocusOtherPane | Self::MoveTabToOtherPane | Self::WidenExplorer | Self::NarrowExplorer | Self::TallerResults | Self::ShorterResults | Self::EnlargeFirstPane | Self::EnlargeSecondPane => G::View,
             Self::GitBranches | Self::NewBranch | Self::CheckoutRevision | Self::ShowLocalChanges | Self::CompareWithRevision | Self::CompareWithBase
             | Self::ShowBranchChanges | Self::CompareWithWorktree | Self::ResolveConflicts => G::Git,

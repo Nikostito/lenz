@@ -130,7 +130,7 @@ pub struct Tab {
     /// While the preview of an edited version is being made: the last preview shown, which stays on screen, and the
     /// edits made since its version (each edit set in order), which carry its positions to the current text.
     pub(crate) held: Option<HeldPreview>,
-    /// Annotate with Git Blame, while on: kept across releases, made again for new content.
+    /// Annotate with Git Blame or inline blame, while on: kept across releases, made again for new content.
     pub(crate) blame: Option<crate::blame::Blame>,
     /// Shown from a recovered draft: it stays named as recovered until it is saved, discarded or reloaded.
     pub(crate) recovered: bool,
@@ -395,7 +395,7 @@ impl Tab {
             preview_source: self.preview_source.clone(),
             held: self.held.clone(),
             // Its own annotations, blamed for itself once shown.
-            blame: self.blame.as_ref().map(|_| crate::blame::Blame::new()),
+            blame: self.blame.as_ref().map(|b| if b.column { crate::blame::Blame::new() } else { crate::blame::Blame::inline() }),
             recovered: self.recovered,
         }
     }
@@ -484,16 +484,19 @@ impl Tab {
     }
     /// The annotation column's width in cells (0 while Annotate with Git Blame is off).
     pub fn annotation_cols(&self) -> usize {
-        if self.blame.is_some() { crate::blame::ANNOTATION_COLS } else { 0 }
+        if self.annotating() { crate::blame::ANNOTATION_COLS } else { 0 }
     }
+    /// Annotate with Git Blame is on: its column shows (inline blame alone keeps no column).
+    pub fn annotating(&self) -> bool { self.blame.as_ref().is_some_and(|b| b.column) }
+    fn annotations(&self) -> Option<&crate::blame::Blame> { self.blame.as_ref().filter(|b| b.column) }
     /// Current attribution state while annotations are enabled.
-    pub fn blame_status(&self) -> Option<crate::blame::Status<'_>> { self.blame.as_ref().map(crate::blame::Blame::status) }
+    pub fn blame_status(&self) -> Option<crate::blame::Status<'_>> { self.annotations().map(crate::blame::Blame::status) }
     /// Line `line`'s blame annotation, once git has reached it.
     pub fn annotation(&self, line: usize) -> Option<crate::blame::Annotation<'_>> {
         self.annotation_with_width(line, crate::blame::ANNOTATION_COLS)
     }
     pub fn annotation_with_width(&self, line: usize, width: usize) -> Option<crate::blame::Annotation<'_>> {
-        crate::blame::annotation(self.blame.as_ref()?, line, width)
+        crate::blame::annotation(self.annotations()?, line, width)
     }
     /// For source a language server returned (not a file): where it came from.
     pub fn retrieved(&self) -> Option<&crate::semantics::VirtualSource> {

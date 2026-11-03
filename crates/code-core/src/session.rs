@@ -293,6 +293,8 @@ pub enum Command {
     /// Wrap long lines at the pane's width (remembered).
     SetSoftWrap(bool),
     SetRelativeLineNumbers(bool),
+    /// The caret line's commit, faint after the line's end (author, date and summary); remembered.
+    SetInlineBlame(bool),
     SetVimEnabled(bool),
     VimKey(keymap::KeyPress),
     /// Show a project file or folder (project-relative) in the explorer, opening the folders above it.
@@ -864,6 +866,8 @@ pub enum CommandId {
     CompareWithWorktree,
     ResolveConflicts,
     AnnotateBlame,
+    /// The caret line's last commit shown faintly after its end; remembered.
+    InlineBlame,
     CloseAnnotations,
     NarrowAnnotations,
     WidenAnnotations,
@@ -946,7 +950,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 250] = [
+    pub const ALL: [CommandId; 251] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1130,6 +1134,7 @@ impl CommandId {
         Self::CompareWithWorktree,
         Self::ResolveConflicts,
         Self::AnnotateBlame,
+        Self::InlineBlame,
         Self::CloseAnnotations,
         Self::NarrowAnnotations,
         Self::WidenAnnotations,
@@ -1369,6 +1374,7 @@ impl CommandId {
             Self::CompareWithWorktree => "Compare with Worktree…",
             Self::ResolveConflicts => "Resolve Conflicts in Lenz Diff",
             Self::AnnotateBlame => "Annotate with Git Blame",
+            Self::InlineBlame => "Inline Blame",
             Self::CloseAnnotations => "Close Annotations",
             Self::NarrowAnnotations => "Narrow Annotation Gutter",
             Self::WidenAnnotations => "Widen Annotation Gutter",
@@ -2637,7 +2643,8 @@ impl State {
             CommandId::DocumentationOnHover => Some(self.settings.documentation_on_hover),
             CommandId::AutoCompletion => Some(self.settings.auto_completion),
             CommandId::FileIcons => Some(self.settings.file_icons),
-            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.blame.is_some())),
+            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.annotating())),
+            CommandId::InlineBlame => Some(self.settings.inline_blame),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
                 let indent = self.project_preferences()?.indent;
                 Some(indent == match id { CommandId::IndentTabs => Some(Indent::Tabs), CommandId::IndentTwoSpaces => Some(Indent::Spaces(2)), CommandId::IndentFourSpaces => Some(Indent::Spaces(4)), _ => None })
@@ -3404,7 +3411,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -3537,7 +3544,7 @@ impl Session {
             }
             CommandId::ResolveConflicts => self.state.stash_conflicts.is_none().then_some("Smart Checkout left no conflicts"),
             CommandId::NarrowAnnotations | CommandId::WidenAnnotations => {
-                if self.state.active().is_none_or(|t| t.blame.is_none()) { Some("Annotations are off") }
+                if self.state.active().is_none_or(|t| !t.annotating()) { Some("Annotations are off") }
                 else if id == CommandId::NarrowAnnotations && self.state.layout().annotation_cols() <= 12 { Some("Annotation gutter is at its minimum width") }
                 else if id == CommandId::WidenAnnotations && self.state.layout().annotation_cols() >= 80 { Some("Annotation gutter is at its maximum width") }
                 else { None }
@@ -3545,15 +3552,9 @@ impl Session {
             CommandId::AnnotateBlame | CommandId::CloseAnnotations => match self.state.active() {
                 None => Some("No file is open"),
                 // Turning annotations off always works, also once the file has gone.
-                Some(t) if t.blame.is_some() => None,
-                Some(t) if t.read_only_side().is_some() => Some("A comparison side has no live Git attribution"),
-                Some(t) if t.retrieved.is_some() => Some("Source from a language server has no Git history"),
-                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
-                Some(t) if t.unavailable.is_some() => Some("The file is unavailable"),
-                Some(t) if !t.loaded && self.state.loading().is_some() => Some("The file is still loading"),
-                // An SVG shown as its source is text.
-                Some(t) if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) => Some("Only text can be annotated"),
-                Some(t) if id == CommandId::CloseAnnotations && t.blame.is_none() => Some("Annotations are off"),
+                Some(t) if t.annotating() => None,
+                Some(t) if let Some(why) = self.blame_refused(t) => Some(why),
+                Some(t) if id == CommandId::CloseAnnotations && !t.annotating() => Some("Annotations are off"),
                 Some(_) => None,
             },
             // The explorer's selection, which only the adapter knows, is checked when it asks.
@@ -4070,7 +4071,7 @@ impl Session {
         }
         entries.push(C(CommandId::LocateFile));
         if text {
-            match tab.is_some_and(|t| t.blame.is_some()) {
+            match tab.is_some_and(|t| t.annotating()) {
                 true => entries.extend([Separator, C(CommandId::ShowCommit), C(CommandId::ShowCommitDiff), C(CommandId::CopyRevision), C(CommandId::CloseAnnotations)]),
                 false => entries.extend([Separator, C(CommandId::AnnotateBlame)]),
             }
@@ -4100,7 +4101,42 @@ impl Session {
 
     /// Line `line`'s annotation in tab `tab`, while its annotations are on and git has reached it.
     pub fn annotation(&self, tab: TabId, line: usize) -> Option<crate::blame::Annotation<'_>> {
-        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref()?, line, self.state.layout().annotation_cols())
+        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref().filter(|b| b.column)?, line, self.state.layout().annotation_cols())
+    }
+
+    /// Why tab `t` cannot be attributed with Git blame, if it cannot.
+    fn blame_refused(&self, t: &crate::tabs::Tab) -> Option<&'static str> {
+        if t.read_only_side().is_some() { Some("A comparison side has no live Git attribution") }
+        else if t.retrieved.is_some() { Some("Source from a language server has no Git history") }
+        else if t.untitled() { Some(UNTITLED_NO_FILE) }
+        else if t.unavailable.is_some() { Some("The file is unavailable") }
+        else if !t.loaded && self.state.loading().is_some() { Some("The file is still loading") }
+        // An SVG shown as its source is text.
+        else if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) { Some("Only text can be annotated") }
+        else { None }
+    }
+
+    /// Inline blame keeps attribution for the shown tabs, without their annotation column, and drops it elsewhere.
+    /// A pass over the tabs; the blame itself runs only for content not yet attributed.
+    fn sync_inline_blame(&mut self) {
+        let on = self.state.settings.inline_blame;
+        let (mut start, mut stop) = (Vec::new(), Vec::new());
+        for t in &self.state.tabs {
+            let wanted = on && self.is_shown(t.id) && self.blame_refused(t).is_none();
+            match &t.blame {
+                None if wanted => start.push(t.id),
+                Some(b) if !b.column && !wanted => stop.push((t.id, t.buffer)),
+                _ => {}
+            }
+        }
+        for (id, buffer) in stop {
+            if let Some(t) = self.tab_mut(id) { t.blame = None; }
+            if let Some(buffer) = buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+        }
+        for id in start {
+            if let Some(t) = self.tab_mut(id) { t.blame = Some(crate::blame::Blame::inline()); }
+            self.annotate(id);
+        }
     }
 
     /// A new request for the checkout about to run (an older one's answer is then dropped).
@@ -4217,7 +4253,7 @@ impl Session {
             return Ok((c.sha.clone(), c.root.clone()));
         }
         let t = self.state.active().ok_or("No file is open")?;
-        let b = t.blame.as_ref().ok_or("Annotations are off")?;
+        let b = t.blame.as_ref().filter(|b| b.column).ok_or("Annotations are off")?;
         if b.error.is_some() { return Err("Blame failed"); }
         if !b.done { return Err("Blame pending"); }
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head)).ok_or("No line is selected")?;
@@ -4231,7 +4267,7 @@ impl Session {
     /// The caret line's annotation in the active tab (the status line's commit).
     pub fn caret_annotation(&self) -> Option<crate::blame::Annotation<'_>> {
         let t = self.state.active()?;
-        let b = t.blame.as_ref()?; // nothing more while annotations are off
+        let b = t.blame.as_ref().filter(|b| b.column)?; // nothing more while annotations are off
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head))?;
         crate::blame::annotation(b, line, self.state.layout().annotation_cols())
     }
@@ -4417,6 +4453,7 @@ impl Session {
         }
         self.invalidate_result_analysis();
         self.sync_project_syntax();
+        self.sync_inline_blame();
         self.refresh_blame();
         // A shown draft's change markers follow its text: only a version or baseline that changed is compared again.
         self.refresh_markers(markers_due);
@@ -4941,6 +4978,12 @@ impl Session {
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
+            Command::SetInlineBlame(on) => {
+                self.state.settings.inline_blame = on;
+                self.save_settings();
+                self.sync_inline_blame();
+                Effect { repaint: true, ..Effect::default() }
+            }
             Command::SetVimEnabled(on) => self.set_vim_enabled(on),
             Command::VimKey(key) => self.vim_key(key),
             Command::SetSoftWrap(on) => {
@@ -5328,12 +5371,21 @@ impl Session {
                     return Effect::default();
                 }
                 let Some(t) = self.active_mut() else { return Effect::default() };
-                if on == t.blame.is_some() {
+                if on == t.annotating() {
                     return Effect::default();
                 }
-                t.blame = on.then(crate::blame::Blame::new);
+                // Inline blame's attribution becomes the column's, and stays when the column goes (it drops it
+                // itself once it is off).
+                match (on, t.blame.as_mut()) {
+                    (_, Some(b)) => b.column = on,
+                    (true, None) => t.blame = Some(crate::blame::Blame::new()),
+                    (false, None) => {}
+                }
                 let id = t.id;
-                if !on && let Some(buffer) = t.buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                if !on && !self.state.settings.inline_blame {
+                    if let Some(t) = self.tab_mut(id) { t.blame = None; }
+                    if let Some(buffer) = self.tab_mut(id).and_then(|t| t.buffer) { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                }
                 self.annotate(id);
                 repaint
             }
@@ -10304,6 +10356,8 @@ struct Settings {
     /// Long lines wrap at the pane's width.
     soft_wrap: bool,
     relative_line_numbers: bool,
+    /// The caret line's commit shows faintly after the line's end.
+    inline_blame: bool,
     vim_enabled: bool,
     /// The enclosing declarations stay pinned at the top of each pane.
     sticky_scroll: bool,
@@ -10334,7 +10388,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, inline_blame: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
@@ -10530,15 +10584,21 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
     }
 }
 
-/// The previous (`backward`) or next word stop within the head's line: the far end of the run of spaces, word
-/// characters or other symbols beside the head. At the line's edge the head stays.
+/// The previous (`backward`) or next word stop within the head's line: the far end of the run of word characters or
+/// other symbols beside the head, with the spaces between them crossed too, as macOS's Option+arrows and VS Code's
+/// Ctrl+arrows go: from the end of `width: 80` the stops are `80`, `:` and `width`. At the line's edge the head
+/// stays; spaces running to it end there.
 pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool) -> usize {
     let range = doc.reader_line_range(doc.line_of(head));
     if backward {
         if head <= range.start { return head; }
+        let head = skip_back(doc, head, range.start, char::is_whitespace);
+        if head <= range.start { return head; }
         let kind = doc.range(doc.previous_char_boundary(head)..head).and_then(|t| t.chars().next()).map_or(0, word_class);
         skip_back(doc, head, range.start, |c| word_class(c) == kind)
     } else {
+        if head >= range.end { return head; }
+        let head = skip_on(doc, head, range.end, char::is_whitespace);
         if head >= range.end { return head; }
         let kind = doc.range(head..doc.next_char_boundary(head)).and_then(|t| t.chars().next()).map_or(0, word_class);
         skip_on(doc, head, range.end, |c| word_class(c) == kind)
