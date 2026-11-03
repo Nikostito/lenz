@@ -68,6 +68,9 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
     // The mixed list keeps word-start matches only; a single scope stays fully fuzzy. ponytail: the file count past the
     // ranked cap still includes scattered matches; filter inside project::rank if that total must be exact.
     let loose = |q: &str, text: &str| scope != Scope::All || lenz_content::fuzzy::word_starts(q, text);
+    // Files there also match a query whose characters appear in order in the file name, letters left out
+    // (`i_summary` finds `invoice_summary.csv`): a file name is short, so a scattered match there is not noise.
+    let loose_file = |q: &str, path: &str| loose(q, path) || lenz_content::fuzzy::name_subsequence(q, path);
     if scope == Scope::Recent {
         for (i, path) in snapshot.recent.iter().take(LIMIT).enumerate() {
             if !current() { return None; }
@@ -87,7 +90,7 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
             if snapshot.root.as_ref().is_some_and(|root| !path.starts_with(root)) { continue; }
             let rel = snapshot.root.as_ref().and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
             let detail = rel.to_string_lossy();
-            if let Some(score) = lenz_content::fuzzy::score(file_query, &detail).filter(|_| loose(file_query, &detail)) {
+            if let Some(score) = lenz_content::fuzzy::score(file_query, &detail).filter(|_| loose_file(file_query, &detail)) {
                 if !seen.insert(path.clone()) { continue; }
                 ranked.push((if query.is_empty() { 1_000_000 - i as i64 } else { score }, file_row(path.clone(), detail.into_owned(), at)));
                 matched += 1;
@@ -101,7 +104,7 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
             matched += total;
             for path in files {
                 let absolute = root.join(&*path);
-                if !seen.insert(absolute.clone()) || !loose(file_query, &path) { matched = matched.saturating_sub(1); continue; }
+                if !seen.insert(absolute.clone()) || !loose_file(file_query, &path) { matched = matched.saturating_sub(1); continue; }
                 let score = lenz_content::fuzzy::score(file_query, &path).unwrap_or(0);
                 ranked.push((score, file_row(absolute, path.to_string(), at)));
             }
@@ -174,7 +177,18 @@ mod tests {
         let (rows, count) = rank(snapshot(), Scope::All, "npe", || true).unwrap();
         assert_eq!((rows.len(), count), (2, 2));
         assert_eq!(rank(snapshot(), Scope::Files, "etw", || true).unwrap().0.len(), 2);
-        assert!(rank(snapshot(), Scope::All, "etw", || true).unwrap().0.is_empty());
+        assert!(rank(snapshot(), Scope::All, "zzz", || true).unwrap().0.is_empty());
+    }
+    #[test]
+    fn everywhere_finds_files_by_letters_in_order_in_their_name() {
+        let snap = || Snapshot {root: Some("/project".into()), files: vec![vec![Entry::new("billing/invoice_summary.csv"), Entry::new("billing/summary.csv"), Entry::new("sums/invoice.csv")].into()], symbols: Vec::new(), recent: Vec::new(), actions: Vec::new()};
+        for query in ["invoice_sum", "i_summary", "invc_smry"] {
+            let (rows, _) = rank(snap(), Scope::All, query, || true).unwrap();
+            assert_eq!(rows.first().map(|r| r.label.as_str()), Some("invoice_summary.csv"), "{query}");
+        }
+        // Letters spread over the folders and the name are still only for the Files scope.
+        assert!(rank(snap(), Scope::All, "smivc", || true).unwrap().0.is_empty());
+        assert_eq!(rank(snap(), Scope::Files, "smivc", || true).unwrap().0.len(), 1);
     }
     #[test]
     #[ignore = "release-only ranking and cancellation benchmark"]
