@@ -53,6 +53,7 @@ pub mod watch;
 pub mod workspace;
 
 pub mod navigation;
+pub mod line_edit;
 
 pub mod text;
 

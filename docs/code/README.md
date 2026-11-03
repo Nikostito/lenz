@@ -39,16 +39,17 @@ Folder…**, the recent folders and the files recently opened without a folder; 
 folder or file ([terminal](tui.md)).
 
 Keys (the default IntelliJ keymap; see [Keymaps](#keymaps)): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
-all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
+all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (a run of word characters or of symbols,
+spaces going with it: from the end of `width: 80` the stops are `80`, `:` and `width`; Shift selects),
 Ctrl+Shift+Home/End select to the file's start/end, Home goes to the first non-blank character and then the line start
-while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's;
-no word motion there yet, since Option+Left/Right is Back/Forward), Ctrl+Backspace / Ctrl+Delete delete to the word
+while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's,
+and Option+Left/Right move by word, Shift selecting; Back/Forward are Cmd+[ / Cmd+] there), Ctrl+Backspace / Ctrl+Delete delete to the word
 stop (also Alt+Backspace / Alt+Delete, macOS's Option), Ctrl+W / Ctrl+Shift+W extend / shrink the selection, Ctrl+- / Ctrl+= collapse /
 expand, Ctrl+Shift+- / Ctrl+Shift+= collapse / expand all, arrows move the cursor, PageUp/PageDown/Home/End scroll,
 Ctrl+P find file (`name:line`), Ctrl+G go to line, Ctrl+F find (Tab: replace, Enter replaces, Alt+A replaces all), F3 / Shift+F3 next / previous match, Ctrl+Shift+F search,
 Alt+Z soft wrap, Ctrl+Shift+. breadcrumbs, Ctrl+Shift+O outline, Ctrl+T declarations, F12 / Ctrl-click definition,
 Alt+F12 peek, Ctrl+Shift+B type definition, Ctrl+Alt+B implementations, Shift+F12 usages, Ctrl+Alt+H call hierarchy,
-Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons) back/forward,
+Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: Cmd+[ / Cmd+]) back/forward,
 F11 toggle bookmark, Ctrl+F11 bookmark key, Shift+F11 bookmarks, Ctrl+Shift+0–9 / Alt+0–9 set / go to a numbered
 bookmark, Ctrl+E recent files, Ctrl+Alt+E recent locations, Ctrl+Shift+V Markdown source/preview, F10 command menu,
 Ctrl+Shift+A find action; Escape closes a menu or cancels a pending definition. Ctrl+Alt+Down / Up add a cursor on the next / previous line in both keymaps (also **Add Cursor Below / Above** in the Edit menu), Alt+J selects the word under the caret and then its next occurrence, and Escape, a click or a caret move returns to one cursor; several selections are edited and undone together ([limits](tui.md)). Tab / Shift+Tab indent and outdent the selected lines with the file's EditorConfig or project step, Ctrl+/ (or Alt+/) comments, Ctrl+Shift+Down / Up move lines (VS Code keymap: Alt+Down / Up) and Alt+Shift+Down / Up duplicate them ([structural edits](tui.md)). In the GUI, Close Window
@@ -247,7 +248,8 @@ keystroke typed in a Markdown file. Native macOS and Wayland, and physical termi
 
 **Search Everywhere** follows [IntelliJ's name-navigation pattern](https://www.jetbrains.com/help/idea/searching-everywhere.html):
 one popup with **All / Files / Symbols / Actions** tabs, a query, fuzzy matches and secondary paths/details. The All
-tab keeps matches at word starts (`nsr` finds `NewSearchResult`, not `inspector`); a single tab matches any letters in order.
+tab keeps symbols and actions at word starts (`nsr` finds `NewSearchResult`, not `inspector`) and lists files whose name
+holds the query's letters in order (`i_summary` finds `invoice_summary.csv`); a single tab matches any letters in order.
 Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three categories. Direct shortcuts are:
 
 | Search | Shortcut |
@@ -256,7 +258,9 @@ Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three c
 | Symbols by name | Ctrl+Alt+Shift+N (VS Code: Ctrl+Shift+O) |
 | Actions by name | Ctrl+Shift+A or Ctrl+Shift+P (VS Code: Ctrl+Shift+P) |
 
-Tab / Shift+Tab cycles categories while keeping the query. Arrows, Page keys and Home/End select a
+Tab / Shift+Tab cycles categories while keeping the query. Left/Right move the query's caret, Ctrl+Left/Right or
+Alt+Left/Right (macOS's Option) by word and Cmd+Left/Right (GUI) to its ends; typing goes in at the caret, and Backspace /
+Delete take a character, with Ctrl, Alt or Cmd a word. Up/Down, Page keys and Home/End select a
 result; the wheel scrolls the popup without changing selection. Enter opens/runs the selected result and Esc returns to reading. Tabs and rows are clickable. File results distinguish
 identical basenames by path and accept `name:line[:column]`. Empty queries prefer open/recent files; search
 keeps at most the best 100 results. Action rows show shortcuts, setting values and current disabled reasons.
@@ -539,6 +543,11 @@ that commit's other lines; in the terminal the status line shows the caret line'
 **Show Commit…**, opens the commit (message, author, date, changed files) with **Show Diff**, which opens the whole
 commit in Lenz Diff against its first parent, and **Copy Revision**; both are also in the right-click menu. Annotating
 an earlier revision, choosing what the column shows and a commit log are not available.
+
+**Inline Blame** (View menu, or Find Action) shows the caret line's last commit faintly after the line's end, as
+`Author, YYYY-MM-DD • summary` (“Not committed yet” for a changed line), without the annotation column. It is off by
+default and remembered; it follows the caret in the active tab, hides over a selection and gives way to a problem shown
+on that line. While it is on, the shown tabs are blamed as for annotations, again after each change.
 
 Find (Ctrl+F) opens a box over the pane's text: matches are tinted as you type and the counter says which one is
 selected (at most 10,000 are listed); Enter / Shift+Enter or F3 / Shift+F3 step, Alt+Enter lists every match in the

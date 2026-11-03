@@ -109,7 +109,8 @@ pub enum Modal {
     NewScratch { input: String, selected: bool, error: Option<String> },
     RenameTerminal { id: code_core::terminal::Id, input: String, selected: bool, error: Option<String> },
     /// Unified file, symbol and command search; result targets stay in the core.
-    Navigation { at: usize },
+    /// Search Everywhere: the highlighted row, and the query's caret (a byte offset; `None` at the end).
+    Navigation { at: usize, caret: Option<usize> },
     /// The search box: the text typed so far, and whether it searches the project (else the active file); for the
     /// project also the file pattern, and whether keys go to it (Tab switches).
     /// `selected`: the focused field's text is selected, so typing replaces it (a reopened search's old query).
@@ -299,6 +300,9 @@ pub struct ReaderView {
     themes_started: bool,
     pub modal: Option<Modal>,
     double_shift: code_core::navigation::DoubleShift,
+    /// macOS's keys: Option+Left/Right move by word in the text (Back/Forward stay on Cmd+[ / Cmd+]), and text boxes
+    /// take Cmd+arrows to their ends. Tests turn it on elsewhere.
+    mac_keys: bool,
     navigation_drawn: Option<(u64, usize, usize)>,
     /// Popup viewport and fractional wheel steps, independent of the highlighted option.
     modal_scroll: std::cell::Cell<usize>,
@@ -779,7 +783,7 @@ impl ReaderView {
 
     pub fn new(session: Session, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let (font, notice) = lenz_gpui::pick_mono(cx, fonts().font_family.as_deref());
-        let mut view = Self { session, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
+        let mut view = Self { session, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), mac_keys: cfg!(target_os = "macos"), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
         view.layout = view.session.state().layout();
         cx.on_app_quit(|view, cx| {
             view.remember_explorer();
@@ -1605,6 +1609,10 @@ impl ReaderView {
     #[cfg(feature = "test-support")]
     pub fn enable_draft_input_for_test(&mut self) { self.session.enable_text_input_for_test(); }
 
+    /// macOS's Option+arrow and text-box keys on any platform (other crates' parity tests).
+    #[cfg(feature = "test-support")]
+    pub fn set_mac_keys_for_test(&mut self, on: bool) { self.mac_keys = on; }
+
     /// A core command through this view's own dispatch, as its menus and keys send them (other crates' parity tests).
     #[cfg(feature = "test-support")]
     pub fn dispatch_for_test(&mut self, command: Command, cx: &mut Context<Self>) { self.dispatch(command, cx); }
@@ -1819,7 +1827,12 @@ impl ReaderView {
         if self.tree_focus && self.tree_key(key, ctrl, cx) {
             return;
         }
-        // Back/Forward: Alt+Left/Right, and Cmd+[ / Cmd+] as on macOS.
+        // macOS: Option+Left/Right move by word, Shift selecting, as there natively and in IntelliJ's macOS keymap.
+        if self.mac_keys && k.modifiers.alt && !ctrl && matches!(key, "left" | "right") {
+            let motion = if key == "left" { Motion::WordLeft } else { Motion::WordRight };
+            return self.dispatch(if shift { Command::Extend(motion) } else { Command::MoveCaret(motion) }, cx);
+        }
+        // Back/Forward: Alt+Left/Right (not on macOS, above), and Cmd+[ / Cmd+] as on macOS.
         match (key, k.modifiers.alt && !ctrl, k.modifiers.platform) {
             ("left", true, _) | ("[", _, true) => return self.run(CommandId::Back, window, cx),
             ("right", true, _) | ("]", _, true) => return self.run(CommandId::Forward, window, cx),
@@ -1887,7 +1900,7 @@ impl ReaderView {
             // next-occurrence chords come from the keymap, above, so a preset or an override moves them.
             ("escape", false, false) if self.session.disabled(CommandId::CollapseSelections).is_none() => self.run(CommandId::CollapseSelections, window, cx),
             // macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the document's, as there natively and in
-            // IntelliJ's macOS keymap; Shift selects. ponytail: no Option+arrow word motion there, Option+Left/Right is Back.
+            // IntelliJ's macOS keymap; Shift selects. Option+arrows move by word (`mac_keys`, before Back/Forward).
             (arrow @ ("left" | "right" | "up" | "down"), true, shift) if k.modifiers.platform && !k.modifiers.control => {
                 let motion = match arrow { "left" => Motion::LineStart, "right" => Motion::LineEnd, "up" => Motion::DocumentStart, _ => Motion::DocumentEnd };
                 self.dispatch(if shift { Command::Extend(motion) } else { Command::MoveCaret(motion) }, cx);
@@ -3070,7 +3083,7 @@ impl ReaderView {
 
     fn on_wheel(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.double_shift.interrupt();
-        if let Some(Modal::Navigation { at }) = self.modal {
+        if let Some(Modal::Navigation { at, .. }) = self.modal {
             let len = self.session.state().navigation().map_or(0, |n| n.rows.len());
             let visible = self.navigation_visible(len);
             self.modal_first(at, at..at.saturating_add(1), len, visible);
@@ -7009,7 +7022,7 @@ impl Modal {
     /// The highlighted row of [`ReaderView::modal_rows`].
     pub fn at(&self) -> usize {
         match self {
-            Modal::Navigation { at } => *at,
+            Modal::Navigation { at, .. } => *at,
             Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::Recent { at } => *at,
             Modal::ScratchFiles { at, .. } => *at + 1,
             Modal::Themes { at, .. } => *at + THEME_HEADER_ROWS,

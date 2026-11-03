@@ -1406,10 +1406,12 @@ impl App {
                 style(p.fg, p.status_bg),
             );
             if content.width > 2 {
+                // The caret sits before the text after it, counted from the end the row keeps visible.
+                let after = modal.caret.and_then(|c| modal.input.get(code_core::line_edit::clamp(&modal.input, c)..)).map_or(0, |a| a.width());
                 frame.set_cursor_position((
                     content.x
                         + 2
-                        + query.width().min(content.width.saturating_sub(3) as usize) as u16,
+                        + query.width().saturating_sub(after).min(content.width.saturating_sub(3) as usize) as u16,
                     content.y + 1,
                 ));
             }
@@ -2738,6 +2740,13 @@ fn draw_source_row(
             let extra = if problem.other_count > 0 { format!(" (+{})", problem.other_count) } else { String::new() };
             let message = format!("{}: {}{extra}", problem.severity.label(), problem.message);
             line(buf, Rect::new(x, y, area.right() - x, 1), &message, style(fg, base));
+        }
+    } else if r.last && !sticky && native.end.is_some() && !native.pending
+        && let Some((_, commit)) = state.caret_blame(tab.id()).filter(|(line, _)| *line == r.line) {
+        // Inline blame: the caret line's commit, faint, where no problem is labelled on that line.
+        let x = end_x.saturating_add(if fold.is_some_and(|(_, shut)| shut) { 2 } else { 0 }).saturating_add(2);
+        if x < area.right() {
+            line(buf, Rect::new(x, y, area.right() - x, 1), &commit, style(p.dim, base));
         }
     }
 

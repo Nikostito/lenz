@@ -126,6 +126,8 @@ pub(crate) struct Modal {
     pub capture: Option<CommandId>,
     /// The focused field's text is selected, so typing replaces it (a terminal's label, a reopened search's query).
     pub selected: bool,
+    /// Search Everywhere's caret in `input` (a byte offset; `None` at the end). Other prompts type at the end.
+    pub caret: Option<usize>,
 }
 #[derive(Clone)]
 pub(crate) struct Choice {
@@ -181,6 +183,8 @@ pub(crate) struct TabStrip { pub first: usize, pub last: usize, pub shown: Optio
 pub(crate) struct App {
     /// `LENZ_ICONS=nerd|plain` for this run, over the File Icons setting until that is toggled here.
     pub icons_override: Option<bool>,
+    /// macOS's keys: Alt (Option)+Left/Right move by word in the text, and the search box takes Alt+arrows by word.
+    pub mac_keys: bool,
     pub session: Session,
     pub modal: Option<Modal>,
     pub focus: Focus,
@@ -252,6 +256,7 @@ impl App {
         let mut app = Self {
             // Unit tests read plain labels unless they choose glyphs (the default has its own test).
             icons_override: if cfg!(test) { Some(false) } else { std::env::var("LENZ_ICONS").ok().map(|v| v == "nerd") },
+            mac_keys: cfg!(target_os = "macos"),
             session: Session::with_text_input(config, enabled),
             modal: None,
             focus: Focus::Text,
@@ -993,6 +998,7 @@ impl App {
             error,
             capture: None,
             selected,
+            caret: None,
         });
         if self
             .modal
@@ -1504,14 +1510,22 @@ impl App {
         } else {
             &mut modal.input
         };
+        // Search Everywhere types and deletes at its caret; the other prompts at the end.
+        let caret_box = modal.kind == Prompt::Navigation && !modal.secondary_focus;
+        let mut caret = modal.caret.unwrap_or(target.len());
         if std::mem::take(&mut modal.selected) {
             target.clear();
+        } else if backspace && caret_box {
+            code_core::line_edit::apply(target, &mut caret, code_core::line_edit::Edit::Backspace);
         } else if backspace {
             target.pop();
         }
-        if !backspace {
+        if !backspace && caret_box {
+            code_core::line_edit::insert(target, &mut caret, text);
+        } else if !backspace {
             target.extend(text.chars().filter(|c| !c.is_control()));
         }
+        modal.caret = caret_box.then_some(caret);
         modal.at = 0;
         modal.top = 0;
         modal.reveal_selection = true;
@@ -1731,6 +1745,33 @@ impl App {
             }
             return;
         }
+        // Search Everywhere's query: arrows by character, Ctrl or Alt (macOS's Option) by word; Backspace and Delete,
+        // with Ctrl or Alt a word (Ctrl+Backspace reaches a terminal as Ctrl+H, Ctrl+W or a modified Backspace).
+        if kind == Prompt::Navigation {
+            use code_core::line_edit::Edit;
+            let recent = self.session.state().navigation().is_some_and(|s| s.scope == Scope::Recent);
+            let edit = match key.code {
+                KeyCode::Left if control || alt => Some(Edit::WordLeft),
+                KeyCode::Right if control || alt => Some(Edit::WordRight),
+                KeyCode::Left => Some(Edit::Left),
+                KeyCode::Right => Some(Edit::Right),
+                KeyCode::Backspace if control || alt => Some(Edit::BackspaceWord),
+                KeyCode::Char('w' | 'h') if control && !alt => Some(Edit::BackspaceWord),
+                KeyCode::Backspace => Some(Edit::Backspace),
+                KeyCode::Delete if !recent && (control || alt) => Some(Edit::DeleteWord),
+                KeyCode::Delete if !recent => Some(Edit::Delete),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                let Some(modal) = self.modal.as_mut() else { return };
+                let mut caret = modal.caret.unwrap_or(modal.input.len());
+                modal.selected = false;
+                let changed = code_core::line_edit::apply(&mut modal.input, &mut caret, edit);
+                modal.caret = Some(caret);
+                if changed { self.edit_prompt("", false); }
+                return;
+            }
+        }
         if kind == Prompt::Navigation && control {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             let scope = match (key.code, shift, alt) {
@@ -1749,6 +1790,7 @@ impl App {
             if !shift && !alt && matches!(key.code, KeyCode::Char('a' | 'A')) {
                 if let Some(modal) = &mut self.modal {
                     modal.input.clear();
+                    modal.caret = None;
                 }
                 self.edit_prompt("", false);
                 return;
@@ -2514,6 +2556,12 @@ impl App {
                 };
                 self.dispatch(Command::MoveTab { tab, pane, index });
             }
+            return;
+        }
+        // macOS: Option+Left/Right move by word in the text, as in the desktop app; Back and Forward stay in the menus
+        // there. A terminal sending Option+arrows as Esc b / Esc f (Terminal.app's default) reaches Lenz as Alt+B / Alt+F.
+        if self.mac_keys && alt && !ctrl && !shift && self.focus == Focus::Text && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.dispatch(Command::MoveCaret(if key.code == KeyCode::Left { Motion::WordLeft } else { Motion::WordRight }));
             return;
         }
         let action = match (key.code, ctrl, shift, alt) {
