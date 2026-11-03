@@ -183,7 +183,7 @@ pub(crate) struct TabStrip { pub first: usize, pub last: usize, pub shown: Optio
 pub(crate) struct App {
     /// `LENZ_ICONS=nerd|plain` for this run, over the File Icons setting until that is toggled here.
     pub icons_override: Option<bool>,
-    /// macOS's keys: Alt (Option)+Left/Right move by word in the text, and the search box takes Alt+arrows by word.
+    /// macOS's keys: with macOS Word Motion on, Alt (Option)+Left/Right move by word in the text.
     pub mac_keys: bool,
     pub session: Session,
     pub modal: Option<Modal>,
@@ -2558,9 +2558,10 @@ impl App {
             }
             return;
         }
-        // macOS: Option+Left/Right move by word in the text, as in the desktop app; Back and Forward stay in the menus
-        // there. A terminal sending Option+arrows as Esc b / Esc f (Terminal.app's default) reaches Lenz as Alt+B / Alt+F.
-        if self.mac_keys && alt && !ctrl && !shift && self.focus == Focus::Text && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+        // macOS Word Motion: Option+Left/Right move by word in the text, as in the desktop app; Back and Forward stay in
+        // the menus then. A terminal sending Option+arrows as Esc b / Esc f (Terminal.app's default) reaches Lenz as
+        // Alt+B / Alt+F. Off (the default), Alt+Left/Right stay Back/Forward.
+        if self.mac_keys && self.session.state().mac_word_motion() && alt && !ctrl && !shift && self.focus == Focus::Text && matches!(key.code, KeyCode::Left | KeyCode::Right) {
             self.dispatch(Command::MoveCaret(if key.code == KeyCode::Left { Motion::WordLeft } else { Motion::WordRight }));
             return;
         }

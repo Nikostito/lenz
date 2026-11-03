@@ -45,6 +45,14 @@ impl State {
     pub fn relative_line_numbers(&self) -> bool {
         self.settings.relative_line_numbers
     }
+    /// macOS Word Motion is on: Option+Left/Right move by word and word stops cross spaces.
+    pub fn mac_word_motion(&self) -> bool {
+        self.settings.mac_word_motion
+    }
+    /// Search Everywhere's All tab also lists files by letters in order in their name.
+    pub fn name_letter_search(&self) -> bool {
+        self.settings.name_letter_search
+    }
     /// Inline blame is on: the caret line's commit shows after its end.
     pub fn inline_blame(&self) -> bool {
         self.settings.inline_blame

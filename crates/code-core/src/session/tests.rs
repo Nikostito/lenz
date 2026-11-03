@@ -59,14 +59,25 @@ fn text_input_adjacent_deletion_is_one_undo_group() {
 }
 
 #[test]
-fn word_deletion_removes_one_run_with_its_spaces_and_then_the_line_break() {
+fn word_deletion_removes_one_run_and_then_the_line_break() {
     let d = tempfile::tempdir().unwrap(); let path = write(d.path(), "words.txt", b"foo_bar  baz\r\nqux"); let mut s = session(d.path()); open(&mut s, Command::OpenRetained(path.clone()), "words.txt"); s.enable_text_input_for_test();
     let mut after = |caret: Option<usize>, backward| { if let Some(at) = caret { s.dispatch(Command::Select(Selection { anchor: at, head: at })); } s.dispatch(Command::Delete { backward, word: true }); source_text(s.state().current_source().unwrap()) };
     assert_eq!(after(Some(12), true), "foo_bar  \r\nqux");
-    assert_eq!(after(None, true), "\r\nqux", "the spaces go with the word before them");
+    assert_eq!(after(None, true), "foo_bar\r\nqux", "the spaces are one run");
+    assert_eq!(after(None, true), "\r\nqux");
     assert_eq!(after(None, true), "\r\nqux", "nothing before the document's start");
     assert_eq!(after(None, false), "qux", "the CRLF line break as one");
     assert_eq!(after(Some(1), false), "q");
+    assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
+}
+
+#[test]
+fn mac_word_motion_deletes_a_word_with_the_spaces_before_it() {
+    let d = tempfile::tempdir().unwrap(); let path = write(d.path(), "words.txt", b"foo_bar  baz\r\nqux"); let mut s = session(d.path()); open(&mut s, Command::OpenRetained(path.clone()), "words.txt"); s.enable_text_input_for_test();
+    s.dispatch(Command::SetMacWordMotion(true));
+    let mut after = |caret: Option<usize>, backward| { if let Some(at) = caret { s.dispatch(Command::Select(Selection { anchor: at, head: at })); } s.dispatch(Command::Delete { backward, word: true }); source_text(s.state().current_source().unwrap()) };
+    assert_eq!(after(Some(12), true), "foo_bar  \r\nqux");
+    assert_eq!(after(None, true), "\r\nqux", "the spaces go with the word before them");
     assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
 }
 
@@ -1648,6 +1659,16 @@ fn session_clock(dir: &Path, clock: semantics::Clock) -> Session {
 }
 
 /// Apply background results until `done` holds.
+/// Whether a session opened on `dir` sees `seen` within 10 s: settings are saved in the background.
+fn saved(dir: &Path, seen: impl Fn(&Session) -> bool) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if seen(&session(dir)) { return true; }
+        if std::time::Instant::now() > until { return false; }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn settle(s: &mut Session, done: impl Fn(&Session) -> bool) {
     let rx = s.completions();
     let until = std::time::Instant::now() + Duration::from_secs(10);
@@ -2568,7 +2589,7 @@ fn an_empty_session_offers_open_and_explains_the_rest() {
     assert_eq!(disabled(CommandId::CloseTerminal), Some("No terminal is open"));
     assert_eq!(disabled(CommandId::RecoverDrafts), Some("No recovered drafts are offered"));
     assert_eq!(disabled(CommandId::SaveAs), Some("No file is open"));
-    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Inline Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
+    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "macOS Word Motion", "Search Everywhere: Letters in File Names", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Inline Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
     assert_eq!(disabled(CommandId::LocateFile), Some("No file is open"));
     assert_eq!(disabled(CommandId::WidenExplorer), Some("No folder or library is open"));
     assert_eq!(disabled(CommandId::TallerResults), Some("No search results are shown"));
@@ -2831,10 +2852,10 @@ fn word_motions_stop_at_word_ends_and_starts_and_home_toggles_the_indent() {
     s.dispatch(Command::Open(path));
     settle(&mut s, opened);
     let mut head = |m| { s.dispatch(Command::Extend(m)); s.state().selection().unwrap().head };
-    let right: Vec<_> = (0..10).map(|_| head(Motion::WordRight)).collect();
-    assert_eq!(right, [7, 15, 17, 21, 22, 25, 26, 27, 31, 32], "runs of word characters or symbols with the spaces before them, then the line break");
-    let left: Vec<_> = (0..9).map(|_| head(Motion::WordLeft)).collect();
-    assert_eq!(left, [31, 27, 26, 25, 22, 21, 18, 16, 8], "the line break, then word starts and symbols, spaces going with the word after them");
+    let right: Vec<_> = (0..13).map(|_| head(Motion::WordRight)).collect();
+    assert_eq!(right, [4, 7, 8, 15, 16, 17, 18, 21, 22, 25, 26, 27, 31], "runs of spaces, word characters and symbols, then the line break");
+    let left: Vec<_> = (0..4).map(|_| head(Motion::WordLeft)).collect();
+    assert_eq!(left, [27, 26, 25, 22]);
     assert_eq!([head(Motion::LineStart), head(Motion::LineStart), head(Motion::LineStart)], [4, 0, 4], "Home: first non-blank, then the line's start");
     assert_eq!(s.state().selection().unwrap().anchor, 0, "Shift keeps the anchor");
     s.dispatch(Command::MoveCaret(Motion::WordRight));
@@ -2849,12 +2870,15 @@ fn word_motions_stop_at_word_ends_and_starts_and_home_toggles_the_indent() {
 }
 
 #[test]
-fn word_motions_stop_before_the_value_the_colon_and_the_key_of_a_yaml_entry() {
+fn mac_word_motion_stops_before_the_value_the_colon_and_the_key_of_a_yaml_entry() {
     let d = tempfile::tempdir().unwrap();
     let path = write(d.path(), "c.yaml", b"     column: timestamp\n");
     let mut s = session(d.path());
     s.dispatch(Command::Open(path));
     settle(&mut s, opened);
+    assert_eq!(s.on(CommandId::MacWordMotion), Some(false), "off by default");
+    s.dispatch(Command::SetMacWordMotion(true));
+    assert!(saved(d.path(), |s| s.state().mac_word_motion()), "remembered");
     s.dispatch(Command::MoveCaret(Motion::LineEnd));
     let mut head = |m| { s.dispatch(Command::MoveCaret(m)); s.state().selection().unwrap().head };
     assert_eq!([head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft)], [13, 11, 5, 0], "timestamp, the colon, column, then the indent");
@@ -8826,8 +8850,7 @@ mod blame {
         s.dispatch(Command::SetInlineBlame(false));
         assert_eq!(s.state().caret_blame(t), None);
         assert!(s.state().active().unwrap().blame.is_none(), "turned off, its attribution goes");
-        let reopened = session(r.path());
-        assert_eq!(reopened.on(CommandId::InlineBlame), Some(false), "remembered");
+        assert!(saved(r.path(), |s| s.on(CommandId::InlineBlame) == Some(false)), "remembered");
     }
 
     #[test]

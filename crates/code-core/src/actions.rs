@@ -344,6 +344,8 @@ impl Session {
             CommandId::FileIcons => Command::SetFileIcons(!state.file_icons()),
             CommandId::AnnotateBlame => Command::SetAnnotate(state.active().is_none_or(|t| !t.annotating())),
             CommandId::InlineBlame => Command::SetInlineBlame(!state.inline_blame()),
+            CommandId::MacWordMotion => Command::SetMacWordMotion(!state.mac_word_motion()),
+            CommandId::NameLetterSearch => Command::SetNameLetterSearch(!state.name_letter_search()),
             CommandId::NarrowAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols().saturating_sub(2), commit: true },
             CommandId::WidenAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols() + 2, commit: true },
             CommandId::CloseAnnotations => Command::SetAnnotate(false),
@@ -570,7 +572,7 @@ impl CommandId {
             Self::MatchCase | Self::WholeWord | Self::RegularExpression => return G::FindOptions,
             Self::ExtendSelection | Self::ShrinkSelection | Self::AddCursorBelow | Self::AddCursorAbove | Self::SelectNextOccurrence | Self::CollapseSelections => return G::Selections,
             Self::IndentSelection | Self::OutdentSelection | Self::ToggleComment | Self::MoveLinesUp | Self::MoveLinesDown | Self::DuplicateLinesUp | Self::DuplicateLinesDown => return G::Lines,
-            Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::VimMode => return G::EditingSettings,
+            Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::VimMode | Self::MacWordMotion => return G::EditingSettings,
             Self::WorkspaceRoot | Self::ServerRuntime | Self::ExcludeRubyTooling | Self::ResetProjectServerSettings | Self::PersistentIndex | Self::RebuildIndex => return G::ServerSetup,
             Self::ConfigureSqlMetadata | Self::ConnectSqlMetadata | Self::RefreshSqlMetadata | Self::DisconnectSqlMetadata => return G::Metadata,
             Self::SqlDialect | Self::SqlDialectPostgreSql | Self::SqlDialectDuckDb | Self::SqlDialectFollowProject | Self::ProjectSqlDialectPostgreSql | Self::ProjectSqlDialectDuckDb | Self::ProjectSqlDialectUnset => return G::Dialect,
@@ -600,7 +602,7 @@ impl CommandId {
             | Self::CallHierarchy | Self::CallHierarchyCallers | Self::CallHierarchyCallees
             | Self::TypeHierarchy | Self::TypeHierarchySupertypes | Self::TypeHierarchySubtypes
             | Self::Documentation | Self::NextProblem | Self::PreviousProblem | Self::ShowProblems | Self::CheckProjectSyntax | Self::CancelProjectSyntax | Self::ShowInSource | Self::FollowLink => G::Navigate,
-            Self::SearchEverywhere | Self::FindSymbol | Self::FindAction | Self::FindFile | Self::SearchProject | Self::FindInFile | Self::NextMatch | Self::PreviousMatch
+            Self::SearchEverywhere | Self::NameLetterSearch | Self::FindSymbol | Self::FindAction | Self::FindFile | Self::SearchProject | Self::FindInFile | Self::NextMatch | Self::PreviousMatch
             | Self::CloseFind | Self::MatchCase | Self::WholeWord | Self::RegularExpression | Self::ReplaceMatch | Self::ReplaceAll | Self::ListMatches
             | Self::FindDeclarations | Self::RerunSearch | Self::CloseResults | Self::ToggleResults | Self::StopSearch | Self::FoldAllResults | Self::NextResult | Self::PreviousResult | Self::PreviousResults | Self::NextResults | Self::Usages | Self::Symbols
             | Self::FileSymbols => G::Find,
@@ -608,7 +610,7 @@ impl CommandId {
             | Self::AddCursorBelow | Self::AddCursorAbove | Self::SelectNextOccurrence | Self::CollapseSelections
             | Self::IndentSelection | Self::OutdentSelection | Self::ToggleComment | Self::MoveLinesUp | Self::MoveLinesDown
             | Self::DuplicateLinesUp | Self::DuplicateLinesDown
-            | Self::VimMode | Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::Completion | Self::ParameterInfo | Self::QuickFix | Self::FormatDocument | Self::OrganizeImports => G::Selection,
+            | Self::VimMode | Self::MacWordMotion | Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::Completion | Self::ParameterInfo | Self::QuickFix | Self::FormatDocument | Self::OrganizeImports => G::Selection,
             Self::InstallServer | Self::StartServerInstall | Self::CancelServerInstall | Self::WorkspaceRoot | Self::LanguageServer | Self::ServerDetails | Self::CopyServerDetails | Self::ServerRuntime
             | Self::RestartServer | Self::ExcludeRubyTooling | Self::ResetProjectServerSettings | Self::PersistentIndex | Self::RebuildIndex
             | Self::DisableServer | Self::EnableServer => G::LanguageServers,
