@@ -1,5 +1,6 @@
-//! Caret editing in a one-line text box (Search Everywhere's query): both adapters keep the text and a byte caret
-//! and map their keys to [`Edit`]s, so the box moves and deletes the same way in the window and the terminal.
+//! Caret editing in a one-line text box (Search Everywhere's query, Search in Project's fields): both adapters keep the
+//! text and a byte caret and map their keys to [`Edit`]s, so the box moves and deletes the same way in the window and
+//! the terminal.
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One caret step or deletion. Word steps stop as the editor's word motions do: spaces go with the word beside them.
@@ -41,6 +42,22 @@ pub fn apply(text: &mut String, caret: &mut usize, edit: Edit) -> bool {
     match removed.filter(|range| !range.is_empty()) {
         Some(range) => { text.replace_range(range, ""); true }
         None => false,
+    }
+}
+
+/// [`apply`] to a field whose whole text may be selected (Ctrl/Cmd+A): then a step leaves the selection at its start
+/// (left, a word left, the start) or its end, and a deletion clears the field. Whether `text` changed.
+pub fn apply_selected(text: &mut String, caret: &mut usize, selected: &mut bool, edit: Edit) -> bool {
+    if !std::mem::take(selected) { return apply(text, caret, edit); }
+    match edit {
+        Edit::Left | Edit::WordLeft | Edit::Start => { *caret = 0; false }
+        Edit::Right | Edit::WordRight | Edit::End => { *caret = text.len(); false }
+        Edit::Backspace | Edit::Delete | Edit::BackspaceWord | Edit::DeleteWord => {
+            let changed = !text.is_empty();
+            text.clear();
+            *caret = 0;
+            changed
+        }
     }
 }
 
@@ -105,6 +122,17 @@ mod tests {
         assert_eq!(run(&text, caret, &[Edit::Start, Edit::Delete, Edit::End, Edit::Backspace]), ("ketch pad.yam".into(), 13));
         assert_eq!(run(&text, caret, &[Edit::Left, Edit::Left, Edit::Right]), (text.clone(), 9));
         assert_eq!(run("", 5, &[Edit::Backspace, Edit::Delete, Edit::BackspaceWord, Edit::Left]), (String::new(), 0));
+    }
+
+    #[test]
+    fn a_selected_field_collapses_on_a_step_and_clears_on_a_deletion() {
+        let step = |edit| { let (mut text, mut caret, mut selected) = ("draft notes".to_owned(), 3, true); let changed = apply_selected(&mut text, &mut caret, &mut selected, edit); (text, caret, selected, changed) };
+        assert_eq!(step(Edit::Left), ("draft notes".into(), 0, false, false));
+        assert_eq!(step(Edit::WordRight), ("draft notes".into(), 11, false, false));
+        assert_eq!(step(Edit::BackspaceWord), (String::new(), 0, false, true));
+        let (mut text, mut caret, mut selected) = ("draft notes".to_owned(), 5, false);
+        assert!(apply_selected(&mut text, &mut caret, &mut selected, Edit::BackspaceWord));
+        assert_eq!((text.as_str(), caret), (" notes", 0), "nothing selected: as apply");
     }
 
     #[test]

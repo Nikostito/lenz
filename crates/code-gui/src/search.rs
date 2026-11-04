@@ -19,6 +19,8 @@ pub(super) struct Layout {
     files: String,
     in_files: bool,
     selected: bool,
+    /// The focused field's caret (a byte offset; `None` at the end).
+    caret: Option<usize>,
     on: [bool; 3],
     char_w: f32,
 }
@@ -29,7 +31,7 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
 
 impl ReaderView {
     pub(super) fn search_layout(&self) -> Option<Layout> {
-        let Some(Modal::Search { query, files, in_files, selected, .. }) = &self.modal else { return None };
+        let Some(Modal::Search { query, files, in_files, selected, caret, .. }) = &self.modal else { return None };
         let (lh, cw) = (line_h(), self.char_w);
         let w = (self.width - 16.0).clamp(0.0, 640.0);
         let x = (self.width - w) / 2.0;
@@ -71,6 +73,7 @@ impl ReaderView {
             files: files.clone(),
             in_files: *in_files,
             selected: *selected,
+            caret: *caret,
             on: [o.case, o.word, o.regex],
             char_w: cw,
         })
@@ -85,8 +88,9 @@ impl ReaderView {
         if let Some((option, _)) = l.toggles.iter().find(|(_, b)| b.contains(&point)) {
             self.dispatch(Command::ToggleFindOption(*option), cx);
         } else if let Some(i) = l.fields.iter().position(|b| b.contains(&point))
-            && let Some(Modal::Search { in_files, selected, .. }) = &mut self.modal
+            && let Some(Modal::Search { in_files, selected, caret, .. }) = &mut self.modal
         {
+            if *in_files != (i == 1) { *caret = None; }
             *in_files = i == 1;
             *selected = false;
         }
@@ -123,7 +127,9 @@ impl Layout {
                         lenz_gpui::text(window, cx, m, fx + 8.0, fy + 4.0, &shown, p.fg);
                     }
                     if active {
-                        let caret_x = fx + 8.0 + lenz_content::wrap::width(&shown) as f32 * self.char_w;
+                        // The caret sits before the text after it, counted from the end the field keeps visible.
+                        let after = self.caret.and_then(|c| value.get(code_core::line_edit::clamp(value, c)..)).map_or(0, lenz_content::wrap::width);
+                        let caret_x = fx + 8.0 + lenz_content::wrap::width(&shown).saturating_sub(after) as f32 * self.char_w;
                         lenz_gpui::fill(window, caret_x, fy + 4.0, 2.0, fh - 8.0, p.caret);
                     }
                 });

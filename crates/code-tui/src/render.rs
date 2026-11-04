@@ -1281,9 +1281,11 @@ impl App {
                 line(frame.buffer_mut(), text_area, shown, style(p.fg, if active && modal.selected { p.selected_bg } else { p.bg }));
             }
             if active && text_area.height > 0 && text_area.width > 0 {
+                // The caret sits before the text after it, counted from the end the field keeps visible.
+                let after = modal.caret.and_then(|c| value.get(code_core::line_edit::clamp(value, c)..)).map_or(0, |a| a.width());
                 frame.set_cursor_position((
                     text_area.x
-                        + (shown.width() as u16).min(text_area.width.saturating_sub(1)),
+                        + (shown.width().saturating_sub(after) as u16).min(text_area.width.saturating_sub(1)),
                     text_area.y,
                 ));
             }
