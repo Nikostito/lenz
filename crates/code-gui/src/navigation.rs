@@ -21,6 +21,27 @@ pub(super) struct Frame {
     rows: Vec<code_core::navigation::Row>,
 }
 
+/// The caret edit a key makes in a one-line text box (Search Everywhere, Search in Project): arrows by character, Alt
+/// (macOS's Option) or Ctrl by word, Cmd to the ends, as in a macOS text field; Backspace and Delete take a character,
+/// with Alt, Ctrl or Cmd a word. Shift moves the caret alike.
+pub(super) fn line_edit_key(ev: &KeyDownEvent) -> Option<code_core::line_edit::Edit> {
+    use code_core::line_edit::Edit;
+    let m = &ev.keystroke.modifiers;
+    let key = ev.keystroke.key.as_str();
+    Some(match key {
+        "left" | "right" if m.platform && !m.control && !m.alt => if key == "left" { Edit::Start } else { Edit::End },
+        "left" if m.alt || m.control => Edit::WordLeft,
+        "right" if m.alt || m.control => Edit::WordRight,
+        "left" => Edit::Left,
+        "right" => Edit::Right,
+        "backspace" if m.alt || m.control || m.platform => Edit::BackspaceWord,
+        "backspace" => Edit::Backspace,
+        "delete" if m.alt || m.control || m.platform => Edit::DeleteWord,
+        "delete" => Edit::Delete,
+        _ => return None,
+    })
+}
+
 impl ReaderView {
     pub(super) fn open_navigation(&mut self, scope: Scope, cx: &mut Context<Self>) {
         self.double_shift.reset();
@@ -77,20 +98,8 @@ impl ReaderView {
         let Some(Modal::Navigation { at, caret }) = &mut self.modal else { return };
         let mut caret = caret.map_or(query.len(), |c| line_edit::clamp(&query, c));
         if let Some(scope) = scope_shortcut { return self.update_navigation(scope, query, Some(caret), cx); }
-        // The query's caret: arrows by character, Alt (macOS's Option) or Ctrl by word, Cmd to the ends, as in a
-        // macOS text field; Backspace and Delete with Alt, Ctrl or Cmd take a word. Shift moves the caret alike.
-        let edit = match key {
-            "left" | "right" if m.platform && !m.control && !m.alt => Some(if key == "left" { Edit::Start } else { Edit::End }),
-            "left" if m.alt || m.control => Some(Edit::WordLeft),
-            "right" if m.alt || m.control => Some(Edit::WordRight),
-            "left" => Some(Edit::Left),
-            "right" => Some(Edit::Right),
-            "backspace" if m.alt || ctrl => Some(Edit::BackspaceWord),
-            "backspace" => Some(Edit::Backspace),
-            "delete" if scope != Scope::Recent && (m.alt || ctrl) => Some(Edit::DeleteWord),
-            "delete" if scope != Scope::Recent => Some(Edit::Delete),
-            _ => None,
-        };
+        // The query's caret; Delete stays Recent Files' forget-the-row key.
+        let edit = line_edit_key(ev).filter(|edit| scope != Scope::Recent || !matches!(edit, Edit::Delete | Edit::DeleteWord));
         if let Some(edit) = edit {
             if line_edit::apply(&mut query, &mut caret, edit) { return self.update_navigation(scope, query, Some(caret), cx); }
             if let Some(Modal::Navigation { caret: shown, .. }) = &mut self.modal { *shown = Some(caret); }

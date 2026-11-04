@@ -114,7 +114,7 @@ pub enum Modal {
     /// The search box: the text typed so far, and whether it searches the project (else the active file); for the
     /// project also the file pattern, and whether keys go to it (Tab switches).
     /// `selected`: the focused field's text is selected, so typing replaces it (a reopened search's old query).
-    Search { query: String, files: String, in_files: bool, project: bool, selected: bool },
+    Search { query: String, files: String, in_files: bool, project: bool, selected: bool, caret: Option<usize> },
     /// Declaration search: the name typed so far; results update in the panel as it is typed. `semantic` asks
     /// the language servers for workspace symbols instead of the syntactic index (Tab switches).
     Declarations { query: String, semantic: bool },
@@ -1452,7 +1452,7 @@ impl ReaderView {
                 InterfaceAction::SearchProject => {
                     let results = self.session.state().results();
                     let (query, files) = (results.map(|r| r.query().to_owned()).unwrap_or_default(), results.map(|r| r.pattern().to_owned()).unwrap_or_default());
-                    self.modal = Some(Modal::Search { selected: !query.is_empty(), query, files, in_files: false, project: true });
+                    self.modal = Some(Modal::Search { selected: !query.is_empty(), query, files, in_files: false, project: true, caret: None });
                     cx.notify();
                 }
                 InterfaceAction::FindInFile => {
@@ -1608,6 +1608,14 @@ impl ReaderView {
 
     #[cfg(feature = "test-support")]
     pub fn enable_draft_input_for_test(&mut self) { self.session.enable_text_input_for_test(); }
+
+    /// Search in Project's fields and the focused one's caret, while it is open (other crates' parity tests).
+    #[cfg(feature = "test-support")]
+    pub fn search_fields_for_test(&self) -> Option<(String, String, usize)> {
+        let Some(Modal::Search { query, files, in_files, caret, .. }) = &self.modal else { return None };
+        let field = if *in_files { files } else { query };
+        Some((query.clone(), files.clone(), caret.map_or(field.len(), |c| code_core::line_edit::clamp(field, c))))
+    }
 
     /// macOS's Option+arrow and text-box keys on any platform (other crates' parity tests).
     #[cfg(feature = "test-support")]
@@ -2667,18 +2675,35 @@ impl ReaderView {
             Some(Modal::Search { query, .. }) => self.session.search_refusal(query),
             _ => None,
         };
-        if let Some(Modal::Search { query, files, in_files, project, selected }) = &mut self.modal {
+        // The paste the focused field takes: the clipboard's first line, at the caret.
+        let paste = (key == "v" && (ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform) && matches!(self.modal, Some(Modal::Search { .. })))
+            .then(|| cx.read_from_clipboard().and_then(|c| c.text())).flatten().map(|t| t.lines().next().unwrap_or_default().to_string());
+        if let Some(Modal::Search { query, files, in_files, project, selected, caret }) = &mut self.modal {
+            use code_core::line_edit::{self, Edit};
             let (mods, empty) = (ev.keystroke.modifiers, query.is_empty());
             let field = if *in_files { &mut *files } else { &mut *query };
+            // The focused field's caret: the keys of Search Everywhere's query, and Home/End to its ends.
+            let mut at = caret.map_or(field.len(), |c| line_edit::clamp(field, c));
+            let edit = navigation::line_edit_key(ev).or(match key {
+                "home" if !mods.shift => Some(Edit::Start),
+                "end" if !mods.shift => Some(Edit::End),
+                _ => None,
+            });
+            if let Some(edit) = edit {
+                line_edit::apply_selected(field, &mut at, selected, edit);
+                *caret = Some(at);
+                return;
+            }
             match key {
                 "escape" => self.modal = None,
                 "enter" if refused.is_some() => {}
                 "a" if mods.control || mods.platform => *selected = !field.is_empty(),
                 "home" if mods.shift => *selected = !field.is_empty(),
-                "left" | "right" | "home" | "end" => *selected = false,
-                "tab" if *project => { *in_files = !*in_files; *selected = false; }
-                "backspace" => {
-                    if std::mem::take(selected) { field.clear() } else if mods.control || mods.alt { code_core::search::drop_word(field) } else { field.pop(); }
+                "tab" if *project => { *in_files = !*in_files; *selected = false; *caret = None; }
+                "v" if paste.is_some() => {
+                    if std::mem::take(selected) { field.clear(); at = 0; }
+                    line_edit::insert(field, &mut at, paste.as_deref().unwrap_or_default());
+                    *caret = Some(at);
                 }
                 "enter" if !empty => {
                     let scope = match (*project, files.trim()) {
@@ -2696,8 +2721,9 @@ impl ReaderView {
                 }
                 _ => {
                     if let Some(text) = ev.keystroke.key_char.clone().filter(|_| !mods.control && !mods.platform) {
-                        if std::mem::take(selected) { field.clear(); }
-                        field.push_str(&text);
+                        if std::mem::take(selected) { field.clear(); at = 0; }
+                        line_edit::insert(field, &mut at, &text);
+                        *caret = Some(at);
                     }
                 }
             }

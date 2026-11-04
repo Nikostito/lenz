@@ -629,7 +629,11 @@ cannot make bookmarks unreadable.
 Project search (Ctrl+Shift+F) opens a centered dialog that takes the same options (literal and case-insensitive by
 default); a click on a field focuses it and a click on an option toggles it, and an invalid regular expression is
 shown there and not searched. It reopens with the last query selected, so typing replaces it; Ctrl+A selects a
-field, Backspace clears a selection and Ctrl+Backspace (Ctrl+W in a terminal) drops the last word. Tab moves to its files field:
+field, Backspace or Delete clears a selection, and Left/Right leave it at its start or end. Each field edits at its
+caret as Search Everywhere's query does: Left/Right by character, Ctrl+Left/Right or Alt+Left/Right (macOS's Option) by
+word, Home/End (and Cmd+Left/Right in the GUI) to its ends; typing and a paste go in at the caret (the GUI's Ctrl+V
+takes the clipboard's first line), and Backspace / Delete take a character, with Ctrl, Alt or Cmd a word (Ctrl+W or Ctrl+H in a terminal too).
+Tab moves to its files field, its caret at the end:
 comma-separated
 globs, any case, `!` to exclude (`*.rs, src/, !*.test.ts`); a name without `/` matches at any depth, a path with `/`
 from the root, and a folder means everything in it. Matches list as a tree in the explorer's order (folders before

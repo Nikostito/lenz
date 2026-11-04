@@ -1510,8 +1510,8 @@ impl App {
         } else {
             &mut modal.input
         };
-        // Search Everywhere types and deletes at its caret; the other prompts at the end.
-        let caret_box = modal.kind == Prompt::Navigation && !modal.secondary_focus;
+        // Search Everywhere and Search in Project type and delete at their caret; the other prompts at the end.
+        let caret_box = matches!(modal.kind, Prompt::Navigation | Prompt::Search);
         let mut caret = modal.caret.unwrap_or(target.len());
         if std::mem::take(&mut modal.selected) {
             target.clear();
@@ -1745,12 +1745,16 @@ impl App {
             }
             return;
         }
-        // Search Everywhere's query: arrows by character, Ctrl or Alt (macOS's Option) by word; Backspace and Delete,
+        // Search Everywhere's query and Search in Project's fields: arrows by character, Ctrl or Alt (macOS's Option)
+        // by word, and in Search in Project Home/End to the ends (Search Everywhere's pick rows); Backspace and Delete,
         // with Ctrl or Alt a word (Ctrl+Backspace reaches a terminal as Ctrl+H, Ctrl+W or a modified Backspace).
-        if kind == Prompt::Navigation {
+        if matches!(kind, Prompt::Navigation | Prompt::Search) {
             use code_core::line_edit::Edit;
-            let recent = self.session.state().navigation().is_some_and(|s| s.scope == Scope::Recent);
+            let recent = kind == Prompt::Navigation && self.session.state().navigation().is_some_and(|s| s.scope == Scope::Recent);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             let edit = match key.code {
+                KeyCode::Home if kind == Prompt::Search && !control && !shift => Some(Edit::Start),
+                KeyCode::End if kind == Prompt::Search && !control && !shift => Some(Edit::End),
                 KeyCode::Left if control || alt => Some(Edit::WordLeft),
                 KeyCode::Right if control || alt => Some(Edit::WordRight),
                 KeyCode::Left => Some(Edit::Left),
@@ -1764,9 +1768,9 @@ impl App {
             };
             if let Some(edit) = edit {
                 let Some(modal) = self.modal.as_mut() else { return };
-                let mut caret = modal.caret.unwrap_or(modal.input.len());
-                modal.selected = false;
-                let changed = code_core::line_edit::apply(&mut modal.input, &mut caret, edit);
+                let field = if modal.secondary_focus { &mut modal.secondary } else { &mut modal.input };
+                let mut caret = modal.caret.map_or(field.len(), |c| code_core::line_edit::clamp(field, c));
+                let changed = code_core::line_edit::apply_selected(field, &mut caret, &mut modal.selected, edit);
                 modal.caret = Some(caret);
                 if changed { self.edit_prompt("", false); }
                 return;
@@ -1844,6 +1848,7 @@ impl App {
                 let m = self.modal.as_mut().unwrap();
                 m.secondary_focus = !m.secondary_focus;
                 m.selected = false;
+                m.caret = None;
             }
             KeyCode::Tab if matches!(kind, Prompt::Declarations | Prompt::Symbols) => {
                 let m = self.modal.as_mut().unwrap();
@@ -1931,15 +1936,9 @@ impl App {
                 let Some(m) = self.modal.as_mut() else { return };
                 m.selected = !if m.secondary_focus { &m.secondary } else { &m.input }.is_empty();
             }
-            // Ctrl+Backspace reaches a terminal as Ctrl+H, Ctrl+W or a modified Backspace.
-            KeyCode::Backspace | KeyCode::Char('w' | 'h') if control && kind == Prompt::Search => {
-                let Some(m) = self.modal.as_mut() else { return };
-                if !std::mem::take(&mut m.selected) { code_core::search::drop_word(if m.secondary_focus { &mut m.secondary } else { &mut m.input }); }
-                else if m.secondary_focus { m.secondary.clear() } else { m.input.clear() }
-                self.edit_prompt("", false);
-            }
             KeyCode::Char('u') if control => {
                 let m = self.modal.as_mut().unwrap();
+                m.caret = None;
                 if m.secondary_focus {
                     m.secondary.clear();
                 } else {
@@ -3139,6 +3138,7 @@ impl App {
                     .position(|r| r.contains(point))
                     && let Some(modal) = &mut self.modal
                 {
+                    if modal.secondary_focus != (i == 1) { modal.caret = None; }
                     modal.secondary_focus = i == 1;
                     modal.selected = false;
                 } else if !self.layout.modal.contains(point) {

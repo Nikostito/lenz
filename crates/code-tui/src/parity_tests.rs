@@ -254,6 +254,84 @@ fn search_everywhere_edits_its_query_at_the_caret_in_both_adapters(cx: &mut Test
     assert_eq!(std::fs::read(path).unwrap(), b"fn main() {}\n");
 }
 
+/// Search in Project's two fields edit at their caret in both adapters: arrows by character, Alt (Option) or Ctrl by
+/// word, Home/End to the ends; Backspace and Delete by character or with Alt or Ctrl by word; Ctrl+A selects the field.
+#[gpui::test]
+fn search_in_project_edits_its_fields_at_the_caret_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(project.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(project.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let tui_fields = |tui: &App| tui.modal.as_ref().filter(|m| m.kind == crate::app::Prompt::Search).map(|m| {
+        let field = if m.secondary_focus { &m.secondary } else { &m.input };
+        (m.input.clone(), m.secondary.clone(), m.caret.map_or(field.len(), |c| code_core::line_edit::clamp(field, c)))
+    });
+    let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+    // Search in Project needs the folder's file list.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().project().is_none()) || tui.session.state().project().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    visual.simulate_keystrokes("ctrl-shift-f");
+    tui.run(CommandId::SearchProject);
+    for c in "draft notes".chars() {
+        visual.simulate_keystrokes(if c == ' ' { "space".to_string() } else { c.to_string() }.as_str());
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none)));
+    }
+    for (gui_key, code, modifiers, query, files, caret) in [
+        ("left", KeyCode::Left, none, "draft notes", "", 10),
+        ("left", KeyCode::Left, none, "draft notes", "", 9),
+        ("x", KeyCode::Char('x'), none, "draft notxes", "", 10),
+        ("alt-left", KeyCode::Left, alt, "draft notxes", "", 6),
+        ("_", KeyCode::Char('_'), none, "draft _notxes", "", 7),
+        ("ctrl-left", KeyCode::Left, ctrl, "draft _notxes", "", 6),
+        ("ctrl-left", KeyCode::Left, ctrl, "draft _notxes", "", 0),
+        ("end", KeyCode::End, none, "draft _notxes", "", 13),
+        ("home", KeyCode::Home, none, "draft _notxes", "", 0),
+        ("delete", KeyCode::Delete, none, "raft _notxes", "", 0),
+        ("alt-right", KeyCode::Right, alt, "raft _notxes", "", 4),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "raft", "", 4),
+        ("backspace", KeyCode::Backspace, none, "raf", "", 3),
+        ("left", KeyCode::Left, none, "raf", "", 2),
+        ("alt-backspace", KeyCode::Backspace, alt, "f", "", 0),
+        ("tab", KeyCode::Tab, none, "f", "", 0),
+        ("*", KeyCode::Char('*'), none, "f", "*", 1),
+        (".", KeyCode::Char('.'), none, "f", "*.", 2),
+        ("r", KeyCode::Char('r'), none, "f", "*.r", 3),
+        ("left", KeyCode::Left, none, "f", "*.r", 2),
+        ("x", KeyCode::Char('x'), none, "f", "*.xr", 3),
+        ("ctrl-a", KeyCode::Char('a'), ctrl, "f", "*.xr", 3),
+        ("left", KeyCode::Left, none, "f", "*.xr", 0),
+        ("ctrl-a", KeyCode::Char('a'), ctrl, "f", "*.xr", 0),
+        ("backspace", KeyCode::Backspace, none, "f", "", 0),
+    ] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+        let expected = Some((query.to_string(), files.to_string(), caret));
+        assert_eq!(tui_fields(&tui), expected, "TUI {gui_key}");
+        assert_eq!(gui.read_with(&visual, |view, _| view.search_fields_for_test()), expected, "GUI {gui_key}");
+    }
+    // The terminal cursor sits at the caret: between `a` and `b`.
+    for c in "ab".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, none)));
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!((buffer[(cursor.x - 1, cursor.y)].symbol(), buffer[(cursor.x, cursor.y)].symbol()), ("a", "b"));
+    assert_eq!(std::fs::read(path).unwrap(), b"fn main() {}\n");
+}
+
 /// IntelliJ's word and document motions: Ctrl+arrows by word, Shift selects, Home toggles the indent, Ctrl+Up/Down scroll.
 #[gpui::test]
 fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut TestAppContext) {

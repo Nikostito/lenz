@@ -5042,6 +5042,34 @@ fn search_dialog_is_centered_and_its_fields_and_toggles_take_clicks(cx: &mut Tes
 }
 
 #[gpui::test]
+fn the_project_search_fields_edit_at_their_caret(cx: &mut TestAppContext) {
+    let (f, mut v, _root) = bookmarks_fixture(cx);
+    let field = |v: &mut VisualTestContext| f.view.read_with(v, |r, _| r.search_fields_for_test()).expect("Search in Project is open");
+    v.simulate_keystrokes("ctrl-shift-f d r a f t space n o t e s");
+    assert_eq!(field(&mut v), ("draft notes".into(), String::new(), 11));
+    v.simulate_keystrokes("left left x");
+    assert_eq!(field(&mut v), ("draft notxes".into(), String::new(), 10), "typing goes in at the caret");
+    v.simulate_keystrokes("alt-left");
+    assert_eq!(field(&mut v).2, 6, "Option+Left to the word's start");
+    v.simulate_keystrokes("cmd-left");
+    assert_eq!(field(&mut v).2, 0, "Cmd+Left to the start");
+    v.simulate_keystrokes("end cmd-backspace");
+    assert_eq!(field(&mut v), ("draft ".into(), String::new(), 6), "Cmd+Backspace takes the word before the caret");
+    v.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("fresh\nsecond line".into())));
+    v.simulate_keystrokes("home ctrl-v");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), String::new(), 5), "a paste: its first line, at the caret");
+    v.simulate_keystrokes("tab * . r s left left x");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), "*.xrs".into(), 3), "Tab: the file pattern, its caret at the end");
+    v.simulate_keystrokes("ctrl-a left y");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), "y*.xrs".into(), 1), "Left leaves a selection at its start");
+    v.simulate_keystrokes("ctrl-a delete");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), String::new(), 0), "Delete clears a selection");
+    draw(&mut v);
+    v.simulate_keystrokes("escape");
+    assert!(f.view.read_with(&v, |r, _| r.modal.is_none()));
+}
+
+#[gpui::test]
 fn a_reopened_search_selects_its_old_query_so_typing_replaces_it(cx: &mut TestAppContext) {
     let (f, mut v, _root) = bookmarks_fixture(cx);
     let field = |v: &mut VisualTestContext| match f.view.read_with(v, |r, _| r.modal.clone()) {
