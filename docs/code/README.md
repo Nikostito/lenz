@@ -50,7 +50,8 @@ expand, Ctrl+Shift+- / Ctrl+Shift+= collapse / expand all, arrows move the curso
 Ctrl+P find file (`name:line`), Ctrl+G go to line, Ctrl+F find (Tab: replace, Enter replaces, Alt+A replaces all), F3 / Shift+F3 next / previous match, Ctrl+Shift+F search,
 Alt+Z soft wrap, Ctrl+Shift+. breadcrumbs, Ctrl+Shift+O outline, Ctrl+T declarations, F12 / Ctrl-click definition,
 Alt+F12 peek, Ctrl+Shift+B type definition, Ctrl+Alt+B implementations, Shift+F12 usages, Ctrl+Alt+H call hierarchy,
-Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: also Cmd+[ / Cmd+]) back/forward,
+Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: also Cmd+[ / Cmd+]) back/forward
+(every jump is a step, a definition in the same file too: Back returns to each place you Ctrl-clicked, in turn),
 F11 toggle bookmark, Ctrl+F11 bookmark key, Shift+F11 bookmarks, Ctrl+Shift+0–9 / Alt+0–9 set / go to a numbered
 bookmark, Ctrl+E recent files, Ctrl+Alt+E recent locations, Ctrl+Shift+V Markdown source/preview, F10 command menu,
 Ctrl+Shift+A find action; Escape closes a menu or cancels a pending definition. Ctrl+Alt+Down / Up add a cursor on the next / previous line in both keymaps (also **Add Cursor Below / Above** in the Edit menu), Alt+J selects the word under the caret and then its next occurrence, and Escape, a click or a caret move returns to one cursor; several selections are edited and undone together ([limits](tui.md)). Tab / Shift+Tab indent and outdent the selected lines with the file's EditorConfig or project step, Ctrl+/ (or Alt+/) comments, Ctrl+Shift+Down / Up move lines (VS Code keymap: Alt+Down / Up) and Alt+Shift+Down / Up duplicate them ([structural edits](tui.md)). In the GUI, Close Window

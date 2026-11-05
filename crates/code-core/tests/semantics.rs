@@ -4373,3 +4373,32 @@ fn erasing_the_last_name_closes_automatic_but_preserves_manual_completion() {
     assert_eq!(f.s.state().completion().unwrap().trigger, code_core::session::CompletionTrigger::Manual);
     assert_eq!(current_text(f.s.state()), original);
 }
+
+/// Each Go to Definition is a Back step, also within one file: Back returns to every place a definition was asked
+/// from, in turn, and Forward retraces the steps.
+#[test]
+fn back_returns_to_each_place_a_definition_was_asked_from_in_the_same_file() {
+    let main = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let mut f = fixture(&[], &[("src/main.rs", main)]);
+    f.open("src/main.rs");
+    let caret = |f: &Fixture| f.s.state().selection().unwrap().head;
+    let first_call = f.caret("first();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn first").unwrap() + 3));
+    assert_eq!(f.selected_text(), "first");
+    let second_call = f.caret("second();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn second").unwrap() + 3));
+    assert!(f.s.state().can_back());
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), second_call, "back to the second click");
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), first_call, "back to the first click");
+    // Forward retraces the steps: where the second definition was asked from (the place left), then that definition.
+    f.s.dispatch(Command::Forward);
+    assert_eq!(caret(&f), second_call, "forward to the second click");
+    f.s.dispatch(Command::Forward);
+    assert_eq!(f.selected_text(), "second", "forward to the second definition");
+    assert!(!f.s.state().can_forward());
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), main);
+}
