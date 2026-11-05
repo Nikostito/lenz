@@ -53,6 +53,10 @@ impl State {
     pub fn name_letter_search(&self) -> bool {
         self.settings.name_letter_search
     }
+    /// Always Select Opened File is on: the explorer follows the active file.
+    pub fn always_select_opened_file(&self) -> bool {
+        self.settings.always_select_opened_file
+    }
     /// Inline blame is on: the caret line's commit shows after its end.
     pub fn inline_blame(&self) -> bool {
         self.settings.inline_blame

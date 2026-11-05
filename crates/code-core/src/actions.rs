@@ -390,6 +390,7 @@ impl Session {
             CommandId::FollowLink => Command::FollowLink,
             CommandId::LocateFile => Command::Locate,
             CommandId::FoldersFirst => Command::SetFoldersFirst(true),
+            CommandId::AlwaysSelectOpenedFile => Command::SetAlwaysSelectOpenedFile(!state.always_select_opened_file()),
             CommandId::AllByName => Command::SetFoldersFirst(false),
             CommandId::SplitRight => Command::Split(Split::Columns),
             CommandId::SplitDown => Command::Split(Split::Rows),
@@ -560,7 +561,7 @@ impl CommandId {
             Self::RelativeLineNumbers | Self::SoftWrap | Self::StickyScroll | Self::Breadcrumbs | Self::FileIcons | Self::ImageSource | Self::MarkdownSource | Self::PreviewBeside => return G::Appearance,
             Self::Collapse | Self::Expand | Self::CollapseAll | Self::ExpandAll | Self::CollapseCommentsImports => return G::Folding,
             Self::DocumentationOnHover | Self::AutoCompletion | Self::InlayTypes | Self::InlayParameters | Self::SemanticHighlighting => return G::Hints,
-            Self::LocateFile | Self::CopyExplorerName | Self::CopyExplorerFullPath | Self::CopyExplorerRelativePath | Self::CopyExplorerEntry | Self::PasteExplorerEntry | Self::CancelExplorerCopy | Self::ExplorerHistory | Self::RenameExplorerEntry | Self::MoveExplorerEntry | Self::DeleteExplorerEntry | Self::DeleteExplorerPermanently | Self::RestoreDeleted | Self::FoldersFirst | Self::AllByName => return G::Explorer,
+            Self::LocateFile | Self::CopyExplorerName | Self::CopyExplorerFullPath | Self::CopyExplorerRelativePath | Self::CopyExplorerEntry | Self::PasteExplorerEntry | Self::CancelExplorerCopy | Self::ExplorerHistory | Self::RenameExplorerEntry | Self::MoveExplorerEntry | Self::DeleteExplorerEntry | Self::DeleteExplorerPermanently | Self::RestoreDeleted | Self::FoldersFirst | Self::AllByName | Self::AlwaysSelectOpenedFile => return G::Explorer,
             Self::CsvTable | Self::CsvHeader | Self::CsvFilter | Self::CsvSort | Self::CsvClearFilter | Self::CsvMoveLeft | Self::CsvMoveRight | Self::CsvDropColumn | Self::CsvEditCell => return G::Csv,
             Self::AnnotateBlame | Self::InlineBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision => return G::Annotations,
             Self::GitBranches | Self::NewBranch | Self::CheckoutRevision => return G::Branches,
@@ -591,7 +592,7 @@ impl CommandId {
             | Self::ImageSource | Self::MarkdownSource | Self::PreviewBeside | Self::ToggleExplorer | Self::LocateFile | Self::NewExplorerFile | Self::NewExplorerFolder
             | Self::CopyExplorerName | Self::CopyExplorerFullPath | Self::CopyExplorerRelativePath | Self::CopyExplorerEntry | Self::PasteExplorerEntry | Self::CancelExplorerCopy | Self::ExplorerHistory
             | Self::RenameExplorerEntry | Self::MoveExplorerEntry | Self::DeleteExplorerEntry | Self::DeleteExplorerPermanently | Self::RestoreDeleted
-            | Self::FoldersFirst | Self::AllByName | Self::AnnotateBlame | Self::InlineBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision | Self::SplitRight | Self::SplitDown | Self::Unsplit
+            | Self::FoldersFirst | Self::AllByName | Self::AlwaysSelectOpenedFile | Self::AnnotateBlame | Self::InlineBlame | Self::CloseAnnotations | Self::NarrowAnnotations | Self::WidenAnnotations | Self::ShowCommit | Self::ShowCommitDiff | Self::CopyRevision | Self::SplitRight | Self::SplitDown | Self::Unsplit
             | Self::FocusOtherPane | Self::MoveTabToOtherPane | Self::WidenExplorer | Self::NarrowExplorer | Self::TallerResults | Self::ShorterResults | Self::EnlargeFirstPane | Self::EnlargeSecondPane => G::View,
             Self::GitBranches | Self::NewBranch | Self::CheckoutRevision | Self::ShowLocalChanges | Self::CompareWithRevision | Self::CompareWithBase
             | Self::ShowBranchChanges | Self::CompareWithWorktree | Self::ResolveConflicts => G::Git,

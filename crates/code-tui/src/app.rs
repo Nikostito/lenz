@@ -186,6 +186,8 @@ pub(crate) struct App {
     pub icons_override: Option<bool>,
     /// macOS's keys: with macOS Word Motion on, Alt (Option)+Left/Right move by word in the text.
     pub mac_keys: bool,
+    /// The last Always Select Opened File ticket acted on.
+    follow_seen: u64,
     pub session: Session,
     pub modal: Option<Modal>,
     pub focus: Focus,
@@ -258,6 +260,7 @@ impl App {
             // Unit tests read plain labels unless they choose glyphs (the default has its own test).
             icons_override: if cfg!(test) { Some(false) } else { std::env::var("LENZ_ICONS").ok().map(|v| v == "nerd") },
             mac_keys: cfg!(target_os = "macos"),
+            follow_seen: 0,
             session: Session::with_text_input(config, enabled),
             modal: None,
             focus: Focus::Text,
@@ -366,6 +369,19 @@ impl App {
         }
     }
 
+    /// Always Select Opened File: highlight the active file's row and scroll to it, once per ticket; a hidden explorer
+    /// stays hidden.
+    pub(crate) fn sync_follow(&mut self) {
+        let Some((path, ticket)) = self.session.state().tree_follow() else { return };
+        if ticket <= self.follow_seen { return; }
+        self.follow_seen = ticket;
+        if let Some(at) = self.session.state().tree_rows().position(|r| r.path == path) {
+            self.tree_at = at;
+            self.tree_seen = usize::MAX;
+            self.tree_top = self.tree_top.min(at);
+        }
+    }
+
     /// Show and select the row the session asked for, once per ticket.
     pub(crate) fn sync_reveal(&mut self) {
         let Some((path, ticket)) = self.session.state().tree_reveal() else { return };
@@ -470,6 +486,7 @@ impl App {
             self.tree_at = self.session.state().active_in_tree().and_then(|path| self.session.state().tree_rows().position(|r| r.path == path)).unwrap_or(0);
         }
         self.sync_reveal();
+        self.sync_follow();
         if let Some(plan) = effect.external { self.start(plan.launch,plan.toast); }
         if let Some(copy) = effect.copy {
             self.copy = Some(copy);
@@ -562,6 +579,7 @@ impl App {
             self.tree_at = self.session.state().tree_rows().position(|r| r.path == path).unwrap_or(0);
         }
         self.sync_reveal();
+        self.sync_follow();
         if self.session.state().results().map(|r| r.id()) != results_id {
             self.results_at = 0;
             self.results_top = 0;

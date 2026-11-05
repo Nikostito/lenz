@@ -6945,3 +6945,68 @@ fn a_definition_in_nested_modules_lands_below_the_sticky_headers_in_both_adapter
     }
     assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
 }
+
+/// Always Select Opened File, turned on from each adapter's command list: the explorer selects each file that becomes
+/// active, its folders opened, in both; a hidden explorer stays hidden and still follows.
+#[gpui::test]
+fn always_select_opened_file_follows_the_active_file_in_both_explorers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    for file in ["src/ui/view.rs", "src/data/store.rs", "a.md"] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x\n").unwrap();
+    }
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let mut draw = |visual: &mut VisualTestContext, tui: &mut App| {
+        visual.update(|w, cx| { let _ = w.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    draw(&mut visual, &mut tui);
+    // On from Find Action in the window and from the command list in the terminal.
+    visual.simulate_keystrokes("ctrl-shift-a a l w a y s space s e l e c t");
+    settle(&mut visual, &mut tui, &|_| true);
+    let gui_ready = |v: &ReaderView| v.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "Explorer: Always Select Opened File"));
+    let until = Instant::now() + Duration::from_secs(10);
+    while !gui.read_with(&visual, |v, _| gui_ready(v)) { gui.update(&mut visual, |v, cx| v.poll(cx)); assert!(Instant::now() < until); std::thread::sleep(Duration::from_millis(2)); }
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)));
+    for c in "always select".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(gui.read_with(&visual, |v, _| v.session().state().always_select_opened_file()), "GUI on");
+    assert!(tui.session.state().always_select_opened_file(), "TUI on");
+    let selected = |visual: &mut VisualTestContext, tui: &App| (
+        gui.read_with(visual, |v, _| v.tree_sel.as_deref().map(str::to_owned)),
+        tui.session.state().tree_rows().nth(tui.tree_at).map(|r| r.path.to_string()),
+    );
+    for (file, hide) in [("src/ui/view.rs", false), ("src/data/store.rs", false), ("a.md", true)] {
+        if hide {
+            visual.simulate_keystrokes("ctrl-b");
+            tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)));
+            assert!(!gui.read_with(&visual, |v, _| v.explorer_shown_for_test()) && !tui.tree_shown, "hidden");
+        }
+        gui.update(&mut visual, |v, cx| v.dispatch_for_test(Command::Open(root.join(file)), cx));
+        tui.dispatch(Command::Open(root.join(file)));
+        settle(&mut visual, &mut tui, &|s| s.active_in_tree().as_deref() == Some(file));
+        draw(&mut visual, &mut tui);
+        assert_eq!(selected(&mut visual, &tui), (Some(file.to_string()), Some(file.to_string())), "{file}");
+        if hide { assert!(!gui.read_with(&visual, |v, _| v.explorer_shown_for_test()) && !tui.tree_shown, "a hidden explorer stays hidden"); }
+    }
+}
