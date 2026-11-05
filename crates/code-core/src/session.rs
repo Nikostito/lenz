@@ -2890,6 +2890,9 @@ pub struct Session {
     projections: crate::projection_jobs::Scheduler,
     layouts: crate::layout_jobs::Scheduler,
     layout_intents: [Option<LayoutIntent>; 2],
+    /// A navigation's landing (a definition, Back/Forward) whose caret line must end below the sticky headers: kept
+    /// until the tab's declarations, which make the headers, are known; any later user input gives it up.
+    band_goal: Option<TabId>,
     native: crate::native::Reveals,
     jobs: Jobs,
     analysis: crate::analysis::Analysis,
@@ -3219,7 +3222,7 @@ impl Session {
             semantic_wait: Default::default(),
             projections: Default::default(),
             layouts: Default::default(),
-            layout_intents: Default::default(), native: Default::default(),
+            layout_intents: Default::default(), band_goal: None, native: Default::default(),
             themes,
             theme_preview: None,
             request: 0,
@@ -4397,6 +4400,7 @@ impl Session {
         // (Home while an End seek is pending, for example). Adapter layout/metric feedback is not user input.
         if matches!(&input, Input::Command(command) if !matches!(command, Command::PrepareLayout { .. } | Command::PrepareProjection(_) | Command::CancelProjection { .. } | Command::ClampColumn { .. } | Command::SetTextSize { .. } | Command::SetNativeContext { .. } | Command::MeasuredReveal { .. } | Command::TakeExternal { .. })) {
             self.layout_intents = Default::default();
+            self.band_goal = None;
             self.native.cancel();
         }
         if !self.vim_group_edit && matches!(&input, Input::Command(command) if !matches!(command, Command::Edit { .. } | Command::Delete { .. } | Command::InsertText { .. }
@@ -4467,6 +4471,7 @@ impl Session {
         }
         self.invalidate_result_analysis();
         self.sync_project_syntax();
+        effect.repaint |= self.settle_band_goal();
         self.sync_inline_blame();
         self.refresh_blame();
         // A shown draft's change markers follow its text: only a version or baseline that changed is compared again.
@@ -9155,6 +9160,22 @@ impl Session {
         self.native.issue(&self.state, tab, source);
     }
 
+    /// A navigation's landing kept clear of the sticky band ([`Session::band_goal`]): done once the tab shows its
+    /// placed caret with its declarations parsed and a laid-out pane; given up when sticky scroll is off. Whether the
+    /// view moved.
+    fn settle_band_goal(&mut self) -> bool {
+        let Some(id) = self.band_goal else { return false };
+        if !self.state.settings.sticky_scroll || !self.is_shown(id) { self.band_goal = None; return false; }
+        let Some(view) = self.state.view(id) else { return false };
+        let pane = view.tab().pane() as usize;
+        if view.tab().restore.is_some() || view.declarations().is_none() || self.state.text_size[pane].1 == 0 { return false; }
+        let Some(line) = view.tab().selection().map(|s| view.snapshot().line_of(s.head)) else { self.band_goal = None; return false };
+        self.band_goal = None;
+        let top = (view.tab().top_line(), view.tab().top_row());
+        self.clear_of_band(id, line, 0);
+        self.state.view(id).is_some_and(|v| (v.tab().top_line(), v.tab().top_row()) != top)
+    }
+
     /// Keep a known exact row below the sticky band. Cold layout resumes through the same bounded lane.
     fn clear_of_band(&mut self, tab: TabId, line: usize, row: usize) {
         use crate::layout::Query;
@@ -9292,6 +9313,8 @@ impl Session {
                 Some(snapshot) => t.restore_to(to, &snapshot),
                 None => { t.restore = Some(to.clone()); t.top_line = to.top_line; }
             }
+            // Its line goes below the sticky headers of the declarations around it, once they are known.
+            self.band_goal = Some(id);
         }
         // A step for another tab, or for another line of this one (a definition in the same file, as Go to Line).
         let moved = !same || from.as_ref().zip(restore.as_ref()).is_some_and(|(from, to)| from.line != to.line);
