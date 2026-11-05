@@ -295,6 +295,8 @@ pub enum Command {
     SetRelativeLineNumbers(bool),
     /// The caret line's commit, faint after the line's end (author, date and summary); remembered.
     SetInlineBlame(bool),
+    /// The explorer follows the active file: whenever it changes, the explorer selects it; remembered.
+    SetAlwaysSelectOpenedFile(bool),
     /// macOS-style word motion: Option+Left/Right move by word, and word stops cross the spaces between words; remembered.
     SetMacWordMotion(bool),
     /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
@@ -861,6 +863,8 @@ pub enum CommandId {
     /// The tree's order: each folder's folders before its files, or everything by name.
     FoldersFirst,
     AllByName,
+    /// The explorer selects the active file whenever it changes (IntelliJ's Always Select Opened File); remembered.
+    AlwaysSelectOpenedFile,
     GitBranches,
     NewBranch,
     CheckoutRevision,
@@ -958,7 +962,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 253] = [
+    pub const ALL: [CommandId; 254] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1134,6 +1138,7 @@ impl CommandId {
         Self::LocateFile,
         Self::FoldersFirst,
         Self::AllByName,
+        Self::AlwaysSelectOpenedFile,
         Self::GitBranches,
         Self::NewBranch,
         Self::CheckoutRevision,
@@ -1431,6 +1436,7 @@ impl CommandId {
             Self::ToggleExplorer => "Show / Hide Explorer",
             Self::LocateFile => "Select Opened File in Explorer",
             Self::FoldersFirst => "Explorer: Folders First",
+            Self::AlwaysSelectOpenedFile => "Explorer: Always Select Opened File",
             Self::AllByName => "Explorer: All by Name",
             Self::SplitRight => "Split Right",
             Self::SplitDown => "Split Down",
@@ -1792,6 +1798,9 @@ pub struct State {
     tree_revision: u64,
     /// The explorer row the session asked the adapters to show and select, with its ticket.
     tree_reveal: Option<(Arc<str>, u64)>,
+    /// Always Select Opened File: the active file's row for the adapters to select (and scroll to, not show the
+    /// explorer for), once per ticket.
+    tree_follow: Option<(Arc<str>, u64)>,
     explorer: crate::workspace::Explorer,
     explorer_search: ExplorerSearch,
     workspace_revision: u64,
@@ -2429,6 +2438,9 @@ impl State {
     /// The explorer row the session asked the adapters to show and select, and its ticket:
     /// adapters apply it when the ticket changes, after any revision reset.
     pub fn tree_reveal(&self) -> Option<(Arc<str>, u64)> { self.tree_reveal.clone() }
+    /// Always Select Opened File's row to select (the active file's), and its ticket: a newer ticket asks again. The
+    /// explorer stays hidden if it is.
+    pub fn tree_follow(&self) -> Option<(Arc<str>, u64)> { self.tree_follow.clone() }
     pub fn active_in_tree(&self) -> Option<Arc<str>> {
         let t = self.active()?;
         if self.libraries.contains(&t.source) { return Some(t.source.to_string_lossy().as_ref().into()); }
@@ -2657,6 +2669,7 @@ impl State {
             CommandId::FileIcons => Some(self.settings.file_icons),
             CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.annotating())),
             CommandId::InlineBlame => Some(self.settings.inline_blame),
+            CommandId::AlwaysSelectOpenedFile => Some(self.settings.always_select_opened_file),
             CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
             CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
@@ -2893,6 +2906,9 @@ pub struct Session {
     /// A navigation's landing (a definition, Back/Forward) whose caret line must end below the sticky headers: kept
     /// until the tab's declarations, which make the headers, are known; any later user input gives it up.
     band_goal: Option<TabId>,
+    /// Always Select Opened File: the active file it last revealed, and whether its row was selected (a library's
+    /// folders may still be read).
+    followed: Option<(Arc<str>, bool)>,
     native: crate::native::Reveals,
     jobs: Jobs,
     analysis: crate::analysis::Analysis,
@@ -3159,6 +3175,7 @@ impl Session {
             libraries: Default::default(),
             tree_revision: 0,
             tree_reveal: None,
+            tree_follow: None,
                 explorer: Default::default(), explorer_search: Default::default(), workspace_revision: 0,
                 recent,
                 recent_alone,
@@ -3222,7 +3239,7 @@ impl Session {
             semantic_wait: Default::default(),
             projections: Default::default(),
             layouts: Default::default(),
-            layout_intents: Default::default(), band_goal: None, native: Default::default(),
+            layout_intents: Default::default(), band_goal: None, followed: None, native: Default::default(),
             themes,
             theme_preview: None,
             request: 0,
@@ -3428,7 +3445,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -4472,6 +4489,7 @@ impl Session {
         self.invalidate_result_analysis();
         self.sync_project_syntax();
         effect.repaint |= self.settle_band_goal();
+        effect.repaint |= self.follow_active_file();
         self.sync_inline_blame();
         self.refresh_blame();
         // A shown draft's change markers follow its text: only a version or baseline that changed is compared again.
@@ -5004,6 +5022,12 @@ impl Session {
             }
             Command::SetNameLetterSearch(on) => {
                 self.state.settings.name_letter_search = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetAlwaysSelectOpenedFile(on) => {
+                self.state.settings.always_select_opened_file = on;
+                self.followed = None;
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
@@ -9160,6 +9184,25 @@ impl Session {
         self.native.issue(&self.state, tab, source);
     }
 
+    /// Always Select Opened File: when the active file changes, its folders open (as the explorer's target button
+    /// does) and its row is offered to the adapters to select. A library's row waits for its folder to be read.
+    fn follow_active_file(&mut self) -> bool {
+        if !self.state.settings.always_select_opened_file { return false; }
+        let Some(rel) = self.state.active_in_tree() else { return false };
+        let mut repaint = false;
+        if self.followed.as_ref().is_none_or(|(path, _)| *path != rel) {
+            self.followed = Some((rel.clone(), false));
+            repaint |= self.command(Command::Locate).repaint;
+        }
+        if self.followed.as_ref().is_some_and(|(_, selected)| !selected) && self.state.tree_rows().any(|row| row.path == rel) {
+            let ticket = self.state.tree_follow.as_ref().map_or(1, |(_, t)| t + 1);
+            self.state.tree_follow = Some((rel.clone(), ticket));
+            self.followed = Some((rel, true));
+            repaint = true;
+        }
+        repaint
+    }
+
     /// A navigation's landing kept clear of the sticky band ([`Session::band_goal`]): done once the tab shows its
     /// placed caret with its declarations parsed and a laid-out pane; given up when sticky scroll is off. Whether the
     /// view moved.
@@ -10408,6 +10451,8 @@ struct Settings {
     /// Long lines wrap at the pane's width.
     soft_wrap: bool,
     relative_line_numbers: bool,
+    /// The explorer selects the active file whenever it changes.
+    always_select_opened_file: bool,
     /// The caret line's commit shows faintly after the line's end.
     inline_blame: bool,
     /// Option+Left/Right move by word (macOS) and word stops cross the spaces between words.
@@ -10444,7 +10489,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
