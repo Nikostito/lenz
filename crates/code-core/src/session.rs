@@ -9293,7 +9293,9 @@ impl Session {
                 None => { t.restore = Some(to.clone()); t.top_line = to.top_line; }
             }
         }
-        if record && !same && let Some(to) = self.here() {
+        // A step for another tab, or for another line of this one (a definition in the same file, as Go to Line).
+        let moved = !same || from.as_ref().zip(restore.as_ref()).is_some_and(|(from, to)| from.line != to.line);
+        if record && moved && let Some(to) = self.here() {
             self.visit(from, to);
         }
         self.rewatch();

@@ -6781,3 +6781,79 @@ fn open_find_and_type(tui: &mut App, text: &str) {
     tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)));
     for c in text.chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
 }
+
+/// Go to Definition within one file is a Back step in both adapters: Back (Cmd+[ in the GUI, Alt+Left in the terminal)
+/// returns to each place a definition was asked from, and Forward retraces the steps.
+#[gpui::test]
+fn back_returns_to_each_definition_asked_in_the_same_file_in_both_adapters(cx: &mut TestAppContext) {
+    use code_core::semantics::Status;
+    let profile = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_owned();
+    assert!(std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-q", "--locked", "-p", "code-core", "--example", "fake_lsp"])
+        .current_dir(env!("CARGO_MANIFEST_DIR")).status().unwrap().success());
+    let fake = profile.join("examples/fake_lsp");
+    let source = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let main = root.join("src/main.rs");
+    std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='hops'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(&main, source).unwrap();
+    let make = |name| {
+        let c = config(&dir.path().join(name));
+        let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&c.providers).unwrap()).unwrap();
+        settings["providers"]["rust-analyzer"] = serde_json::json!({"executable": fake});
+        std::fs::write(&c.providers, settings.to_string()).unwrap();
+        c
+    };
+    let gui = cx.new(|cx| ReaderView::new(Session::new(make("gui")), Some(main.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(make("tui"), Some(main.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until, "{:?}", tui.session.state().notices());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some() && s.provider().is_some_and(|p| p.status == Status::Ready));
+    // Editing on, as the reader's: Home goes to the line's first character in both.
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let caret = |s: &State| s.selection().map(|sel| sel.head);
+    let selected = |s: &State| s.selection().map(|sel| sel.range());
+    let first = source.find("fn first").unwrap() + 3;
+    let second = source.find("fn second").unwrap() + 3;
+    // Into `first();` on line 2, F12; then into `second();` in first's body, F12.
+    let mut clicks = Vec::new();
+    for (gui_keys, tui_keys, to) in [
+        ("ctrl-home down home right", vec![(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::Home, KeyModifiers::NONE), (KeyCode::Right, KeyModifiers::NONE)], first..first + 5),
+        ("down home right", vec![(KeyCode::Down, KeyModifiers::NONE), (KeyCode::Home, KeyModifiers::NONE), (KeyCode::Right, KeyModifiers::NONE)], second..second + 6),
+    ] {
+        visual.simulate_keystrokes(gui_keys);
+        for (code, modifiers) in tui_keys { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); }
+        let at = caret(tui.session.state());
+        assert_eq!(gui.read_with(&visual, |v, _| caret(v.session().state())), at);
+        clicks.push(at);
+        visual.simulate_keystrokes("f12");
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)));
+        settle(&mut visual, &mut tui, &|s| s.asking().is_none() && selected(s) == Some(to.clone()));
+    }
+    for expected in [clicks[1], clicks[0]] {
+        visual.simulate_keystrokes("cmd-[");
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(caret(tui.session.state()), expected);
+        assert_eq!(gui.read_with(&visual, |v, _| caret(v.session().state())), expected);
+    }
+    visual.simulate_keystrokes("cmd-] cmd-]");
+    for _ in 0..2 { tui.handle(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT))); }
+    assert_eq!(selected(tui.session.state()), Some(second..second + 6));
+    assert_eq!(gui.read_with(&visual, |v, _| selected(v.session().state())), Some(second..second + 6));
+    assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
+}
