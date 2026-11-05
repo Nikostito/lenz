@@ -4402,3 +4402,34 @@ fn back_returns_to_each_place_a_definition_was_asked_from_in_the_same_file() {
     assert!(!f.s.state().can_forward());
     assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), main);
 }
+
+/// A definition deep in nested modules lands with its line in view below the sticky headers of the modules around
+/// it, not under them, in the same file and from another one.
+#[test]
+fn a_definition_in_nested_modules_lands_below_the_sticky_headers() {
+    let body = "                    let _ = 1;\n".repeat(12);
+    // The methods before it push `fn deep` far below the headers, as in a long class.
+    let before = "                pub fn filler() {}\n".repeat(30);
+    let nested = format!("pub mod a {{\n    pub mod b {{\n        pub mod c {{\n            pub mod d {{\n{before}                pub fn deep() {{\n{body}                }}\n            }}\n        }}\n    }}\n}}\n");
+    let main = format!("{nested}fn main() {{\n{}    a::b::c::d::deep();\n}}\n", "    let _ = 0;\n".repeat(40));
+    let other = "mod lib;\nfn caller() { lib::a::b::c::d::deeper(); }\n";
+    let mut f = fixture(&[], &[("src/main.rs", &main), ("src/lib.rs", &nested.replace("fn deep", "fn deeper")), ("src/other.rs", other)]);
+    let def_line = 34;
+    for (file, needle, name) in [("src/main.rs", "deep();", "deep"), ("src/other.rs", "deeper();", "deeper")] {
+        f.open(file);
+        f.s.dispatch(Command::SetTextSize { pane: 0, cols: 100, rows: 20 });
+        f.s.dispatch(Command::Scroll(usize::MAX));
+        f.definition(needle, false);
+        f.settle(|s| s.state().asking().is_none() && s.state().current_source().is_some_and(|d| d.line_of(s.state().selection().map_or(0, |sel| sel.head)) == def_line && !d.source().ends_with("other.rs")));
+        // Its sticky headers, once the file's declarations are known.
+        f.settle(|s| s.state().active().is_some_and(|t| s.state().view(t.id()).is_some_and(|v| v.declarations().is_some())));
+        let (top, band) = {
+            let state = f.s.state();
+            let view = state.view(state.active().unwrap().id()).unwrap();
+            let code_core::layout::Query::Ready(sticky) = view.layout_sticky(code_core::tabs::sticky_cap(20), None) else { panic!("sticky layout pending") };
+            (view.tab().top_line(), sticky.len())
+        };
+        assert!(def_line >= top + band, "{file}: `fn deep` (line {def_line}) is under the {band} sticky header(s) from top line {top}");
+        assert_eq!(f.selected_text(), name, "{file}");
+    }
+}

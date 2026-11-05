@@ -574,7 +574,9 @@ Soft Wrap (Alt+Z, remembered) wraps long lines at the pane's width; continuation
 carry no number. Large files, images and previews do not wrap.
 
 Sticky Scroll pins the first lines of the declarations around the top line over each pane's text (at most five, the
-innermost kept; Rust `impl` blocks and Markdown sections count); a click goes there. A breadcrumb bar under each pane's
+innermost kept; Rust `impl` blocks and Markdown sections count); a click goes there. A jump (a definition, Go to Line,
+Back/Forward) lands with its line below them, also deep in nested modules and once a newly opened file's declarations
+arrive. A breadcrumb bar under each pane's
 tabs shows the file's path in the project, then the declarations holding the caret: a folder or file shows in the
 explorer, a declaration gets the caret, and the `›` after a crumb lists a folder's entries, the files beside a file,
 or the declarations beside a declaration (type to filter, Enter goes there). Ctrl+Shift+. gives the bar the keys (Left /
