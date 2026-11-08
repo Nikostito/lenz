@@ -144,7 +144,11 @@ for memory, workload scope and unverified platforms.
 
 Builds for macOS (Apple Silicon) and Linux (x86_64, aarch64) are on the [GitHub Releases page](https://github.com/aantoniadis/lenz/releases); the current one is a beta.
 
-- **Homebrew** (macOS arm64, Linux): `brew install aantoniadis/lenz/lenz`, from the tap's formula (`packaging/homebrew/lenz.rb`).
+- **Homebrew** (macOS arm64, Linux): `brew install aantoniadis/lenz/lenz`, from the tap's formula (`packaging/homebrew/lenz.rb`). On macOS the formula keeps `Lenz.app` in its own prefix; for Launchpad and Spotlight, link it into `/Applications` (the link follows upgrades; remove it after `brew uninstall`):
+
+  ```sh
+  ln -s "$(brew --prefix lenz)/Lenz.app" /Applications/Lenz.app
+  ```
 - **Arch Linux**: `packaging/aur/PKGBUILD` builds `lenz-bin` from the release tarball: `curl -LO https://raw.githubusercontent.com/aantoniadis/lenz/main/packaging/aur/PKGBUILD && makepkg -si`. It will be submitted to the AUR as `lenz-bin` once account registration there reopens.
 - **Tarball**: `lenz-<version>-<target>.tar.gz` from the [releases](https://github.com/aantoniadis/lenz/releases) holds `lenz`, `lenz-code`, `lenz-code-tui`, `lenz-diff`, `lenz-diff-tui`, this README and the licences; put the five executables on your `PATH`, together. On macOS they are inside `Lenz.app` (so the Dock shows its icon), with a symlink into it for each: keep them with the bundle, or link to `Lenz.app/Contents/MacOS/<name>`.
 - **From source**: build the release package with `packaging/package.sh <version>` and put the five executables from `target/package/lenz-<version>-<target>/` on your `PATH`; see [Build](#build) for the system libraries.
