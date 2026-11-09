@@ -302,6 +302,8 @@ pub enum Command {
     SetAlwaysSelectOpenedFile(bool),
     /// macOS-style word motion: Option+Left/Right move by word, and word stops cross the spaces between words; remembered.
     SetMacWordMotion(bool),
+    /// Leaving a file (another tab, file or pane becomes active) saves its edits as Save does; remembered.
+    SetSaveOnLeave(bool),
     /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
     SetNameLetterSearch(bool),
     /// Search Everywhere ranks files near the open and recent ones higher (and a file named exactly as the query
@@ -661,6 +663,8 @@ pub enum CommandId {
     VimMode,
     /// Option+Left/Right move by word (macOS), word stops crossing spaces; remembered, off by default.
     MacWordMotion,
+    /// Save a file's edits, as Save does, when another tab, file or pane becomes active; remembered, off by default.
+    SaveOnLeave,
     /// Search Everywhere's All tab finds files by letters in order in their name; remembered, off by default.
     NameLetterSearch,
     /// Search Everywhere and Find File rank files near the open and recent ones higher; remembered, off by default.
@@ -970,7 +974,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 255] = [
+    pub const ALL: [CommandId; 256] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -992,6 +996,7 @@ impl CommandId {
         Self::RelativeLineNumbers,
         Self::VimMode,
         Self::MacWordMotion,
+        Self::SaveOnLeave,
         Self::NameLetterSearch,
         Self::RankNearbyFiles,
         Self::StickyScroll,
@@ -1400,6 +1405,7 @@ impl CommandId {
             Self::AnnotateBlame => "Annotate with Git Blame",
             Self::InlineBlame => "Inline Blame",
             Self::MacWordMotion => "macOS Word Motion",
+            Self::SaveOnLeave => "Save When Leaving a File",
             Self::NameLetterSearch => "Search Everywhere: Letters in File Names",
             Self::RankNearbyFiles => "Search Everywhere: Rank by Open and Recent Files",
             Self::CloseAnnotations => "Close Annotations",
@@ -2681,6 +2687,7 @@ impl State {
             CommandId::InlineBlame => Some(self.settings.inline_blame),
             CommandId::AlwaysSelectOpenedFile => Some(self.settings.always_select_opened_file),
             CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
+            CommandId::SaveOnLeave => Some(self.settings.save_on_leave),
             CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
             CommandId::RankNearbyFiles => Some(self.settings.rank_nearby_files),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
@@ -3456,7 +3463,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::RankNearbyFiles | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::SaveOnLeave | CommandId::NameLetterSearch | CommandId::RankNearbyFiles | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -5024,6 +5031,11 @@ impl Session {
             Command::GoToLine(at) => self.go_to_line(at),
             Command::SetRelativeLineNumbers(on) => {
                 self.state.settings.relative_line_numbers = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetSaveOnLeave(on) => {
+                self.state.settings.save_on_leave = on;
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
@@ -9202,6 +9214,15 @@ impl Session {
         self.native.issue(&self.state, tab, source);
     }
 
+    /// Save When Leaving a File: the tab another one replaces as the active tab is saved, while its draft is still
+    /// shown, if it is an edited file that can be saved. Its exact text is written (no format on save: a server's
+    /// answer would come for a tab no longer shown). Untitled documents and read-only, busy or blocked files are
+    /// left for the user; closing a tab is the close prompt's, not this.
+    fn save_on_leave(&mut self, tab: TabId) {
+        let saveable = self.state.tabs.iter().any(|t| t.id == tab && t.is_file() && !t.untitled()) && self.state.tab_dirty(tab) && self.save_disabled(tab).is_none();
+        if saveable { self.save(tab); }
+    }
+
     /// Always Select Opened File: when the active file changes, its folders open (as the explorer's target button
     /// does) and its row is offered to the adapters to select. A library's row waits for its folder to be read.
     fn follow_active_file(&mut self) -> bool {
@@ -9530,6 +9551,7 @@ impl Session {
                 self.state.semantics.cancel();
             }
             if let Some(old) = self.state.active {
+                if self.state.settings.save_on_leave { self.save_on_leave(old); }
                 self.release(old);
             }
             self.state.active = Some(id);
@@ -10479,6 +10501,8 @@ struct Settings {
     inline_blame: bool,
     /// Option+Left/Right move by word (macOS) and word stops cross the spaces between words.
     mac_word_motion: bool,
+    /// Leaving a file saves its edits as Save does.
+    save_on_leave: bool,
     /// Search Everywhere's All tab also lists files whose name holds the query's letters in order.
     name_letter_search: bool,
     /// Search Everywhere ranks files near the open and recent ones higher.
@@ -10513,7 +10537,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, rank_nearby_files: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, save_on_leave: false, name_letter_search: false, rank_nearby_files: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 

@@ -564,3 +564,55 @@ fn an_edited_file_left_and_shown_again_is_highlighted_as_is_another_file_of_its_
         assert_eq!(std::fs::read_to_string(root.join(a)).unwrap(), good, "{a}: nothing was saved");
     }
 }
+
+#[test]
+fn save_when_leaving_a_file_writes_its_edits_when_another_becomes_active() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] { std::fs::write(root.join(name), "start\n").unwrap(); }
+    let mut s = session(&d.path().join("state"));
+    s.dispatch(Command::OpenRoot(root.clone()));
+    s.enable_text_input_for_test();
+    let open = |s: &mut Session, name: &str| {
+        s.dispatch(Command::OpenRetained(root.join(name)));
+        settle(s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with(name)));
+        s.state().active().unwrap().id()
+    };
+    let disk = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+    // Off (the default): leaving an edited file keeps its edits unsaved.
+    assert_eq!(s.on(CommandId::SaveOnLeave), Some(false));
+    let a = open(&mut s, "a.txt");
+    type_text(&mut s, a, "one\n");
+    let b = open(&mut s, "b.txt");
+    assert!(s.state().tab_dirty(a) && disk("a.txt") == "start\n");
+    // On: switching tabs saves the one left, its exact text.
+    s.dispatch(Command::SetSaveOnLeave(true));
+    type_text(&mut s, b, "two\n");
+    s.dispatch(Command::ActivateTab(a));
+    settle(&mut s, |s| !s.state().tab_dirty(b));
+    assert_eq!(disk("b.txt"), "start\ntwo\n");
+    assert!(s.state().tab_dirty(a), "the file shown keeps its edits");
+    // Opening another file saves too; a saved file is not written again.
+    open(&mut s, "c.txt");
+    settle(&mut s, |s| !s.state().tab_dirty(a));
+    assert_eq!(disk("a.txt"), "start\none\n");
+    // An untitled document has no file to save: left as it is, without a Save As prompt.
+    s.dispatch(Command::NewDocument);
+    let untitled = s.state().active().unwrap().id();
+    type_text(&mut s, untitled, "draft\n");
+    s.dispatch(Command::ActivateTab(a));
+    assert!(s.state().tab_dirty(untitled) && s.save_as_prompt().is_none());
+    // Closing an edited file asks, as without the setting: Discard leaves the file as it was on disk.
+    let c = s.state().tabs().iter().find(|t| t.source().ends_with("c.txt")).unwrap().id();
+    s.dispatch(Command::ActivateTab(c));
+    settle(&mut s, |s| s.state().view(c).is_some());
+    type_text(&mut s, c, "dropped\n");
+    s.dispatch(Command::CloseTab(c));
+    let prompt = s.close_prompt().expect("the close prompt asks");
+    assert_eq!(disk("c.txt"), "start\n", "not saved by closing");
+    s.dispatch(Command::ChooseClose { ticket: prompt.ticket, buffer: prompt.buffer, choice: crate::close::Choice::Discard });
+    settle(&mut s, |s| s.state().tabs().iter().all(|t| t.id() != c));
+    assert_eq!(disk("c.txt"), "start\n", "discarded, not saved");
+    assert!(saved(&d.path().join("state"), |s| s.state().save_on_leave()), "remembered");
+}

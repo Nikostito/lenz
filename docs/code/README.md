@@ -99,6 +99,11 @@ own answers are not chords: the recovered-draft dialog keeps `r`, `d` and Esc in
 
 ### Vim editing and relative line numbers
 
+**Save When Leaving a File** (Edit → Editing Preferences, or Find Action; off by default, remembered) saves an edited
+file as soon as another tab, file or pane becomes active: switching tabs, opening another file, Back/Forward or a
+definition. Its exact text is written (format on save applies to Save itself); untitled documents and read-only files
+are left as they are, and closing a tab still asks, so Discard never writes.
+
 **macOS Word Motion** (Edit → Editing Preferences, or Find Action) makes Option+Left/Right move by word on macOS,
 Shift selecting, with Back/Forward on Cmd+[ / Cmd+] (and the mouse's side buttons). Word stops then cross the spaces
 between words, for Ctrl+arrows and word deletion too: from the end of `width: 80` the stops are `80`, `:` and

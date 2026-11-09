@@ -45,6 +45,10 @@ impl State {
     pub fn relative_line_numbers(&self) -> bool {
         self.settings.relative_line_numbers
     }
+    /// Save When Leaving a File is on.
+    pub fn save_on_leave(&self) -> bool {
+        self.settings.save_on_leave
+    }
     /// macOS Word Motion is on: Option+Left/Right move by word and word stops cross spaces.
     pub fn mac_word_motion(&self) -> bool {
         self.settings.mac_word_motion

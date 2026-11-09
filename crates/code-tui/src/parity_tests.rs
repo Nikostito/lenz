@@ -7053,3 +7053,67 @@ fn a_pasted_path_in_search_everywhere_opens_a_file_outside_the_project_in_both_a
     }
     assert_eq!(std::fs::read(&outside).unwrap(), b"one\ntwo\nthree\n");
 }
+
+/// Save When Leaving a File, turned on from each adapter's command list: switching tabs writes the edited file left,
+/// in both adapters; the file shown keeps its own edits.
+#[gpui::test]
+fn save_when_leaving_a_file_writes_it_on_a_tab_switch_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for side in ["gui", "tui"] {
+        std::fs::create_dir_all(dir.path().join(side)).unwrap();
+        for name in ["a.txt", "b.txt"] { std::fs::write(dir.path().join(side).join(name), "start\n").unwrap(); }
+    }
+    let (gui_a, tui_a) = (dir.path().join("gui/a.txt"), dir.path().join("tui/a.txt"));
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui-state"))), Some(dir.path().join("gui")), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui-state")), Some(dir.path().join("tui")));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    gui.update(&mut visual, |v, _| v.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    // On from Find Action in the window and from the command list in the terminal.
+    visual.simulate_keystrokes("ctrl-shift-a s a v e space w h e n");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !gui.read_with(&visual, |v, _| v.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "Save When Leaving a File"))) {
+        gui.update(&mut visual, |v, cx| v.poll(cx)); assert!(Instant::now() < until); std::thread::sleep(Duration::from_millis(2));
+    }
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)));
+    for c in "save when leaving".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(gui.read_with(&visual, |v, _| v.session().state().save_on_leave()) && tui.session.state().save_on_leave(), "on in both");
+    // a.txt and b.txt open as kept tabs; an edit in a.txt; Ctrl+Tab to b.txt.
+    for name in ["b.txt", "a.txt"] {
+        gui.update(&mut visual, |v, cx| v.dispatch_for_test(Command::OpenRetained(dir.path().join("gui").join(name)), cx));
+        tui.dispatch(Command::OpenRetained(dir.path().join("tui").join(name)));
+    }
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source().ends_with("a.txt")));
+    visual.simulate_keystrokes("ctrl-end x");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert_eq!(std::fs::read_to_string(&gui_a).unwrap(), "start\n");
+    visual.simulate_keystrokes("ctrl-tab");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)));
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source().ends_with("b.txt")));
+    let until = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&gui_a).unwrap() == "start\n" || std::fs::read_to_string(&tui_a).unwrap() == "start\n" {
+        gui.update(&mut visual, |v, cx| v.poll(cx));
+        while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+        assert!(Instant::now() < until, "saved on leaving");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(std::fs::read_to_string(&gui_a).unwrap(), std::fs::read_to_string(&tui_a).unwrap());
+    assert_eq!(std::fs::read_to_string(&tui_a).unwrap(), "start\nx");
+}
