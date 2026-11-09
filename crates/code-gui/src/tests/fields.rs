@@ -6,7 +6,9 @@ fn popup_fields_copy_cut_paste_ranges_and_leave_source_untouched(cx: &mut TestAp
     settle(cx, &f, |v| v.session.state().current_source().is_some());
     let mut visual = visual(cx, &f);
     f.view.update(&mut visual, |v, _| {
-        v.modal = Some(Modal::NewScratch {
+        v.modal = Some(Modal::SaveAs {
+            tab: v.session.state().active().unwrap().id(),
+            dir: std::path::PathBuf::from("/"),
             input: "one é👩🏽‍💻 two".into(),
             selected: false,
             error: None,
@@ -22,19 +24,19 @@ fn popup_fields_copy_cut_paste_ranges_and_leave_source_untouched(cx: &mut TestAp
     visual.simulate_keystrokes("ctrl-x");
     assert!(f.view.read_with(
         &visual,
-        |v, _| matches!(&v.modal,Some(Modal::NewScratch{input,..})if input=="one  two")
+        |v, _| matches!(&v.modal,Some(Modal::SaveAs{input,..})if input=="one  two")
     ));
     visual.simulate_keystrokes("ctrl-v");
     assert!(f.view.read_with(
         &visual,
-        |v, _| matches!(&v.modal,Some(Modal::NewScratch{input,..})if input=="one é👩🏽‍💻 two")
+        |v, _| matches!(&v.modal,Some(Modal::SaveAs{input,..})if input=="one é👩🏽‍💻 two")
     ));
     visual.simulate_keystrokes("ctrl-a");
     visual.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
     visual.simulate_keystrokes("ctrl-v");
     assert!(f.view.read_with(
         &visual,
-        |v, _| matches!(&v.modal,Some(Modal::NewScratch{input,..})if input=="one é👩🏽‍💻 two")
+        |v, _| matches!(&v.modal,Some(Modal::SaveAs{input,..})if input=="one é👩🏽‍💻 two")
     ));
     visual.simulate_resize(size(px(240.), px(180.)));
     draw(&mut visual);
@@ -100,7 +102,9 @@ fn popup_character_and_word_selection_matches_the_text_editor(cx: &mut TestAppCo
     visual.simulate_keystrokes("home ctrl-right right shift-right shift-right ctrl-c");
     let from_editor = visual.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text()));
     f.view.update(&mut visual, |v, _| {
-        v.modal = Some(Modal::NewScratch {
+        v.modal = Some(Modal::SaveAs {
+            tab: v.session.state().active().unwrap().id(),
+            dir: std::path::PathBuf::from("/"),
             input: "one é👩🏽‍💻 two".into(),
             selected: false,
             error: None,

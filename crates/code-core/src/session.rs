@@ -202,6 +202,9 @@ pub enum Command {
     NewDocument,
     /// Create a durable personal file in app-owned storage.
     NewScratch(String),
+    /// A new scratch file of [`crate::scratch::KINDS`]`[kind]`, named `scratch_N.<extension>` (the next free N), opened
+    /// with its SQL dialect when it has one.
+    NewScratchFile(usize),
     OpenScratch(PathBuf),
     /// Create `kind` named `name` in folder `dir` (project-relative, `""` the root) and open or select it.
     CreateEntry { kind: crate::create::Kind, dir: Arc<str>, name: String },
@@ -4428,7 +4431,7 @@ impl Session {
             }
         }
         let laid_out = matches!(&input, Input::Completion(Completion::LaidOut(_)));
-        if matches!(&input, Input::Command(Command::CompareSaved | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
+        if matches!(&input, Input::Command(Command::CompareSaved | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
         let expansion_completion = match &input {
             Input::Completion(Completion::SelectionSteps { request, .. }) => Some(*request),
             Input::Completion(Completion::Analyzed { result, .. }) => match result.as_ref() { Completion::SelectionSteps { request, .. } => Some(*request), _ => None },
@@ -4443,7 +4446,7 @@ impl Session {
         let retire_messages = matches!(&input, Input::Command(_)) && (edit_reveal || reveal_selection) && !self.state.messages.is_empty();
         if retire_messages { self.state.messages.clear(); }
         // Tabs and layout, not each caret move: what an interrupted session reopens.
-        let arranged = matches!(&input, Input::Command(Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
+        let arranged = matches!(&input, Input::Command(Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
             | Command::Pin(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_)
             | Command::SetLayout(_) | Command::ResizeAnnotations { commit: true, .. } | Command::SetSoftWrap(_) | Command::ChooseRecoveredDraft { .. }));
         let input = match input {
@@ -4736,6 +4739,7 @@ impl Session {
             Command::ChooseReplace { ticket, choice } => self.choose_replace(ticket, choice),
             Command::NewDocument => self.new_document(),
             Command::NewScratch(name) => self.new_scratch(name),
+            Command::NewScratchFile(kind) => self.new_scratch_file(kind),
             Command::OpenScratch(path) => self.open_scratch(path),
             Command::CopyExplorerPath { kind } => self.copy_explorer_path(kind),
             Command::CopyExplorerEntry => self.copy_explorer_entry(),

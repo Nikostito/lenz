@@ -77,6 +77,10 @@ fold/unfold, F5 reload), and actions VS Code leaves unbound keep no chord there 
 language-server status, collapse/expand all) instead of reusing a key VS Code gives another action. The choice and
 every override are remembered outside the project in Lenz Code's settings file.
 
+On macOS the IntelliJ preset follows IntelliJ's macOS keymap where it differs: Cmd+Shift+N is New Scratch File there,
+so Find File is Cmd+P (and double Shift). Elsewhere it keeps IntelliJ's Linux and Windows keys (Ctrl+Shift+N finds a
+file).
+
 Both presets bind Ctrl+Alt+Down / Up to Add Cursor Below / Above and Alt+J to Select Next Occurrence; Alt+J stays
 because VS Code's Ctrl+D (select the next occurrence) is Compare Selected here. Tab and Shift+Tab are fixed editing
 keys, like Delete, and the structural edits take chords: Ctrl+/ and Alt+/ for Toggle Comment, Ctrl+Shift+Down / Up for
@@ -429,7 +433,11 @@ is open. Without a project it starts an untitled document; the first Save asks f
 Escape cancels without writing.
 
 **New Scratch File…** and **Scratch Files…** in the File menu create and reopen durable personal files outside
-projects. Their in-app name prompt uses the extension to choose the language. They use ordinary Save and draft recovery, remain available
+projects. New Scratch File lists the kinds of file, as IntelliJ does: Plain text, JSON, Ruby and PostgreSQL first, then
+every language Lenz reads by name (Bash to Zig, ERB and HAML templates, CSV, Dockerfile, environment files); typing
+filters by name or extension and Enter creates the next free `scratch_N.<extension>` (`scratch_1.rb`, `scratch_2.sql`…),
+opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. On macOS Cmd+Shift+N opens it, as in
+IntelliJ's macOS keymap. They use ordinary Save and draft recovery, remain available
 across projects and restarts, and live in `$XDG_STATE_HOME/lenz-code/scratch-files` (default
 `~/.local/state/lenz-code/scratch-files`). Closing a tab keeps its file; there are no scratch run/debug controls.
 Right-click a tab for **Close All Tabs**, **Close Other Tabs**, **Close Tabs to Left** and **Close Tabs to Right**

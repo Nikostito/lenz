@@ -511,3 +511,26 @@ fn scratch_directory_may_live_below_a_symlinked_state_parent() {
     assert!(s.scratch_files().unwrap().iter().any(|p| p.ends_with("personal.txt")));
     assert!(!std::fs::symlink_metadata(s.scratch_directory()).unwrap().file_type().is_symlink());
 }
+
+#[test]
+fn a_scratch_of_a_kind_is_the_next_numbered_scratch_file_in_its_language() {
+    use crate::scratch::KINDS;
+    let d = tempfile::tempdir().unwrap();
+    let mut s = session(&d.path().join("personal-state"));
+    let kind = |label: &str| KINDS.iter().position(|k| k.label == label).unwrap();
+    let name = |s: &Session| s.state().active().unwrap().source().file_name().unwrap().to_string_lossy().into_owned();
+    s.dispatch(Command::NewScratchFile(kind("Ruby")));
+    settle(&mut s, |s| s.state().current_source().is_some());
+    assert_eq!(name(&s), "scratch_1.rb");
+    assert_eq!(s.state().current_source().unwrap().language(), Some(lenz_content::highlight::Language::Ruby));
+    let first = s.state().active().unwrap().source().to_owned();
+    std::fs::write(&first, "puts 1\n").unwrap();
+    s.dispatch(Command::NewScratchFile(kind("PostgreSQL")));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with("scratch_2.sql")));
+    assert_eq!(s.state().sql_dialect().and_then(|d| d.dialect), Some(crate::sql_dialect::Dialect::PostgreSql), "its dialect");
+    s.dispatch(Command::NewScratchFile(kind("Plain text")));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with("scratch_3.txt")));
+    assert_eq!(std::fs::read(&first).unwrap(), b"puts 1\n", "an earlier scratch is kept as it is");
+    assert_eq!(s.scratch_files().unwrap().len(), 3);
+    assert!(s.state().tabs().iter().all(|t| t.retained()), "kept open, as a file the user made");
+}

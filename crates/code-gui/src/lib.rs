@@ -109,7 +109,8 @@ pub enum Modal {
     ScratchFiles { files: Vec<PathBuf>, at: usize },
     /// An in-window destination prompt; the originating tab stays captured until acceptance.
     SaveAs { tab: code_core::tabs::TabId, dir: PathBuf, input: String, selected: bool, error: Option<String> },
-    NewScratch { input: String, selected: bool, error: Option<String> },
+    /// New Scratch File's kinds ([`code_core::scratch::KINDS`]): typing filters, Enter creates `scratch_N.<ext>`.
+    NewScratch { query: String, at: usize },
     RenameTerminal { id: code_core::terminal::Id, input: String, selected: bool, error: Option<String> },
     /// Unified file, symbol and command search; result targets stay in the core.
     /// Search Everywhere: the highlighted row, and the query's caret (a byte offset; `None` at the end).
@@ -2041,7 +2042,11 @@ impl ReaderView {
                 Some(&(_, action)) => self.branch_action(&target, action, window, cx),
                 None => self.modal = Some(Modal::BranchMenu { target, label, at, query, row }),
             },
-            m @ Some(Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::NewScratch { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. }) => self.modal = m,
+            m @ Some(Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. }) => self.modal = m,
+            Some(Modal::NewScratch { query, at }) => match code_core::scratch::matching(&query).get(at) {
+                Some(&kind) => self.dispatch(Command::NewScratchFile(kind), cx),
+                None => self.modal = Some(Modal::NewScratch { query, at }),
+            },
             Some(Modal::Places { list, query, at }) => {
                 let row = self.session.state().place_rows(list, &query).into_iter().nth(at).filter(|r| !r.missing);
                 match row {
@@ -2080,7 +2085,7 @@ impl ReaderView {
                 Some(i) if i < self.session.keymap().rows().len() => *at = i,
                 _ => return,
             },
-            Some(Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } | Modal::Branches { at, .. }) => match row.checked_sub(FINDER_HEADER_ROWS) {
+            Some(Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } | Modal::Branches { at, .. } | Modal::NewScratch { at, .. }) => match row.checked_sub(FINDER_HEADER_ROWS) {
                 Some(i) => *at = i,
                 None => return,
             },
@@ -2088,7 +2093,7 @@ impl ReaderView {
                 Some(i) => *at = i,
                 None => return,
             },
-            Some(Modal::StatusDetails { .. } | Modal::Search { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::Context { .. } | Modal::OpenPath { .. } | Modal::GoTo { .. } | Modal::Mnemonic | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::NewScratch { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. }) | None => return,
+            Some(Modal::StatusDetails { .. } | Modal::Search { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::Context { .. } | Modal::OpenPath { .. } | Modal::GoTo { .. } | Modal::Mnemonic | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. }) | None => return,
         }
         self.modal_accept(window, cx);
     }
@@ -2522,6 +2527,26 @@ impl ReaderView {
                 }
             }
             return cx.notify();
+        }
+        // New Scratch File's kinds: typing filters (the shared field), Up/Down/Page move, Enter creates, Escape closes.
+        if let Some(Modal::NewScratch { query, at }) = self.modal.clone() {
+            let last = code_core::scratch::matching(&query).len().saturating_sub(1);
+            let at = at.min(last);
+            let set = |at: usize| Some(Modal::NewScratch { query: query.clone(), at });
+            match key {
+                "escape" => self.modal = None,
+                "up" => self.modal = set(at.saturating_sub(1)),
+                "down" => self.modal = set((at + 1).min(last)),
+                "pageup" => self.modal = set(at.saturating_sub(10)),
+                "pagedown" => self.modal = set((at + 10).min(last)),
+                "enter" => {
+                    self.modal = set(at);
+                    self.modal_accept(window, cx);
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
         }
         // A list of places: typing filters, Up/Down move, Enter goes there, F6 forgets, Escape back to the text.
         if let Some(Modal::Places { list, query, at }) = self.modal.clone() {
@@ -5532,9 +5557,17 @@ impl ReaderView {
                 vec![(format!("› {input}{}", if *selected { "  (selected)" } else { "" }), None),
                     (error.clone().unwrap_or_else(|| "Save As — type a path; Enter saves, Escape cancels; Ctrl+A selects all".into()), None)]
             }
-            Some(Modal::NewScratch { input, selected, error } | Modal::RenameTerminal { input, selected, error, .. }) => {
+            Some(Modal::RenameTerminal { input, selected, error, .. }) => {
                 vec![(format!("› {input}{}", if *selected { "  (selected)" } else { "" }), None),
-                    (error.clone().unwrap_or_else(|| "New scratch file — name with extension chooses language; Enter creates, Escape cancels; Ctrl+A selects all".into()), None)]
+                    (error.clone().unwrap_or_else(|| "Rename terminal tab — Enter renames, Escape cancels; Ctrl+A selects all".into()), None)]
+            }
+            Some(Modal::NewScratch { query, .. }) => {
+                let mut rows = vec![(format!("› {query}"), None), ("New Scratch File — type to filter; Enter creates the next scratch_N file in the personal scratch folder, Escape cancels".to_string(), None)];
+                rows.extend(code_core::scratch::matching(query).into_iter().map(|i| {
+                    let kind = &code_core::scratch::KINDS[i];
+                    (format!("{}  .{}", kind.label, kind.extension), None)
+                }));
+                rows
             }
             Some(Modal::Create { kind, dir, name, error }) => {
                 let where_ = if dir.is_empty() { "the project root" } else { dir.as_str() };
@@ -7064,7 +7097,7 @@ pub fn wrap(text: &str, cols: usize) -> Vec<String> {
 
 impl Modal {
     fn is_form(&self) -> bool {
-        matches!(self, Self::OpenPath { .. } | Self::Create { .. } | Self::SaveAs { .. } | Self::NewScratch { .. } | Self::RenameTerminal { .. } | Self::Relocate { .. } | Self::PasteEntry { .. } | Self::ConfirmDelete { .. } | Self::NewBranch { .. } | Self::Revision { .. } | Self::GoTo { .. } | Self::Root { .. } | Self::SqlMetadata { .. })
+        matches!(self, Self::OpenPath { .. } | Self::Create { .. } | Self::SaveAs { .. } | Self::RenameTerminal { .. } | Self::Relocate { .. } | Self::PasteEntry { .. } | Self::ConfirmDelete { .. } | Self::NewBranch { .. } | Self::Revision { .. } | Self::GoTo { .. } | Self::Root { .. } | Self::SqlMetadata { .. })
     }
 
     /// The highlighted row of [`ReaderView::modal_rows`].
@@ -7074,9 +7107,9 @@ impl Modal {
             Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::Recent { at } => *at,
             Modal::ScratchFiles { at, .. } => *at + 1,
             Modal::Themes { at, .. } => *at + THEME_HEADER_ROWS,
-            Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } => *at + FINDER_HEADER_ROWS,
+            Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } | Modal::NewScratch { at, .. } => *at + FINDER_HEADER_ROWS,
             Modal::Search { in_files, .. } => *in_files as usize,
-            Modal::StatusDetails { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::OpenPath { .. } | Modal::GoTo { .. } | Modal::Mnemonic | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::NewScratch { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. } => 0,
+            Modal::StatusDetails { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::OpenPath { .. } | Modal::GoTo { .. } | Modal::Mnemonic | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. } => 0,
             Modal::Context { at, .. } => *at,
             Modal::Branches { at, .. } => *at + FINDER_HEADER_ROWS,
             Modal::BranchMenu { at, .. } => *at + 1,

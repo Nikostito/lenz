@@ -145,6 +145,8 @@ pub(crate) enum ChoiceTarget {
     Path(PathBuf),
     Theme(String),
     Place(Place),
+    /// New Scratch File's kind ([`code_core::scratch::KINDS`] index).
+    ScratchKind(usize),
     Sibling {
         pane: u8,
         crumb: usize,
@@ -1283,6 +1285,13 @@ impl App {
                     .map(|e| simple(e.label.clone(), ChoiceTarget::Theme(e.id.clone()))),
             )
             .collect(),
+            Prompt::NewScratch => code_core::scratch::matching(&modal.input)
+                .into_iter()
+                .map(|i| {
+                    let kind = &code_core::scratch::KINDS[i];
+                    Choice { label: kind.label.to_string(), detail: Some(format!(".{}", kind.extension)), disabled: None, target: ChoiceTarget::ScratchKind(i) }
+                })
+                .collect(),
             Prompt::Places(list) => self
                 .session
                 .state()
@@ -1325,7 +1334,7 @@ impl App {
         };
         if matches!(
             modal.kind,
-            Prompt::Places(_) | Prompt::ServerRuntime | Prompt::Themes | Prompt::Branches | Prompt::BranchMenu { .. }
+            Prompt::Places(_) | Prompt::NewScratch | Prompt::ServerRuntime | Prompt::Themes | Prompt::Branches | Prompt::BranchMenu { .. }
         ) || query.is_empty()
         {
             choices
@@ -1345,7 +1354,7 @@ impl App {
                 Prompt::Open => "Open file · enter path",
                 Prompt::RenameTerminal { .. } => "Rename terminal tab · Enter renames · Esc cancels",
                 Prompt::TerminalPath => "Paste path into terminal · Enter pastes · no Enter is sent to the shell",
-                Prompt::NewScratch => "New scratch file · name with extension chooses language · Enter creates · Esc cancels",
+                Prompt::NewScratch => "New scratch file · type to filter · Enter creates the next scratch_N file · Esc cancels",
                 Prompt::ScratchFiles(_) => "Personal scratch files · type to filter · Enter opens · Esc cancels",
                 Prompt::SaveAs(_) => "Save As · enter the new file's path",
                 Prompt::Create { kind, dir } => {
@@ -2031,10 +2040,10 @@ impl App {
                 }
             }
             Prompt::NewScratch => {
-                let name = input.trim().to_owned();
-                if let Some(why) = code_core::create::name_refusal(&name) {
-                    if let Some(modal) = self.modal.as_mut() { modal.error = Some(why); }
-                } else { self.close_modal(); self.dispatch(Command::NewScratch(name)); }
+                if let Some(Choice { target: ChoiceTarget::ScratchKind(kind), .. }) = self.choices().get(at).cloned() {
+                    self.close_modal();
+                    self.dispatch(Command::NewScratchFile(kind));
+                }
             }
             Prompt::SaveAs(tab) => {
                 if input.trim().is_empty() {
@@ -2226,6 +2235,7 @@ impl App {
                         }
                     }
                     ChoiceTarget::Place(place) => self.dispatch(Command::GoToPlace(place)),
+                    ChoiceTarget::ScratchKind(kind) => self.dispatch(Command::NewScratchFile(kind)),
                     ChoiceTarget::Branch(target) => match target {
                         code_core::branches::BranchTarget::Action(id) => self.run(id),
                         t => {
