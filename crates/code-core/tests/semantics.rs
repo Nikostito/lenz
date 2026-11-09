@@ -4433,3 +4433,46 @@ fn a_definition_in_nested_modules_lands_below_the_sticky_headers() {
         assert_eq!(f.selected_text(), name, "{file}");
     }
 }
+
+/// Leaving an edited file for another of its language and coming back: its semantic colours and hints come back with
+/// its syntax colours, and the other file has its own.
+#[test]
+fn an_edited_file_shown_again_gets_its_semantic_colours_and_hints_back() {
+    let mut f = fixture(&[], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    f.settle(decorated);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(decorated);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")), "back on the edited file: {:?}", f.s.state().active().map(|t| t.source().to_owned()));
+    f.settle(|s| decorated(s) && active_view(s).is_some_and(|v| v.highlights().is_some()));
+    assert!(f.s.state().tab_dirty(tab), "still unsaved");
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
+}
+
+/// The same with a server that sends no semantic colours: the edited file's syntax colours come back on their own.
+#[test]
+fn an_edited_file_shown_again_is_highlighted_with_a_server_without_decorations() {
+    let mut f = fixture(&[("FAKE_LSP_NO_DECOR", "1")], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    let colored = |s: &Session| active_view(s).is_some_and(|v| v.highlights().is_some_and(|h| h.spans(0..1).iter().any(|l| !l.is_empty())));
+    f.settle(colored);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(colored);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")));
+    f.settle(colored);
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
+}

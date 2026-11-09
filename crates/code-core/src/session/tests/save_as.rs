@@ -534,3 +534,33 @@ fn a_scratch_of_a_kind_is_the_next_numbered_scratch_file_in_its_language() {
     assert_eq!(s.scratch_files().unwrap().len(), 3);
     assert!(s.state().tabs().iter().all(|t| t.retained()), "kept open, as a file the user made");
 }
+
+/// Leaving an edited file (with a syntax error, or not) and coming back: it is highlighted again, and so is another file
+/// of its language opened meanwhile. Each file is parsed on its own.
+#[test]
+fn an_edited_file_left_and_shown_again_is_highlighted_as_is_another_file_of_its_language() {
+    for (a, b, edit) in [("a.rb", "b.rb", "def broken(\n  if x\n"), ("a.rb", "b.rb", "def fine\nend\n"), ("a.rs", "b.rs", "fn broken( {\n"), ("a.json", "b.json", "{ \"x\": [\n")] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let good = match a { "a.rb" => "class Thing\n  def call\n    1\n  end\nend\n", "a.rs" => "fn main() { let x = 1; }\n", _ => "{ \"x\": 1 }\n" };
+        std::fs::write(root.join(a), good).unwrap();
+        std::fs::write(root.join(b), good).unwrap();
+        let mut s = session(&d.path().join("state"));
+        s.dispatch(Command::OpenRoot(root.clone()));
+        s.dispatch(Command::OpenRetained(root.join(a)));
+        let highlighted = |s: &Session| s.state().active().and_then(|t| s.state().view(t.id())).is_some_and(|v| v.highlights().is_some_and(|h| h.spans(0..1).iter().any(|l| !l.is_empty())));
+        settle(&mut s, highlighted);
+        s.enable_text_input_for_test();
+        let tab = s.state().active().unwrap().id();
+        type_text(&mut s, tab, edit);
+        settle(&mut s, |s| s.state().view(tab).is_some_and(|v| v.highlights().is_some()));
+        s.dispatch(Command::Open(root.join(b)));
+        settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with(b)));
+        settle(&mut s, highlighted);
+        s.dispatch(Command::ActivateTab(tab));
+        settle(&mut s, highlighted);
+        assert!(s.state().tab_dirty(tab), "{a}: the edit is still unsaved");
+        assert_eq!(std::fs::read_to_string(root.join(a)).unwrap(), good, "{a}: nothing was saved");
+    }
+}

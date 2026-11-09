@@ -9670,6 +9670,10 @@ impl Session {
             let last = !self.state.tabs.iter().any(|tab| tab.id != id && tab.buffer == Some(buffer) && self.is_shown(tab.id));
             let dirty = self.state.sources.buffers.get(&buffer).and_then(|entry| entry.draft.as_ref()).is_some_and(crate::draft::Draft::dirty);
             self.analysis.release_view(buffer, id, last && !dirty);
+            // An edited draft stays analysed, but this tab drops what was derived from it (below): with no other view
+            // holding them, those results must run again when it is shown, or it stays without syntax and semantic
+            // colours (each request would match the one already delivered).
+            if last && dirty { self.analysis.release_derived(buffer); }
         }
         if let Some(t) = self.state.tabs.iter().find(|t| t.id == id).filter(|t| t.is_file() && !t.before_root) {
             let (source, at) = (t.source.clone(), shows_text(&self.state, t).then(|| self.state.location(t)));
