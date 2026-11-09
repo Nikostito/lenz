@@ -9696,6 +9696,9 @@ impl Session {
             // holding them, those results must run again when it is shown, or it stays without syntax and semantic
             // colours (each request would match the one already delivered).
             if last && dirty { self.analysis.release_derived(buffer); }
+            // The semantic colours and hints go with the content below; with no other view of the file shown, they are
+            // asked again when it is: a version already asked about would otherwise never be asked again.
+            if last && let Some(source) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.source.clone()) { self.state.semantics.forget_path(&source); }
         }
         if let Some(t) = self.state.tabs.iter().find(|t| t.id == id).filter(|t| t.is_file() && !t.before_root) {
             let (source, at) = (t.source.clone(), shows_text(&self.state, t).then(|| self.state.location(t)));
