@@ -7010,3 +7010,46 @@ fn always_select_opened_file_follows_the_active_file_in_both_explorers(cx: &mut 
         if hide { assert!(!gui.read_with(&visual, |v, _| v.explorer_shown_for_test()) && !tui.tree_shown, "a hidden explorer stays hidden"); }
     }
 }
+
+/// A path pasted into Search Everywhere opens that file, outside the project too, at its line, in both adapters.
+#[gpui::test]
+fn a_pasted_path_in_search_everywhere_opens_a_file_outside_the_project_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let outside = dir.path().join("elsewhere/notes.md");
+    std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    std::fs::write(&outside, "one\ntwo\nthree\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    let pasted = format!("{}:3", outside.display());
+    visual.simulate_keystrokes("ctrl-k");
+    visual.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(pasted.clone())));
+    visual.simulate_keystrokes("ctrl-v");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)));
+    tui.handle(Event::Paste(pasted.clone()));
+    settle(&mut visual, &mut tui, &|s| s.navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "notes.md")));
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source() == outside) && s.selection().is_some());
+    for state in [gui.read_with(&visual, |v, _| v.session().state().current_source().unwrap().line_of(v.session().state().selection().unwrap().head)), tui.session.state().current_source().unwrap().line_of(tui.session.state().selection().unwrap().head)] {
+        assert_eq!(state, 2, "line 3");
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"one\ntwo\nthree\n");
+}

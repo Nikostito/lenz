@@ -274,7 +274,8 @@ Tab / Shift+Tab cycles categories while keeping the query. Left/Right move the q
 Alt+Left/Right (macOS's Option) by word and Cmd+Left/Right (GUI) to its ends; typing goes in at the caret, and Backspace /
 Delete take a character, with Ctrl, Alt or Cmd a word. Up/Down, Page keys and Home/End select a
 result; the wheel scrolls the popup without changing selection. Enter opens/runs the selected result and Esc returns to reading. Tabs and rows are clickable. File results distinguish
-identical basenames by path and accept `name:line[:column]`. Empty queries prefer open/recent files; search
+identical basenames by path and accept `name:line[:column]`. A pasted path to an existing file, absolute or from `~/`
+(quotes and a `:line[:column]` allowed), is the first row and opens that file, outside the project too. Empty queries prefer open/recent files; search
 keeps at most the best 100 results. Action rows show shortcuts, setting values and current disabled reasons.
 Long Unicode queries keep the typed tail visible. Search opens candidates only when selected.
 

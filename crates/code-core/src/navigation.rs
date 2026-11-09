@@ -70,6 +70,14 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
     // The mixed list keeps word-start matches only; a single scope stays fully fuzzy. ponytail: the file count past the
     // ranked cap still includes scattered matches; filter inside project::rank if that total must be exact.
     let loose = |q: &str, text: &str| scope != Scope::All || lenz_content::fuzzy::word_starts(q, text);
+    // A pasted path to an existing file, anywhere on disk (absolute, or `~/` for home; `:line[:column]` kept), is the
+    // first row, inside the project or not.
+    if matches!(scope, Scope::All | Scope::Files) && let Some(path) = pasted_file(file_query) {
+        seen.insert(path.clone());
+        let detail = path.to_string_lossy().into_owned();
+        ranked.push((i64::MAX, file_row(path, detail, at)));
+        matched += 1;
+    }
     // With Letters in File Names on, files there also match a query whose characters appear in order in the file name,
     // letters left out (`i_summary` finds `invoice_summary.csv`): a file name is short, so that is not noise.
     let name_letters = snapshot.name_letters;
@@ -140,6 +148,26 @@ pub(crate) fn rank_with_total(snapshot: Snapshot, scope: Scope, query: &str, cur
     Some((ranked.into_iter().map(|(_,row)| row).collect(), matched))
 }
 
+/// The existing file a pasted query names: an absolute path or one from `~/`, trimmed of spaces and the quotes a shell or
+/// a file manager adds (`'…'`, `"…"`), with `.` and `..` resolved. `None` for anything else, a folder or a missing file.
+fn pasted_file(query: &str) -> Option<PathBuf> {
+    let text = query.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    let path = match text.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None if text.starts_with('/') => PathBuf::from(text),
+        None => return None,
+    };
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => { clean.pop(); }
+            std::path::Component::CurDir => {}
+            other => clean.push(other),
+        }
+    }
+    clean.is_file().then_some(clean)
+}
+
 fn file_row(path: PathBuf, detail: String, at: Option<LineColumn>) -> Row {
     Row {label: path.file_name().map_or_else(|| detail.clone(), |s| s.to_string_lossy().into_owned()), detail, kind: Kind::File, disabled: None, on: None, shortcut: None, target: Target::Open {path, at}}
 }
@@ -195,6 +223,30 @@ mod tests {
         assert!(rank(snap(true), Scope::All, "smivc", || true).unwrap().0.is_empty());
         assert_eq!(rank(snap(true), Scope::Files, "smivc", || true).unwrap().0.len(), 1);
     }
+    #[test]
+    fn a_pasted_path_opens_that_file_from_anywhere_with_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("elsewhere/notes.md");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "x\n").unwrap();
+        let shown = outside.to_string_lossy().into_owned();
+        for (query, at) in [(shown.clone(), None), (format!("  '{shown}' "), None), (format!("{shown}:12"), Some(LineColumn { line: 12, column: None })),
+            (format!("{}/elsewhere/../elsewhere/./notes.md:3:4", dir.path().display()), Some(LineColumn { line: 3, column: Some(4) }))] {
+            for scope in [Scope::All, Scope::Files] {
+                let (rows, count) = rank(snapshot(), scope, &query, || true).unwrap();
+                assert!(count >= 1, "{query}");
+                assert_eq!(rows[0].label, "notes.md", "{query}");
+                assert_eq!(rows[0].detail, shown, "{query}");
+                assert!(matches!(&rows[0].target, Target::Open { path, at: a } if *path == outside && *a == at), "{query}: {:?}", rows[0].target);
+            }
+        }
+        // Not a file: a folder, a missing one, a relative name.
+        for query in [dir.path().join("elsewhere").to_string_lossy().into_owned(), format!("{shown}.missing"), "elsewhere/notes.md".into()] {
+            assert!(rank(snapshot(), Scope::All, &query, || true).unwrap().0.iter().all(|r| r.label != "notes.md"), "{query}");
+        }
+        assert!(rank(snapshot(), Scope::Symbols, &shown, || true).unwrap().0.is_empty(), "symbols are names, not paths");
+    }
+
     #[test]
     #[ignore = "release-only ranking and cancellation benchmark"]
     fn navigation_perf() {
