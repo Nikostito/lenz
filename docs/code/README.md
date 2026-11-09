@@ -262,6 +262,11 @@ one popup with **All / Files / Symbols / Actions** tabs, a query, fuzzy matches 
 tab keeps matches at word starts (`nsr` finds `NewSearchResult`, not `inspector`); a single tab matches any letters in order.
 With **Search Everywhere: Letters in File Names** on (Find Action; off by default, remembered), the All tab also lists
 files whose name holds the query's letters in order (`i_summary` finds `invoice_summary.csv`).
+With **Search Everywhere: Rank by Open and Recent Files** on (Find Action; off by default, remembered), Search
+Everywhere and Find File also weigh where you work: files sharing folders with the active, open and recently opened
+files (up to three folders deep, the more recent the more) and those files themselves rank above a slightly better match
+elsewhere, while a file named exactly as the query (`foo_bar` or `foo_bar.rb`) comes first wherever it is. On
+100,000 matching files it adds about 4 ms per query with ten recent files in different folders, nothing when off.
 Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three categories. Direct shortcuts are:
 
 | Search | Shortcut |

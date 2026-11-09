@@ -346,6 +346,7 @@ impl Session {
             CommandId::InlineBlame => Command::SetInlineBlame(!state.inline_blame()),
             CommandId::MacWordMotion => Command::SetMacWordMotion(!state.mac_word_motion()),
             CommandId::NameLetterSearch => Command::SetNameLetterSearch(!state.name_letter_search()),
+            CommandId::RankNearbyFiles => Command::SetRankNearbyFiles(!state.rank_nearby_files()),
             CommandId::NarrowAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols().saturating_sub(2), commit: true },
             CommandId::WidenAnnotations => Command::ResizeAnnotations { width: state.layout().annotation_cols() + 2, commit: true },
             CommandId::CloseAnnotations => Command::SetAnnotate(false),
@@ -603,7 +604,7 @@ impl CommandId {
             | Self::CallHierarchy | Self::CallHierarchyCallers | Self::CallHierarchyCallees
             | Self::TypeHierarchy | Self::TypeHierarchySupertypes | Self::TypeHierarchySubtypes
             | Self::Documentation | Self::NextProblem | Self::PreviousProblem | Self::ShowProblems | Self::CheckProjectSyntax | Self::CancelProjectSyntax | Self::ShowInSource | Self::FollowLink => G::Navigate,
-            Self::SearchEverywhere | Self::NameLetterSearch | Self::FindSymbol | Self::FindAction | Self::FindFile | Self::SearchProject | Self::FindInFile | Self::NextMatch | Self::PreviousMatch
+            Self::SearchEverywhere | Self::NameLetterSearch | Self::RankNearbyFiles | Self::FindSymbol | Self::FindAction | Self::FindFile | Self::SearchProject | Self::FindInFile | Self::NextMatch | Self::PreviousMatch
             | Self::CloseFind | Self::MatchCase | Self::WholeWord | Self::RegularExpression | Self::ReplaceMatch | Self::ReplaceAll | Self::ListMatches
             | Self::FindDeclarations | Self::RerunSearch | Self::CloseResults | Self::ToggleResults | Self::StopSearch | Self::FoldAllResults | Self::NextResult | Self::PreviousResult | Self::PreviousResults | Self::NextResults | Self::Usages | Self::Symbols
             | Self::FileSymbols => G::Find,

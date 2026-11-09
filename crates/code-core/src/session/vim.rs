@@ -49,6 +49,10 @@ impl State {
     pub fn mac_word_motion(&self) -> bool {
         self.settings.mac_word_motion
     }
+    /// Search Everywhere ranks files near the open and recent ones higher.
+    pub fn rank_nearby_files(&self) -> bool {
+        self.settings.rank_nearby_files
+    }
     /// Search Everywhere's All tab also lists files by letters in order in their name.
     pub fn name_letter_search(&self) -> bool {
         self.settings.name_letter_search

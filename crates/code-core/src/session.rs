@@ -304,6 +304,9 @@ pub enum Command {
     SetMacWordMotion(bool),
     /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
     SetNameLetterSearch(bool),
+    /// Search Everywhere ranks files near the open and recent ones higher (and a file named exactly as the query
+    /// first); remembered.
+    SetRankNearbyFiles(bool),
     SetVimEnabled(bool),
     VimKey(keymap::KeyPress),
     /// Show a project file or folder (project-relative) in the explorer, opening the folders above it.
@@ -660,6 +663,8 @@ pub enum CommandId {
     MacWordMotion,
     /// Search Everywhere's All tab finds files by letters in order in their name; remembered, off by default.
     NameLetterSearch,
+    /// Search Everywhere and Find File rank files near the open and recent ones higher; remembered, off by default.
+    RankNearbyFiles,
     /// Pin the enclosing declarations at the top of each pane; remembered.
     StickyScroll,
     /// The path and declarations bar above each pane's text; remembered.
@@ -965,7 +970,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 254] = [
+    pub const ALL: [CommandId; 255] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -988,6 +993,7 @@ impl CommandId {
         Self::VimMode,
         Self::MacWordMotion,
         Self::NameLetterSearch,
+        Self::RankNearbyFiles,
         Self::StickyScroll,
         Self::Breadcrumbs,
         Self::FocusBreadcrumbs,
@@ -1395,6 +1401,7 @@ impl CommandId {
             Self::InlineBlame => "Inline Blame",
             Self::MacWordMotion => "macOS Word Motion",
             Self::NameLetterSearch => "Search Everywhere: Letters in File Names",
+            Self::RankNearbyFiles => "Search Everywhere: Rank by Open and Recent Files",
             Self::CloseAnnotations => "Close Annotations",
             Self::NarrowAnnotations => "Narrow Annotation Gutter",
             Self::WidenAnnotations => "Widen Annotation Gutter",
@@ -2675,6 +2682,7 @@ impl State {
             CommandId::AlwaysSelectOpenedFile => Some(self.settings.always_select_opened_file),
             CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
             CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
+            CommandId::RankNearbyFiles => Some(self.settings.rank_nearby_files),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
                 let indent = self.project_preferences()?.indent;
                 Some(indent == match id { CommandId::IndentTabs => Some(Indent::Tabs), CommandId::IndentTwoSpaces => Some(Indent::Spaces(2)), CommandId::IndentFourSpaces => Some(Indent::Spaces(4)), _ => None })
@@ -3448,7 +3456,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::NameLetterSearch | CommandId::RankNearbyFiles | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -5021,6 +5029,11 @@ impl Session {
             }
             Command::SetMacWordMotion(on) => {
                 self.state.settings.mac_word_motion = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetRankNearbyFiles(on) => {
+                self.state.settings.rank_nearby_files = on;
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
@@ -8874,6 +8887,7 @@ impl Session {
             recent,
             actions: if matches!(scope, navigation::Scope::All | navigation::Scope::Actions) { self.actions() } else { Vec::new() },
             name_letters: self.state.settings.name_letter_search,
+            nearby: self.state.settings.rank_nearby_files,
         };
         // Recent files are bounded to fifty entries; populate immediately for Ctrl-E followed by Enter.
         if scope == navigation::Scope::Recent {
@@ -10463,6 +10477,8 @@ struct Settings {
     mac_word_motion: bool,
     /// Search Everywhere's All tab also lists files whose name holds the query's letters in order.
     name_letter_search: bool,
+    /// Search Everywhere ranks files near the open and recent ones higher.
+    rank_nearby_files: bool,
     vim_enabled: bool,
     /// The enclosing declarations stay pinned at the top of each pane.
     sticky_scroll: bool,
@@ -10493,7 +10509,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, name_letter_search: false, rank_nearby_files: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
