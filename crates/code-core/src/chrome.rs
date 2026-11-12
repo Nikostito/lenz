@@ -262,7 +262,7 @@ impl Session {
             .chain([name])
             .chain((!position.is_empty()).then_some(position))
             .chain(self.markers_details())
-            .chain(state.results().filter(|r| r.results_kind() == crate::search::ResultsKind::ProjectSyntax).map(|r| format!("{}\nThe captured project inventory respects ignore rules; links outside the project, binary/lossy text, large files, environment files and SQL without a scan provider are not checked. Per-file findings and the total result list are bounded; known explorer badges retain at most 1024 paths. Cancel Project Syntax Check stops background work; Rerun Search checks again.{}", r.kind(), if r.limited() { " The result limit was reached; coverage is incomplete." } else { "" })))
+            .chain(state.results().filter(|r| r.results_kind() == crate::search::ResultsKind::ProjectSyntax).map(|r| format!("{}\nThe captured project inventory skips ignored folders; links outside the project, binary/lossy text, large files, environment files and SQL without a scan provider are not checked. Per-file findings and the total result list are bounded; known explorer badges retain at most 1024 paths. Cancel Project Syntax Check stops background work; Rerun Search checks again.{}", r.kind(), if r.limited() { " The result limit was reached; coverage is incomplete." } else { "" })))
             .chain(state.terminal().active().map(|tab| format!("{} — {}\nInitial directory: {}\n{} terminal tabs{}", tab.label(), tab.status(), tab.cwd().display(), state.terminal().tabs().len(), tab.error().map_or(String::new(), |why| format!("\n{why}")))))
             .chain(image)
             .chain(project)
