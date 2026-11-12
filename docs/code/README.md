@@ -405,6 +405,10 @@ above it. Opening a folder whose only entry is a folder opens that one too, down
 before files; the command menu's "Explorer: All by Name" switches to plain name order ("Explorer: Folders First" back) (bytewise:
 capitals first), saved in `$XDG_CONFIG_HOME/lenz-code/settings.json`. Explorer rows and tabs show the Git status
 letter (M, A, D, R, U, C) apart from the `●` unsaved mark, as in the [terminal editor](tui.md).
+The explorer, the file finder (Shift Shift) and Find in Files share one inventory of the project's files. Folders the
+ignore rules exclude (`target/`, `node_modules/`, `.venv/`; `.gitignore`, `.ignore` and `.git/info/exclude`, also outside
+Git) are not entered, but every file in a folder that is entered is listed, ignored or not: `.env`, `.env.local` and
+other hidden or ignored files show beside `.env.example`.
 
 A single click selects a directory. Click its arrow or double-click its name to expand or collapse it;
 keyboard Left/Right and Enter remain available in both frontends.

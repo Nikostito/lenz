@@ -357,6 +357,74 @@ fn project_name_navigation_reads_shifted_drafts_and_refuses_stale_disk_symbols_i
     replay_draft_project_query(cx, DraftQuery::Names);
 }
 
+/// Ignored files beside the project's files (`.env`, `.env.local`) are in the explorer, the file finder and Find in
+/// Files of both adapters; an ignored folder (`target/`) stays out of all three.
+#[gpui::test]
+fn ignored_env_files_show_in_the_explorer_finder_and_project_search_of_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let files = [(".gitignore", ".env\n.env.*\n!.env.example\ntarget/\n"), (".env", "TOKEN=envneedle\n"), (".env.local", "LOCAL=envneedle\n"), (".env.example", "TOKEN=\n"), ("target/out.rs", "// envneedle\n"), ("main.rs", "fn main() {}\n")];
+    for (name, text) in files {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1100.0), gpui::px(700.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    let key = |tui: &mut App, code, modifiers| tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx));
+            while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            draw(visual, tui, terminal);
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < deadline, "adapters did not settle: GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| snapshot(view.session().state())), snapshot(tui.session.state()));
+            std::thread::yield_now();
+        }
+    };
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.project().is_some_and(|project| matches!(project.coverage(), code_core::project::Coverage::Complete(_))));
+    let rows = |state: &State| state.project().unwrap().rows().iter().map(|row| row.path.to_string()).collect::<Vec<_>>();
+    assert_eq!(rows(tui.session.state()), [".env", ".env.example", ".env.local", ".gitignore", "main.rs"]);
+    assert_eq!(gui.read_with(&visual, |view, _| rows(view.session().state())), rows(tui.session.state()));
+    // The file finder (Ctrl+P) finds and opens the ignored file.
+    visual.simulate_keystrokes("ctrl-p");
+    visual.simulate_keystrokes(&".env.local".chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" "));
+    key(&mut tui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    tui.handle(Event::Paste(".env.local".into()));
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.navigation().is_some_and(|search| !search.pending && search.query == ".env.local" && !search.rows.is_empty()));
+    let shown: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(shown.contains(".env.local"), "{shown}");
+    let labels = gui.read_with(&visual, |view, _| view.modal_rows().into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n"));
+    assert!(labels.contains(".env.local"), "{labels}");
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|source| source.source() == root.join(".env.local")) && state.loading().is_none());
+    // Find in Files (Ctrl+Shift+F) reads both ignored files, not the ignored folder.
+    visual.simulate_keystrokes("ctrl-shift-f");
+    key(&mut tui, KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    for _ in 0..12 { visual.simulate_keystrokes("backspace"); key(&mut tui, KeyCode::Backspace, KeyModifiers::NONE); }
+    visual.simulate_keystrokes(&"envneedle".chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" "));
+    tui.handle(Event::Paste("envneedle".into()));
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.results().is_some_and(|results| results.done() && results.query() == "envneedle"));
+    let hits = |state: &State| { let mut paths: Vec<_> = state.results().unwrap().hits().iter().map(|hit| hit.path.to_string()).collect(); paths.sort(); paths };
+    assert_eq!(hits(tui.session.state()), [".env", ".env.local"]);
+    assert_eq!(gui.read_with(&visual, |view, _| hits(view.session().state())), hits(tui.session.state()));
+    for (name, text) in files { assert_eq!(std::fs::read_to_string(root.join(name)).unwrap(), text, "{name} unchanged"); }
+}
+
 enum DraftQuery { Text, Declarations, Names }
 
 fn replay_draft_project_query(cx: &mut TestAppContext, mode: DraftQuery) {

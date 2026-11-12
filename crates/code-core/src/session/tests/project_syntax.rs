@@ -11,8 +11,11 @@ fn finish_scan(s: &mut Session) { settle(s, |s| s.state().results().is_some_and(
 #[test]
 fn project_syntax_checks_unopened_ignored_filtered_files_without_opening_tabs_or_servers() {
     let (_dir, root, mut s) = scan_session();
-    write(&root, ".ignore", b"ignored.rs\n");
-    write(&root, "ignored.rs", b"fn ignored( {\n");
+    // An ignored folder is not entered; an ignored file in an entered folder is a project file like any other.
+    write(&root, ".ignore", b"generated/\nlocal.rs\n");
+    std::fs::create_dir_all(root.join("generated")).unwrap();
+    write(&root, "generated/ignored.rs", b"fn ignored( {\n");
+    write(&root, "local.rs", b"fn local() {}\n");
     write(&root, "bad.rs", b"fn broken( {\n");
     write(&root, "Bad.java", b"class A { void f( { }\n");
     write(&root, "bad.xml", b"<Root></root>\n");
@@ -29,8 +32,8 @@ fn project_syntax_checks_unopened_ignored_filtered_files_without_opening_tabs_or
     finish_scan(&mut s);
     let results = s.state().results().unwrap();
     for file in ["bad.rs", "Bad.java", "bad.xml"] { assert!(results.hits().iter().any(|h| h.path.as_ref() == file), "{file}: {:?}", results.hits()); }
-    assert!(!results.hits().iter().any(|h| h.path.as_ref() == "ignored.rs"));
-    assert!(results.kind().contains("4 checked"), "{}", results.kind());
+    assert!(!results.hits().iter().any(|h| h.path.as_ref().ends_with("ignored.rs")));
+    assert!(results.kind().contains("5 checked"), "{}", results.kind());
     assert!(results.kind().contains("1 too large"), "{}", results.kind());
     assert!(results.kind().contains("3 unsupported"), "{}", results.kind());
     assert!(s.state().tabs().is_empty() && !s.state.semantics.running(), "scanning never opens tabs or servers");

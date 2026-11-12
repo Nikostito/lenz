@@ -1,5 +1,5 @@
 //! Literal text search: case-insensitive, no regular expressions, no fuzziness. A project search reads the files the
-//! inventory knows (so ignore rules apply), optionally only those a file pattern picks, folder by folder, and streams
+//! inventory knows (so ignored folders are skipped; ignored files such as `.env` beside them are read), optionally only those a file pattern picks, folder by folder, and streams
 //! matches back in batches; a file search runs over a document already in memory. Matches are text matches, never
 //! claims about what a symbol refers to. A project's matches list as a tree: folder, file, then each match.
 

@@ -574,8 +574,10 @@ fn keep_best(hits: &mut Vec<(i64, &Arc<str>)>) {
     hits.truncate(FINDER_LIMIT);
 }
 
-/// Enumerate `root` in batches: ignore rules obeyed (also outside Git), hidden files kept unless ignored, `.git`
-/// skipped, symlinked directories not followed (symlinked files are listed). Stops when `generation` moves on.
+/// Enumerate `root` in batches: folders that ignore rules exclude (`target/`, `node_modules/`; also outside Git) are
+/// not entered, but every file in a folder that is entered is listed, ignored or not, so `.env` and `.env.local`
+/// show beside `.env.example`. Hidden files and folders are kept, `.git` is skipped, symlinked directories are not
+/// followed (symlinked files are listed). Stops when `generation` moves on.
 pub fn scan(root: &Path, generation: u64, latest: &AtomicU64, mut send: impl FnMut(Batch)) {
     let failed = |e: String| Batch { done: true, error: Some(e), ..Batch::default() };
     match std::fs::metadata(root) {
@@ -583,32 +585,51 @@ pub fn scan(root: &Path, generation: u64, latest: &AtomicU64, mut send: impl FnM
         Ok(_) => return send(failed("not a folder".into())),
         Err(e) => return send(failed(e.to_string())),
     }
-    let walker = ignore::WalkBuilder::new(root)
+    // The walker decides which folders to enter; each folder's files are read from the folder itself, so the
+    // ignore rules that drop a file (`.env`, `*.log`) do not hide it.
+    let folders = ignore::WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|e| e.file_name() != ".git")
+        .filter_entry(|e| e.file_name() != ".git" && e.file_type().is_some_and(|t| t.is_dir()))
         .build();
     let mut batch = Vec::with_capacity(BATCH);
     let mut skipped = 0;
-    for entry in walker {
+    for folder in folders {
         if latest.load(Ordering::Relaxed) != generation {
             return; // superseded: the new root's scan reports instead
         }
-        let Ok(entry) = entry else {
+        let Ok(folder) = folder else {
             skipped += 1;
             continue;
         };
-        let Some(kind) = entry.file_type() else { continue };
-        let file = kind.is_file() || (kind.is_symlink() && entry.path().metadata().is_ok_and(|m| m.is_file()));
-        if !file {
+        if !folder.file_type().is_some_and(|t| t.is_dir()) {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-        let rel = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
-        batch.push(rel);
-        if batch.len() == BATCH {
-            send(Batch { paths: std::mem::replace(&mut batch, Vec::with_capacity(BATCH)), skipped: std::mem::take(&mut skipped), ..Batch::default() });
+        let Ok(rel) = folder.path().strip_prefix(root) else { continue };
+        let prefix: String = rel.components().map(|c| format!("{}/", c.as_os_str().to_string_lossy())).collect();
+        let Ok(entries) = std::fs::read_dir(folder.path()) else {
+            skipped += 1;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                skipped += 1;
+                continue;
+            };
+            let file = kind.is_file() || (kind.is_symlink() && entry.path().metadata().is_ok_and(|m| m.is_file()));
+            let name = entry.file_name();
+            if !file || name == ".git" {
+                continue;
+            }
+            batch.push(format!("{prefix}{}", name.to_string_lossy()));
+            if batch.len() == BATCH {
+                send(Batch { paths: std::mem::replace(&mut batch, Vec::with_capacity(BATCH)), skipped: std::mem::take(&mut skipped), ..Batch::default() });
+            }
         }
     }
     send(Batch { paths: batch, done: true, skipped, error: None });
@@ -712,10 +733,16 @@ mod tests {
     }
 
     #[test]
-    fn scanning_obeys_ignores_keeps_hidden_files_and_does_not_follow_directory_links() {
+    fn scanning_skips_ignored_folders_lists_ignored_files_keeps_hidden_files_and_does_not_follow_directory_links() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
-        for (p, body) in [("src/main.rs", ""), (".gitignore", "target/\n*.log\n"), ("target/out.rs", ""), ("app.log", ""), (".config/tool.toml", ""), (".git/HEAD", "ref"), ("docs/main.rs", "")] {
+        let files = [
+            ("src/main.rs", ""), (".gitignore", "target/\n*.log\n.env\n.env.*\n!.env.example\nnode_modules\n"), ("target/out.rs", ""),
+            ("app.log", ""), (".config/tool.toml", ""), (".git/HEAD", "ref"), ("docs/main.rs", ""), (".env", "SECRET=1\n"),
+            (".env.local", ""), (".env.example", ""), ("web/.env.development", ""), ("web/node_modules/x/index.js", ""),
+            ("web/.gitignore", "dist/\n"), ("web/dist/app.js", ""), ("only-ignored/.env", ""), ("sub/.git", "gitdir: elsewhere\n"),
+        ];
+        for (p, body) in files {
             std::fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
             std::fs::write(root.join(p), body).unwrap();
         }
@@ -733,7 +760,11 @@ mod tests {
             done = b.done;
         });
         found.sort();
-        let mut want = vec![".config/tool.toml", ".gitignore", "docs/main.rs", "src/main.rs"];
+        // Ignored files are listed where their folder is entered; ignored folders, nested rules included, are not.
+        let mut want = vec![
+            ".config/tool.toml", ".env", ".env.example", ".env.local", ".gitignore", "app.log", "docs/main.rs", "only-ignored/.env",
+            "src/main.rs", "web/.env.development", "web/.gitignore",
+        ];
         if cfg!(unix) {
             want.push("linked.rs");
             want.sort();
