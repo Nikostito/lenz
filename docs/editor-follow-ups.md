@@ -1436,3 +1436,29 @@ and physical terminal behavior remain unverified.
 
 Historical ticket-67 limit, repaired during the Linux review: plain Home/End now moves the caret
 to line bounds in both adapters; document bounds and Shift selection share core motions.
+
+## Delete Line, block-aware Enter and Copy Reference (2026-11-16)
+
+- **Enter resolves the step when it adds or removes a level:** after a block opener (or Python's `return`) Enter
+  resolves `.editorconfig` to the filesystem root, as YAML's Enter after a key already did; a plain Enter does not.
+  It reads the caret's line and, on an empty line, at most 200 lines above (64 KiB of each); it never materializes
+  the document. Release timings of one Enter through the Session seam (200 samples each, 20,000-line Ruby file, this
+  Linux container, same build otherwise): a plain line 36–39 µs median before and after (47 µs in the baseline run),
+  an empty line 30–40 µs (35 µs before), after `def` 110–150 µs (19 µs before, when Enter only copied the
+  indentation); p90 after `def` 230–260 µs. A per-file cache of the resolved step would remove the difference, at the
+  cost of a changed `.editorconfig` no longer applying at once.
+- **Enter's rules are line rules, not a parse:** a block opener is recognized from its line's text (its last bracket,
+  Python's `:`, Ruby's and Lua's and shell's keywords) with the line comment and quoted brackets set aside. A string
+  that spans lines, a heredoc or a `then` on the next line is not understood; `end`, `else` and closing brackets are
+  not outdented as they are typed; Ruby's `end` is not inserted. Tree-sitter indentation queries would cover more
+  but parse on every Enter.
+- **Copy Reference names the declaration holding the caret:** it reads the tab's extracted declarations and their
+  header text (`module Foo::Bar`, `def self.make`), so a name the caret is on but does not declare (a call) is not
+  resolved to its target; that would need a language server's definition. Ruby's `class << self` is recognized from
+  indentation (the first less-indented line above the method); Python module and Rust module paths come from the
+  project-relative path; Java and PHP prefixes from the file's `package` / `namespace` line. Right after an edit,
+  while the declarations are being re-extracted, the command copies the text once and extracts them itself (not
+  for large files, which have none).
+- **Cmd+Backspace in terminals:** only terminals that report Cmd (the kitty keyboard protocol) deliver it; macOS
+  Terminal and iTerm2's defaults turn it into Ctrl+U, which stays unbound. Ctrl+Y and the menus reach Delete Line
+  everywhere. Native macOS GUI keys were exercised on the GPUI test platform only.

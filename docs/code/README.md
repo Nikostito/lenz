@@ -120,7 +120,15 @@ because VS Code's Ctrl+D (select the next occurrence) is Compare Selected here. 
 keys, like Delete, and the structural edits take chords: Ctrl+/ and Alt+/ for Toggle Comment, Ctrl+Shift+Down / Up for
 Move Lines (Alt+Down / Up in the VS Code preset, which is VS Code's own chord), and Alt+Shift+Down / Up for Duplicate
 Lines in both presets—IntelliJ's own Alt+Shift+arrows move a line and its Ctrl+D duplicates one, so Move Lines takes
-IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it.
+IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it. **Delete Line** removes every line
+the selections touch (one Undo step; each caret keeps its column on the line below): Ctrl+Y in the IntelliJ preset,
+and Cmd+Backspace on macOS in both presets, in the GUI and in terminals that report Cmd (the kitty keyboard protocol);
+it has no VS Code chord because Ctrl+Shift+K is Keep Tab Open here. **Copy Reference** (Ctrl+Alt+Shift+C in the
+IntelliJ preset, Cmd+Option+Shift+C on macOS; also in the text's right-click menu) copies the qualified name of the
+declaration holding the caret: `Foo::Bar::Baz#foo_method` and `Foo::Baz.make` in Ruby (`#` for instance methods, `.`
+for `def self.` and `class << self` ones), `pkg.module.Class.method` in Python, `com.acme.Box#open` in Java,
+`crate::module::Type::method` in Rust; outside a declaration (and in Markdown, HTML and CSS) it copies `path:line`. It
+names the declaration the caret is in, not a name the caret is on: a call is not resolved to what it calls.
 
 **Keymap…** lists each command with its chords, the preset origin of each override and any binding an override
 displaced. Enter takes the next key as the selected command's shortcut, Delete restores the preset's chord, Esc
@@ -213,8 +221,16 @@ actions give the same reason in both adapters. The one copy outside the project 
 record (the draft and the last saved text, as for any file), kept in Lenz Code's recovery folder (0700) as a 0600 file
 until it is saved or discarded. Project text search and Find read the file within the session like any other.
 
-Enter carries the current line's leading tabs and spaces onto the new line. YAML, Markdown and Haml retain
-their structural indentation rules; pasted text keeps its own whitespace.
+Enter in code (Rust, C, C++, Go, Zig, Java, Kotlin, C#, Python, Ruby, PHP, Lua, shell, JavaScript, TypeScript, CSS,
+JSON and SQL) indents the new line as its block calls for: one step deeper after a line that opens a block (an opening
+bracket last; Python's `:`; Ruby's `def`, `class`, `module`, `if`, `else`, `when`, `rescue`, `do |x|`, `{ |x|`; Lua's
+and shell's `then` and `do`), one step out after Python's `return`, `pass`, `break`, `continue` and `raise`, and between
+a bracket and its closer (`{|}`) the closer moves to its own line at the opener's indentation with the caret on an
+indented line between. On an empty line the nearest line with text above stands in, so a blank line inside a body
+continues the body. The step is the file's (EditorConfig, the project's choice, the language default), written as
+spaces after spaces and a tab after tabs. Other files keep the line's leading tabs and spaces. Comments and quoted
+brackets open nothing; `end` and closing brackets are not outdented as they are typed. YAML, XML, Markdown and Haml
+retain their structural indentation rules; pasted text keeps its own whitespace.
 
 The GUI source caret blinks every half second, starts visible after typing or movement, and stays steady
 while a dialog or another control/window has focus. The terminal source caret stays steady.
@@ -354,7 +370,7 @@ sources are listed, since the protocol does not provide a directory listing. Reo
 server session for the text; after that session ends, follow the definition again.
 
 Holding Ctrl over a name underlines it and shows a hand pointer: a click there follows it. A right-click in the text
-opens a menu with every navigation action, Copy Path / Copy Path:Line, Open in Editor, Open with Default App,
+opens a menu with every navigation action, Copy Path / Copy Path:Line / Copy Reference, Open in Editor, Open with Default App,
 Compare With… and Split Right / Split Down (Close Split once split). The call hierarchy lists callers (Tab:
 callees) in the results panel, a level loading as it unfolds (Right/Left). Type Hierarchy (Ctrl+H) lists the subtypes of the type at
 the caret the same way (Tab: supertypes). It comes from the server's own type hierarchy where it has one (JDT LS,

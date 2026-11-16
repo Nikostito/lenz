@@ -441,11 +441,11 @@ fn enter_in_yaml_keeps_the_lines_indentation_and_opens_a_block_after_a_key() {
     open(&mut s, Command::OpenRetained(rust), "main.rs");
     s.dispatch(Command::Select(Selection { anchor: 13, head: 13 }));
     s.dispatch(Command::InsertText { text: "\n".into(), kind: EditKind::Typing });
-    assert_eq!(text(&s), "    let a = {\n    \n", "Enter before a line break is typed, not stepped over");
+    assert_eq!(text(&s), "    let a = {\n        \n", "Enter before a line break is typed, not stepped over, and indents the block");
     s.dispatch(Command::InsertText { text: "l".into(), kind: EditKind::Typing });
     s.dispatch(Command::Select(Selection { anchor: 4, head: 4 }));
     s.dispatch(Command::InsertText { text: "l".into(), kind: EditKind::Typing });
-    assert_eq!(text(&s), "    llet a = {\n    l\n", "a letter before the same letter is typed too");
+    assert_eq!(text(&s), "    llet a = {\n        l\n", "a letter before the same letter is typed too");
     // A paste of a newline is literal.
     let yaml = write(&root, "paste.yaml", b"k:\n");
     open(&mut s, Command::OpenRetained(yaml), "paste.yaml");
@@ -743,4 +743,95 @@ fn xml_well_formedness_errors_feed_shared_problems_and_refresh_after_undo() {
     settle(&mut s, |s| s.state().diagnostics(tab).is_some());
     assert!(s.state().diagnostics(tab).unwrap().items.is_empty());
     assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+}
+
+fn command(s: &mut Session, id: CommandId) -> Effect {
+    let CatalogAction::Command(command) = s.action(id) else { panic!("{id:?} is a command") };
+    s.dispatch(command)
+}
+
+#[test]
+fn delete_line_removes_each_touched_line_once_keeps_columns_and_undoes_once() {
+    let d = tempfile::tempdir().unwrap();
+    let (root, path) = project_file(d.path(), "main.rb", "", "first\r\nsecond line\nthird\nlast");
+    let mut s = ready(d.path(), &root, &path);
+    assert_eq!(s.disabled(CommandId::DeleteLine), None);
+    // Two carets on one line and one on another: each line goes once, in one transaction.
+    s.dispatch(Command::Select(Selection { anchor: 3, head: 3 }));
+    s.dispatch(Command::AddCursorBelow);
+    s.dispatch(Command::Select(Selection { anchor: 3, head: 3 }));
+    s.dispatch(Command::AddCursorBelow);
+    command(&mut s, CommandId::DeleteLine);
+    assert_eq!(text(&s), "third\nlast");
+    assert_eq!(ranges(&s), vec![3..3], "the caret keeps its column on the line below");
+    // The last line takes the previous line's ending; the caret goes up.
+    s.dispatch(Command::Select(Selection { anchor: 8, head: 8 }));
+    command(&mut s, CommandId::DeleteLine);
+    assert_eq!(text(&s), "third");
+    let tab = s.state().active().unwrap().id();
+    s.dispatch(Command::Undo { tab });
+    assert_eq!(text(&s), "third\nlast");
+    s.dispatch(Command::Undo { tab });
+    assert_eq!(text(&s), "first\r\nsecond line\nthird\nlast", "one Undo step per Delete Line");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\r\nsecond line\nthird\nlast", "nothing is saved");
+    s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+    for _ in 0..4 { command(&mut s, CommandId::DeleteLine); }
+    assert_eq!(text(&s), "");
+    assert_eq!(s.disabled(CommandId::DeleteLine), Some("Nothing to delete"));
+}
+
+#[test]
+fn enter_in_code_indents_blocks_opens_bracket_pairs_and_continues_blank_lines() {
+    let d = tempfile::tempdir().unwrap();
+    let source = "module Foo\n  def bar\n    one\n\n  end\nend\n";
+    let (root, path) = project_file(d.path(), "foo.rb", "root = true\n[*]\nindent_style = space\nindent_size = 2\n", source);
+    let mut s = ready(d.path(), &root, &path);
+    let enter = |s: &mut Session| { s.dispatch(Command::InsertText { text: "\n".into(), kind: EditKind::Typing }); };
+    // After `def bar`, then on the blank line inside its body.
+    let after_def = source.find("def bar").unwrap() + "def bar".len();
+    s.dispatch(Command::Select(Selection { anchor: after_def, head: after_def }));
+    enter(&mut s);
+    let body = "module Foo\n  def bar\n    \n    one\n\n  end\nend\n";
+    assert_eq!(text(&s), body, "a method's body is indented");
+    assert_eq!(ranges(&s), vec![after_def + 5..after_def + 5]);
+    let blank = body.find("\n\n").unwrap() + 1;
+    s.dispatch(Command::Select(Selection { anchor: blank, head: blank }));
+    enter(&mut s);
+    assert_eq!(text(&s), "module Foo\n  def bar\n    \n    one\n\n    \n  end\nend\n", "a blank line in the body continues it");
+    assert_eq!(ranges(&s), vec![blank + 5..blank + 5]);
+    // Between a bracket pair: the caret on an indented line, the closer below at the opener's indentation.
+    let (_, js) = project_file(d.path(), "a.js", "root = true\n[*]\nindent_style = space\nindent_size = 2\n", "  call({})\n");
+    s.dispatch(Command::OpenRetained(js.clone()));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source() == js));
+    s.dispatch(Command::Select(Selection { anchor: 8, head: 8 }));
+    enter(&mut s);
+    assert_eq!(text(&s), "  call({\n    \n  })\n");
+    assert_eq!(ranges(&s), vec![13..13]);
+    let tab = s.state().active().unwrap().id();
+    s.dispatch(Command::Undo { tab });
+    assert_eq!(text(&s), "  call({})\n", "one Undo step");
+    // Plain text keeps the line's own indentation.
+    let (_, txt) = project_file(d.path(), "notes.txt", "", "  item {\n");
+    s.dispatch(Command::OpenRetained(txt.clone()));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source() == txt));
+    s.dispatch(Command::Select(Selection { anchor: 8, head: 8 }));
+    enter(&mut s);
+    assert_eq!(text(&s), "  item {\n  \n");
+}
+
+#[test]
+fn copy_reference_names_the_declaration_at_the_caret_else_the_path_and_line() {
+    let d = tempfile::tempdir().unwrap();
+    let source = "module Foo\n  module Bar\n    class Baz\n      def foo_method\n        1\n      end\n    end\n  end\nend\n# end\n";
+    std::fs::create_dir_all(d.path().join("p/lib")).unwrap();
+    let (root, path) = project_file(d.path(), "lib/baz.rb", "", source);
+    let mut s = ready(d.path(), &root, &path);
+    settle(&mut s, |s| s.state().view(s.state.active.unwrap()).is_some_and(|v| v.declarations().is_some()));
+    s.dispatch(Command::Select(Selection { anchor: source.find("foo_method").unwrap() + 2, head: source.find("foo_method").unwrap() + 2 }));
+    assert_eq!(s.disabled(CommandId::CopyReference), None);
+    assert_eq!(command(&mut s, CommandId::CopyReference).copy.as_deref(), Some("Foo::Bar::Baz#foo_method"));
+    // Outside every declaration: the project-relative path and the caret's line, as Copy Path:Line.
+    let last = source.find("# end").unwrap();
+    s.dispatch(Command::Select(Selection { anchor: last, head: last }));
+    assert_eq!(command(&mut s, CommandId::CopyReference).copy.as_deref(), Some("lib/baz.rb:10"));
 }

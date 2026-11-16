@@ -2429,6 +2429,12 @@ impl App {
                 if !self.session.text_input_enabled() { return false; }
                 self.run(if key.code == KeyCode::Char('x') { CommandId::Cut } else { CommandId::Paste }); true
             }
+            // Cmd+Backspace, where the terminal reports Cmd (the kitty keyboard protocol), deletes the lines the
+            // selections touch, as in the GUI and IntelliJ's macOS keymap.
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) && !control && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SHIFT) => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
+            }
             // Ctrl (where the terminal reports it with Backspace) or Alt deletes to the word stop, as IntelliJ's
             // Ctrl+Backspace / Ctrl+Delete; a Ctrl+Backspace sent as Ctrl+H or Ctrl+W stays that key's command.
             KeyCode::Backspace | KeyCode::Delete if !key.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META) => {

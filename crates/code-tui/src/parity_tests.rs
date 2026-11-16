@@ -555,6 +555,94 @@ fn project_name_navigation_reads_shifted_drafts_and_refuses_stale_disk_symbols_i
     replay_draft_project_query(cx, DraftQuery::Names);
 }
 
+/// Delete Line (Cmd+Backspace where Cmd is reported, and the IntelliJ preset's Ctrl+Y), Enter's block indentation
+/// and Copy Reference replayed through both adapters' real keys and menus: the same text, carets and clipboard.
+#[gpui::test]
+fn delete_line_block_enter_and_copy_reference_alike_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join(".editorconfig"), "root = true\n[*]\nindent_style = space\nindent_size = 2\n").unwrap();
+    let path = root.join("lib/baz.rb");
+    let original = "module Foo\n  class Baz\n    def foo_method\n      one\n    end\n  end\nend\n";
+    std::fs::write(&path, original).unwrap();
+    let mut core = Session::new(config(&dir.path().join("gui")));
+    core.dispatch(Command::OpenRoot(root.clone()));
+    let gui = cx.new(|cx| ReaderView::new(core, Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(600.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    tui.session.dispatch(Command::Open(path.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx));
+            while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            draw(visual, tui, terminal);
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < deadline, "adapters did not settle: GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| snapshot(view.session().state())), snapshot(tui.session.state()));
+            std::thread::yield_now();
+        }
+    };
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|d| d.source() == path) && state.active().and_then(|t| state.view(t.id())).is_some_and(|v| v.declarations().is_some()));
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let key = |tui: &mut App, code, modifiers| { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); };
+    let check = |visual: &VisualTestContext, tui: &App, expected: &str| {
+        let state = snapshot(tui.session.state());
+        assert_eq!(state.text.as_deref(), Some(expected));
+        assert_eq!(state, gui.read_with(visual, |view, _| snapshot(view.session().state())));
+    };
+    let to_def_end = |visual: &mut VisualTestContext, tui: &mut App| {
+        visual.simulate_keystrokes("ctrl-home down down end");
+        for (code, modifiers) in [(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE)] { key(tui, code, modifiers); }
+    };
+    // Enter after `def foo_method` indents its body one step deeper, not at the `def` line's own indentation.
+    to_def_end(&mut visual, &mut tui);
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    let entered = "module Foo\n  class Baz\n    def foo_method\n      \n      one\n    end\n  end\nend\n";
+    check(&visual, &tui, entered);
+    // Cmd+Backspace deletes the caret's line; the caret keeps its column on the line below.
+    visual.simulate_keystrokes("cmd-backspace");
+    key(&mut tui, KeyCode::Backspace, KeyModifiers::SUPER);
+    check(&visual, &tui, original);
+    // Ctrl+Y (IntelliJ's Delete Line) takes the next one.
+    visual.simulate_keystrokes("ctrl-y");
+    key(&mut tui, KeyCode::Char('y'), KeyModifiers::CONTROL);
+    check(&visual, &tui, "module Foo\n  class Baz\n    def foo_method\n    end\n  end\nend\n");
+    for expected in [original, entered] {
+        visual.simulate_keystrokes("ctrl-z");
+        key(&mut tui, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        check(&visual, &tui, expected);
+    }
+    // Copy Reference on the method: Ctrl+Alt+Shift+C in the GUI (Cmd+Option+Shift+C on macOS), and the same chord
+    // or the menu row in the terminal.
+    to_def_end(&mut visual, &mut tui);
+    visual.simulate_keystrokes("ctrl-alt-shift-c");
+    assert_eq!(visual.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text())).as_deref(), Some("Foo::Baz#foo_method"));
+    key(&mut tui, KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    assert_eq!(tui.copy.take().as_deref(), Some("Foo::Baz#foo_method"));
+    terminal.draw(|f| tui.draw(f)).unwrap();
+    let button = tui.layout.app_menu;
+    tui.handle(Event::Mouse(crossterm::event::MouseEvent { kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), column: button.x + 1, row: button.y, modifiers: KeyModifiers::NONE }));
+    for row in menu_path(&tui.session, CommandId::CopyReference) {
+        key(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        for _ in 0..row { key(&mut tui, KeyCode::Down, KeyModifiers::NONE); }
+        key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    }
+    assert_eq!(tui.copy.take().as_deref(), Some("Foo::Baz#foo_method"), "from the menu");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "nothing is saved");
+}
+
 /// Ignored files beside the project's files (`.env`, `.env.local`) are in the explorer, the file finder and Find in
 /// Files of both adapters; an ignored folder (`target/`) stays out of all three.
 #[gpui::test]

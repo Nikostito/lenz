@@ -48,6 +48,7 @@ mod snippet;
 pub mod session;
 pub mod shown;
 pub mod breadcrumbs;
+mod reference;
 pub mod tabs;
 pub mod template;
 pub mod watch;

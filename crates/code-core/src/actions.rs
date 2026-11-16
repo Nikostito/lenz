@@ -325,6 +325,7 @@ impl Session {
             CommandId::MoveLinesDown => Command::MoveLines { down: true },
             CommandId::DuplicateLinesUp => Command::DuplicateLines { down: false },
             CommandId::DuplicateLinesDown => Command::DuplicateLines { down: true },
+            CommandId::DeleteLine => Command::DeleteLines,
             CommandId::Definition => Command::Definition { peek: false },
             CommandId::PeekDefinition => Command::Definition { peek: true },
             CommandId::TypeDefinition => Command::TypeDefinition,
@@ -373,6 +374,7 @@ impl Session {
             CommandId::ExplorerHistory => return CatalogAction::Interface(InterfaceAction::ExplorerHistory),
             CommandId::CopyPath => Command::CopyPath { line: false },
             CommandId::CopyPathLine => Command::CopyPath { line: true },
+            CommandId::CopyReference => Command::CopyReference,
             CommandId::FileSymbols => Command::FileSymbols,
             CommandId::CopyServerDetails => Command::CopyText(self.language_server_details()),
             CommandId::InstallServer => Command::OpenServerInstall,
@@ -558,7 +560,7 @@ impl CommandId {
         match self {
             Self::ShowTerminal | Self::NewTerminal | Self::FocusTerminal | Self::FocusEditor | Self::SendSelectionToTerminal | Self::PasteTerminalPath | Self::CloseTerminal | Self::StopTerminal | Self::RenameTerminal | Self::RestartTerminal | Self::NextTerminal | Self::PreviousTerminal | Self::CopyTerminalSelection | Self::FindTerminal => return G::Terminal,
             Self::RecoverDrafts | Self::RecheckSave | Self::ConfirmRecheckedSave | Self::SaveWithoutFormatting | Self::ResolveExternalChange => return G::Recovery,
-            Self::CopyPath | Self::CopyPathLine | Self::OpenInEditor | Self::OpenWithDefaultApp => return G::FileLocation,
+            Self::CopyPath | Self::CopyPathLine | Self::CopyReference | Self::OpenInEditor | Self::OpenWithDefaultApp => return G::FileLocation,
             Self::NewWindow => return G::New,
             Self::ReadOnlyMode => return G::EditingSettings,
             Self::NewDocument | Self::NewExplorerFile | Self::NewExplorerFolder | Self::NewScratch | Self::ScratchFiles => return G::New,
@@ -579,7 +581,7 @@ impl CommandId {
             Self::NextProblem | Self::PreviousProblem | Self::ShowProblems | Self::CheckProjectSyntax | Self::CancelProjectSyntax => return G::Problems,
             Self::MatchCase | Self::WholeWord | Self::RegularExpression => return G::FindOptions,
             Self::ExtendSelection | Self::ShrinkSelection | Self::AddCursorBelow | Self::AddCursorAbove | Self::SelectNextOccurrence | Self::CollapseSelections => return G::Selections,
-            Self::IndentSelection | Self::OutdentSelection | Self::ToggleComment | Self::MoveLinesUp | Self::MoveLinesDown | Self::DuplicateLinesUp | Self::DuplicateLinesDown => return G::Lines,
+            Self::IndentSelection | Self::OutdentSelection | Self::ToggleComment | Self::MoveLinesUp | Self::MoveLinesDown | Self::DuplicateLinesUp | Self::DuplicateLinesDown | Self::DeleteLine => return G::Lines,
             Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::VimMode | Self::MacWordMotion | Self::SaveOnLeave => return G::EditingSettings,
             Self::WorkspaceRoot | Self::ServerRuntime | Self::ExcludeRubyTooling | Self::ResetProjectServerSettings | Self::PersistentIndex | Self::RebuildIndex => return G::ServerSetup,
             Self::ConfigureSqlMetadata | Self::ConnectSqlMetadata | Self::RefreshSqlMetadata | Self::DisconnectSqlMetadata => return G::Metadata,
@@ -589,7 +591,7 @@ impl CommandId {
         }
         match self {
             Self::Open | Self::OpenFolder | Self::OpenRecent | Self::NewWindow | Self::Reload | Self::Save | Self::SaveWithoutFormatting | Self::SaveAs | Self::NewDocument | Self::RecoverDrafts | Self::RecheckSave | Self::ConfirmRecheckedSave
-            | Self::NewScratch | Self::ScratchFiles | Self::CloseAllTabs | Self::CloseOtherTabs | Self::CloseTabsLeft | Self::CloseTabsRight | Self::Close | Self::PinTab | Self::CopyPath | Self::CopyPathLine | Self::OpenInEditor | Self::OpenWithDefaultApp
+            | Self::NewScratch | Self::ScratchFiles | Self::CloseAllTabs | Self::CloseOtherTabs | Self::CloseTabsLeft | Self::CloseTabsRight | Self::Close | Self::PinTab | Self::CopyPath | Self::CopyPathLine | Self::CopyReference | Self::OpenInEditor | Self::OpenWithDefaultApp
             | Self::ReadOnlyMode | Self::CompareWith | Self::CompareSelected | Self::CompareSaved | Self::CloseSavedComparison
             | Self::ResolveExternalChange => G::File,
             Self::ShowTerminal | Self::NewTerminal | Self::FocusTerminal | Self::FocusEditor | Self::SendSelectionToTerminal | Self::PasteTerminalPath | Self::CloseTerminal | Self::StopTerminal | Self::RenameTerminal | Self::RestartTerminal | Self::NextTerminal | Self::PreviousTerminal | Self::CopyTerminalSelection | Self::FindTerminal | Self::ToggleActivityLog | Self::CopyActivityLog | Self::ClearActivityLog | Self::StatusDetails | Self::RelativeLineNumbers | Self::SoftWrap | Self::StickyScroll | Self::Breadcrumbs | Self::Outline
@@ -617,7 +619,7 @@ impl CommandId {
             Self::SelectAll | Self::Copy | Self::Cut | Self::Paste | Self::Delete | Self::Undo | Self::Redo | Self::ExtendSelection | Self::ShrinkSelection
             | Self::AddCursorBelow | Self::AddCursorAbove | Self::SelectNextOccurrence | Self::CollapseSelections
             | Self::IndentSelection | Self::OutdentSelection | Self::ToggleComment | Self::MoveLinesUp | Self::MoveLinesDown
-            | Self::DuplicateLinesUp | Self::DuplicateLinesDown
+            | Self::DuplicateLinesUp | Self::DuplicateLinesDown | Self::DeleteLine
             | Self::VimMode | Self::MacWordMotion | Self::SaveOnLeave | Self::EditingPreferences | Self::IndentTabs | Self::IndentTwoSpaces | Self::IndentFourSpaces | Self::IndentInherit | Self::FormatOnSave | Self::Completion | Self::ParameterInfo | Self::QuickFix | Self::FormatDocument | Self::OrganizeImports => G::Selection,
             Self::InstallServer | Self::StartServerInstall | Self::CancelServerInstall | Self::WorkspaceRoot | Self::LanguageServer | Self::ServerDetails | Self::CopyServerDetails | Self::ServerRuntime
             | Self::RestartServer | Self::ExcludeRubyTooling | Self::ResetProjectServerSettings | Self::PersistentIndex | Self::RebuildIndex

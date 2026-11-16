@@ -195,6 +195,9 @@ pub enum Command {
     MoveLines { down: bool },
     /// Copy the lines the selections touch directly below (or above) themselves.
     DuplicateLines { down: bool },
+    /// Delete every line the selections touch, endings included, as one transaction; each caret keeps its column on
+    /// the line that takes the deleted lines' place.
+    DeleteLines,
     SetReadOnly(bool),
     CompareSaved,
     CloseSavedComparison,
@@ -538,6 +541,8 @@ pub enum Command {
     SetFileIcons(bool),
     /// Copy the active file's path (relative to the open folder), with `:line` of the caret when `line`.
     CopyPath { line: bool },
+    /// Copy the qualified name of the declaration at the caret (`Foo::Bar::Baz#foo_method`), else `path:line`.
+    CopyReference,
     /// A message from the adapter (a launch it could not start), shown with the core's own.
     Notice(String),
     /// Mark the occurrences of the name at the caret (asked in the background; never cancels another request).
@@ -795,6 +800,8 @@ pub enum CommandId {
     DuplicateLinesUp,
     /// Copy the lines the selections touch directly below themselves.
     DuplicateLinesDown,
+    /// Delete the lines the selections touch (IntelliJ's Delete Line).
+    DeleteLine,
     ChooseTheme,
     /// The application's name, version, platform, licence and project page (the adapter shows it).
     About,
@@ -852,6 +859,8 @@ pub enum CommandId {
     /// The active file's path (relative to the open folder), and with the caret's line.
     CopyPath,
     CopyPathLine,
+    /// The qualified name of the declaration at the caret (IntelliJ's Copy Reference), else the path and line.
+    CopyReference,
     /// The active file in the user's editor at the caret, or with the system's default app.
     OpenInEditor,
     OpenWithDefaultApp,
@@ -991,7 +1000,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 260] = [
+    pub const ALL: [CommandId; 262] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1083,6 +1092,7 @@ impl CommandId {
         Self::ResolveExternalChange,
         Self::CopyPath,
         Self::CopyPathLine,
+        Self::CopyReference,
         Self::OpenInEditor,
         Self::OpenWithDefaultApp,
         Self::CompareWith,
@@ -1107,6 +1117,7 @@ impl CommandId {
         Self::MoveLinesDown,
         Self::DuplicateLinesUp,
         Self::DuplicateLinesDown,
+        Self::DeleteLine,
         Self::ChooseTheme,
         Self::About,
         Self::NewWindow,
@@ -1370,6 +1381,7 @@ impl CommandId {
             Self::MoveLinesDown => "Move Lines Down",
             Self::DuplicateLinesUp => "Duplicate Lines Up",
             Self::DuplicateLinesDown => "Duplicate Lines Down",
+            Self::DeleteLine => "Delete Line",
             Self::ChooseTheme => "Change theme",
             Self::About => crate::chrome::ABOUT_TITLE,
             Self::NewWindow => "New Window",
@@ -1441,6 +1453,7 @@ impl CommandId {
             Self::SemanticHighlighting => "Semantic Highlighting",
             Self::CopyPath => "Copy Path",
             Self::CopyPathLine => "Copy Path:Line",
+            Self::CopyReference => "Copy Reference",
             Self::OpenInEditor => "Open in Editor",
             Self::OpenWithDefaultApp => "Open with Default App",
             Self::CompareWith => "Compare Saved Disk Inputs…",
@@ -3530,7 +3543,7 @@ impl Session {
             return Some("This action requires a file on disk; the current document is an archive entry");
         }
         if self.state.active().is_some_and(|tab| tab.csv.is_some()) && matches!(id,
-            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
+            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
         if self.csv_pending() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
         if (self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || self.install_running.is_some()) && matches!(id,
             CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
@@ -3698,7 +3711,7 @@ impl Session {
             CommandId::CloseSavedComparison => self.state.comparison.is_none().then_some("No saved comparison is open"),
             CommandId::CompareWith => (self.state.active().is_none() && self.state.project.is_none()).then_some("No file or folder is open"),
             CommandId::CompareSelected => (self.state.tree_marks.len() < 2).then_some(MARK_TWO),
-            CommandId::CopyPathLine => match self.state.active() {
+            CommandId::CopyPathLine | CommandId::CopyReference => match self.state.active() {
                 None => Some("No file is open"),
                 Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
                 Some(t) if !t.loaded => Some("No text to point at"),
@@ -3741,7 +3754,7 @@ impl Session {
             },
             CommandId::Cut | CommandId::Paste | CommandId::Delete => self.text_action_disabled(id),
             CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment
-            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown => self.structural_action_disabled(id),
+            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine => self.structural_action_disabled(id),
             CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections => self.selection_action_disabled(id),
             CommandId::ReadOnlyMode => self.state.active().and_then(|t| self.state.view(t.id)).map_or(Some("No loaded file is open"), |view| view.intrinsic_edit_disabled()),
             CommandId::Copy if self.state.active().and_then(|tab| tab.csv.as_ref()).is_some() => {
@@ -4193,7 +4206,7 @@ impl Session {
         if text {
             entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation, CommandId::RenameSymbol].map(C));
             entries.extend([Separator, C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll)]);
-            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine)]);
+            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference)]);
         } else {
             if matches!(self.state.rendering(), Some(Rendering::Preview(_))) {
                 entries.extend([C(CommandId::Copy), Separator, C(CommandId::ShowInSource), C(CommandId::FollowLink), Separator]);
@@ -4538,7 +4551,7 @@ impl Session {
             Input::Command(_) | Input::Completion(_) => None,
         };
         let edit_reveal = matches!(&input, Input::Command(Command::Cut | Command::Paste(_) | Command::Delete { .. } | Command::InsertText { .. } | Command::AddCursorBelow | Command::AddCursorAbove
-            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
+            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::DeleteLines | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
         let reveal_selection = (edit_reveal || matches!(&input, Input::Command(Command::VimKey(_) | Command::MoveCaret(_) | Command::Extend(_) | Command::ExtendSelection | Command::ShrinkSelection)) || expansion_completion.is_some())
             && !expansion_completion.is_some_and(|request| self.expanding.is_some_and(|e| e.3 == request && !e.4));
         let markers_due = matches!(input, Input::Completion(Completion::MarkersDue));
@@ -5746,6 +5759,30 @@ impl Session {
                 let at = self.state.view(t.id).map_or(0, |view| t.selection().map_or(0, |s| view.snapshot().line_of(s.head)) + 1);
                 Effect { repaint: false, copy: Some(if line { format!("{path}:{at}") } else { path }), ..Effect::default() }
             }
+            Command::CopyReference => {
+                let Some(t) = self.state.active().filter(|t| !t.untitled()) else { return Effect::default() };
+                let relative = self.state.project.as_ref().and_then(|p| t.source.strip_prefix(p.root()).ok())
+                    .map(|relative| relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                let reference = self.state.view(t.id).and_then(|view| {
+                    let doc = view.snapshot();
+                    let at = t.selection().map_or_else(|| doc.reader_line_range(t.top_line).start, |s| s.head);
+                    match view.declarations() {
+                        Some(declarations) => crate::reference::qualified_name(doc, declarations, at, relative.as_deref()),
+                        // Right after an edit the declarations are still being extracted: this explicit action
+                        // extracts them once itself rather than copy a path where a name was asked for.
+                        None if !doc.is_large() => {
+                            let text: Arc<str> = doc.copy_range(0..doc.len_bytes())?.into();
+                            let declarations = lenz_content::highlight::declarations_while(doc.language()?, text, || true)?;
+                            crate::reference::qualified_name(doc, &declarations, at, relative.as_deref())
+                        }
+                        None => None,
+                    }
+                });
+                match reference {
+                    Some(name) => Effect { repaint: false, copy: Some(name), ..Effect::default() },
+                    None => self.command(Command::CopyPath { line: true }),
+                }
+            }
             Command::CopyText(text) => Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() },
             Command::Notice(text) => {
                 self.state.messages.push(text);
@@ -5756,6 +5793,7 @@ impl Session {
             Command::ToggleComment => self.toggle_comment(),
             Command::MoveLines { down } => self.move_lines(down),
             Command::DuplicateLines { down } => self.duplicate_lines(down),
+            Command::DeleteLines => self.delete_lines(),
             Command::InsertText { text, kind } => self.insert_text(text, kind),
             Command::AddCursorBelow => self.add_cursor(true),
             Command::AddCursorAbove => self.add_cursor(false),

@@ -222,6 +222,10 @@ const INTELLIJ: &[Preset] = &[
     (CommandId::MoveLinesDown, &["Ctrl+Shift+Down"]),
     (CommandId::DuplicateLinesUp, &["Alt+Shift+Up"]),
     (CommandId::DuplicateLinesDown, &["Alt+Shift+Down"]),
+    // IntelliJ's Delete Line; on macOS the GUI and terminals that report Cmd also take Cmd+Backspace, as there.
+    (CommandId::DeleteLine, &["Ctrl+Y"]),
+    // IntelliJ's Copy Reference (Cmd+Option+Shift+C on macOS, where Ctrl is Cmd).
+    (CommandId::CopyReference, &["Ctrl+Alt+Shift+C"]),
     // Terminals often deliver Ctrl+/ as Ctrl+_ (or swallow it), so Alt+/ is the route that always arrives.
     (CommandId::ToggleComment, &["Ctrl+/", "Alt+/"]),
     (CommandId::FocusBreadcrumbs, &["Ctrl+Shift+."]),

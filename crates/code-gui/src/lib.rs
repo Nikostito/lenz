@@ -1796,6 +1796,10 @@ impl ReaderView {
         } else if control && !key.modifiers.alt && !key.modifiers.shift && matches!(key.key.as_str(), "x" | "v") {
             if !self.session.text_input_enabled() { return false; }
             self.run(if key.key == "x" { CommandId::Cut } else { CommandId::Paste }, window, cx); true
+        } else if key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt && !key.modifiers.shift && key.key == "backspace" {
+            // Cmd+Backspace deletes the lines the selections touch, as in IntelliJ's macOS keymap.
+            if self.draft_target().is_none() { return false; }
+            self.run(CommandId::DeleteLine, window, cx); true
         } else if !key.modifiers.platform && matches!(key.key.as_str(), "backspace" | "delete") {
             // Ctrl (or Alt, macOS's Option) deletes to the word stop, as IntelliJ's Ctrl+Backspace / Ctrl+Delete.
             if self.draft_target().is_none() { return false; }
