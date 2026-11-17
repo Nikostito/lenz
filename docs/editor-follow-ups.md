@@ -1450,8 +1450,13 @@ to line bounds in both adapters; document bounds and Shift selection share core 
 - **Enter's rules are line rules, not a parse:** a block opener is recognized from its line's text (its last bracket,
   Python's `:`, Ruby's and Lua's and shell's keywords) with the line comment and quoted brackets set aside. A string
   that spans lines, a heredoc or a `then` on the next line is not understood; `end`, `else` and closing brackets are
-  not outdented as they are typed; Ruby's `end` is not inserted. Tree-sitter indentation queries would cover more
-  but parse on every Enter.
+  not outdented as they are typed. Tree-sitter indentation queries would cover more but parse on every Enter.
+- **Enter's on-type formatting is Ruby LSP's only:** other servers offering `\n` (typescript-language-server, clangd,
+  rust-analyzer for doc comments) are not asked, because some reformat the line above. Lenz asks only for `\n`, not
+  Ruby LSP's `{`, `|` and `d` triggers (closing `#{` in a string, block parameters' `|`, re-indenting when `end` is
+  typed). The `end` guard reads indentation, so a block whose lines are not indented is judged by the first line
+  below at the opener's column. Verified with Ruby LSP 0.26.11 (`real_ruby_enter_closes_an_open_block_once`): without
+  the guard it adds a second `end` below a closed `def` while another block lacks its own.
 - **Copy Reference names the declaration holding the caret:** it reads the tab's extracted declarations and their
   header text (`module Foo::Bar`, `def self.make`), so a name the caret is on but does not declare (a call) is not
   resolved to its target; that would need a language server's definition. Ruby's `class << self` is recognized from

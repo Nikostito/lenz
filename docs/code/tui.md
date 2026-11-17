@@ -267,7 +267,8 @@ each (**Edit → Lines and Indentation** menu, F10 and the palette in both adapt
   Ctrl+Y and the F10 menu stay the routes there.
 - **Enter** in code indents the new line as its block calls for, as in the GUI (see
   [Lenz Code](README.md)): one step deeper after `def`, `do |x|`, `{` or Python's `:`, the closer
-  of `{|}` on its own line, and a blank line inside a body continues it.
+  of `{|}` on its own line, and a blank line inside a body continues it. With Ruby LSP running, its `end` follows as
+  its own Undo step, never below a block that already has one.
 - Typing an opening delimiter wraps a selection (`(` around `x` gives `(x)` with `x` still selected) or opens a pair
   with the caret between (`{}`, `[]`, `""`, `''` or a backtick pair); the closing delimiter already in front of the caret is
   stepped over rather than doubled, a quote after a word stays an apostrophe, and no pair is opened in front of a

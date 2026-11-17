@@ -3131,7 +3131,7 @@ pub struct Session {
     /// What the server inserts after the character just typed (a closing tag), on its way.
     pending_auto_insert: Option<auto_insert::AutoInsertRequest>,
     /// The tab whose typed character its server inserts after: asked once the command is over.
-    auto_insert_due: Option<TabId>,
+    auto_insert_due: Option<(TabId, char)>,
     pending_code_action: Option<code_action::CodeActionRequest>,
     /// The server command running for the user's pick.
     pending_command: Option<server_command::CommandWait>,
@@ -4582,7 +4582,7 @@ impl Session {
         }
         if arranged { self.checkpoint_workspace(); }
         if std::mem::take(&mut self.signature_due) { effect.repaint |= self.signature_at_caret(false).repaint; }
-        if let Some(tab) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab).repaint; }
+        if let Some((tab, typed)) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab, typed).repaint; }
         if self.pending_auto_insert.as_ref().is_some_and(|p| !p.current(&self.state)) { self.cancel_auto_insert(); }
         if self.pending_doc.as_ref().is_some_and(|p| !self.is_shown(p.tab) || !self.state.view(p.tab).is_some_and(|v| p.source.matches(v.snapshot()))) { self.cancel_documentation(); }
         // A popup or request whose tab, version, caret or server is no longer current is gone, not hidden.

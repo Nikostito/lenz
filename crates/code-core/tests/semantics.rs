@@ -1840,7 +1840,7 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
         C(CommandId::TypeHierarchy), C(CommandId::Documentation), C(CommandId::RenameSymbol), Separator,
         C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll), Separator,
         C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode),
-        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::LocateFile), Separator,
+        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference), C(CommandId::LocateFile), Separator,
         C(CommandId::AnnotateBlame), Separator, C(CommandId::OpenInEditor), C(CommandId::OpenWithDefaultApp),
         C(CommandId::ResolveExternalChange), C(CommandId::CompareWith), C(CommandId::CompareSaved), C(CommandId::CloseSavedComparison), Separator,
         C(CommandId::SplitRight), C(CommandId::SplitDown),
@@ -1853,6 +1853,7 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
     assert_eq!(f.s.disabled(CommandId::CloseSavedComparison), Some("No saved comparison is open"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: false }).copy.as_deref(), Some("src/main.rs"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: true }).copy.as_deref(), Some("src/main.rs:2"));
+    assert_eq!(f.s.dispatch(Command::CopyReference).copy.as_deref(), Some("crate::main"), "the function holding the caret");
     assert_eq!(CommandId::CopyPathLine.label(), "Copy Path:Line");
     assert!(CommandId::ALL.contains(&CommandId::CopyPath));
     assert_eq!(f.s.disabled(CommandId::CopyPath), None);
@@ -3784,6 +3785,72 @@ fn typing_a_tags_closing_bracket_inserts_its_closing_tag_as_its_own_undo_step() 
     f.s.dispatch(Command::AddCursorBelow);
     f.keys("<b>");
     assert_eq!(f.auto_inserts().len(), 1, "no question with several carets");
+}
+
+fn ruby_fixture(source: &str) -> Fixture {
+    let config = "root = true\n[*]\nindent_style = space\nindent_size = 2\n";
+    let mut f = fixture_input("ruby-lsp", &[], &[("Gemfile", ""), (".editorconfig", config), ("a.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f
+}
+
+impl Fixture {
+    fn on_types(&self) -> Vec<Value> { messages(&self.log).into_iter().filter_map(|m| m.get("onType").cloned()).collect() }
+    /// Apply what arrives for `ms` milliseconds.
+    fn pump(&mut self, ms: u64) {
+        let rx = self.s.completions();
+        let until = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < until { if let Ok(c) = recv(&rx) { self.s.dispatch(c); } }
+    }
+}
+
+/// Enter after a Ruby block opener indents the body at once, then asks Ruby LSP (the fake answering as it does) for
+/// its on-type edits: the `end` it adds goes in as its own Undo step, with the caret left on the body line. A block
+/// that already has its `end` gets no second one, even when the server (seeing a syntax error elsewhere) offers it.
+#[test]
+fn enter_takes_the_servers_end_as_its_own_undo_step_and_never_adds_a_second_end() {
+    let source = "class A\n  def go\nend\n";
+    let mut f = ruby_fixture(source);
+    let tab = f.s.state().active().unwrap().id();
+    let at = source.find("def go").unwrap() + "def go".len();
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.keys("\n");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the body's indentation comes at once");
+    f.settle(|s| current_text(s.state()).contains("  end\nend"));
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \n  end\nend\n");
+    assert_eq!(f.s.state().selection().map(|s| s.range()), Some(at + 5..at + 5), "the caret stays on the body line");
+    let asked = f.on_types();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0], serde_json::json!({ "ch": "\n", "options": { "tabSize": 2, "insertSpaces": true }, "position": { "line": 2, "character": 4 } }));
+    f.keys("x");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    x\n  end\nend\n");
+    f.s.dispatch(Command::Undo { tab });
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the server's `end` is undone on its own");
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), source);
+    // Closed already: the server answers `end` (the file does not parse elsewhere), and none is added.
+    let closed = "def go\nend\nsyntax_error(\n";
+    let mut g = ruby_fixture(closed);
+    let at = "def go".len();
+    g.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    g.keys("\n");
+    let log = g.log.clone();
+    g.settle_until(move || messages(&log).iter().any(|m| m.get("onType").is_some()));
+    g.pump(400);
+    assert_eq!(current_text(g.s.state()), "def go\n  \nend\nsyntax_error(\n");
+    // A plain line asks the server too, which answers nothing; several carets ask nothing.
+    g.keys("y\n");
+    g.pump(300);
+    assert_eq!(current_text(g.s.state()), "def go\n  y\n  \nend\nsyntax_error(\n");
+    let asked = g.on_types().len();
+    g.s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+    g.s.dispatch(Command::AddCursorBelow);
+    g.keys("\n");
+    g.pump(300);
+    assert_eq!(g.on_types().len(), asked, "no question with several carets");
+    assert_eq!(std::fs::read_to_string(g.root.join("a.rb")).unwrap(), closed, "only the draft changes");
 }
 
 /// A closing tag answered after more typing is dropped, and one the settings turn off (`autoClosingTags: false`) is

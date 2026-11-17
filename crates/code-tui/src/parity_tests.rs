@@ -2815,6 +2815,78 @@ fn problems_and_quick_fixes_show_navigate_and_apply_alike_in_both_adapters(cx: &
     assert!(!root.join("src/other.rs").exists());
 }
 
+/// Enter after a Ruby block opener in both adapters, the fake answering on-type formatting as Ruby LSP does: the body
+/// line is indented at once, the server's `end` follows as its own Undo step with the caret on the body line, and a
+/// block that already has its `end` gets no second one. The same draft and caret in both; the file untouched.
+#[gpui::test]
+fn enter_takes_the_language_servers_end_once_alike_in_both_adapters(cx: &mut TestAppContext) {
+    let profile = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_owned();
+    assert!(std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-q", "--locked", "-p", "code-core", "--example", "fake_lsp"])
+        .current_dir(env!("CARGO_MANIFEST_DIR")).status().unwrap().success());
+    let fake = profile.join("examples/fake_lsp");
+    let text = "class A\n  def go\nend\n\ndef done\nend\nsyntax_error(\n";
+    let dir = tempfile::tempdir().unwrap();
+    let make = |name: &str| {
+        let root = dir.path().join(name).join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Gemfile"), "").unwrap();
+        std::fs::write(root.join(".editorconfig"), "root = true\n[*]\nindent_style = space\nindent_size = 2\n").unwrap();
+        std::fs::write(root.join("a.rb"), text).unwrap();
+        let c = config(&dir.path().join(name).join("config"));
+        let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&c.providers).unwrap()).unwrap();
+        settings["providers"]["ruby-lsp"] = serde_json::json!({"executable": fake, "env": {"FAKE_LSP_NO_DECOR": "1"}});
+        std::fs::write(&c.providers, settings.to_string()).unwrap();
+        (c, root)
+    };
+    let ((gc, groot), (tc, troot)) = (make("gui"), make("tui"));
+    let mut core = Session::new(gc); core.dispatch(Command::OpenRoot(groot.clone()));
+    let gui = cx.new(|cx| ReaderView::new(core, Some(groot.join("a.rb")), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle()); visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(tc, Some(troot.clone())); tui.session.dispatch(Command::Open(troot.join("a.rb")));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx)); while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            visual.update(|window, cx| { let _ = window.draw(cx); }); terminal.draw(|frame| tui.draw(frame)).unwrap();
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < until, "GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| view.session().state().notices()), tui.session.state().notices());
+            std::thread::yield_now();
+        }
+    };
+    let ready = |state: &State| state.current_source().is_some_and(|d| d.source().ends_with("a.rb")) && state.provider().is_some_and(|p| p.status == code_core::semantics::Status::Ready);
+    wait(&mut visual, &mut tui, &mut terminal, &ready);
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let key = |tui: &mut App, code, modifiers| { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); };
+    let same = |visual: &VisualTestContext, tui: &App| {
+        let state = snapshot(tui.session.state());
+        assert_eq!(state, gui.read_with(visual, |view, _| snapshot(view.session().state())));
+        state.text.unwrap_or_default()
+    };
+    // After `def go`: the body line at once, then the server's `end`.
+    visual.simulate_keystrokes("ctrl-home down end enter");
+    for (code, modifiers) in [(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE)] { key(&mut tui, code, modifiers); }
+    let with_end = "class A\n  def go\n    \n  end\nend\n\ndef done\nend\nsyntax_error(\n";
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).as_deref() == Some(with_end)));
+    assert_eq!(same(&visual, &tui), with_end);
+    assert_eq!(tui.session.state().selection().map(|s| s.range()), Some(21..21), "the caret stays on the body line");
+    // Ctrl+Z takes the `end` back on its own, then the line break.
+    visual.simulate_keystrokes("ctrl-z"); key(&mut tui, KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert_eq!(same(&visual, &tui), "class A\n  def go\n    \nend\n\ndef done\nend\nsyntax_error(\n");
+    // `def done` has its `end`: the fake (seeing `syntax_error(`) offers another, and neither adapter takes it.
+    visual.simulate_keystrokes("ctrl-g 6 enter end enter");
+    for (code, modifiers) in [(KeyCode::Char('g'), KeyModifiers::CONTROL), (KeyCode::Char('6'), KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE)] { key(&mut tui, code, modifiers); }
+    let until = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < until { wait(&mut visual, &mut tui, &mut terminal, &|_| true); }
+    assert_eq!(same(&visual, &tui), "class A\n  def go\n    \nend\n\ndef done\n  \nend\nsyntax_error(\n");
+    assert_eq!(std::fs::read_to_string(groot.join("a.rb")).unwrap(), text);
+    assert_eq!(std::fs::read_to_string(troot.join("a.rb")).unwrap(), text);
+}
+
 /// Templates (ticket 57) through both adapters, the fake standing in for Ruby LSP and the HTML server: the problems of
 /// both views of an HTML ERB template drawn alike; a Ruby name typed into an output tag and a word of the markup each
 /// completed by the server of the view the caret is in (Enter), each one Ctrl+Z; the Ruby quick fix by Alt+Enter;

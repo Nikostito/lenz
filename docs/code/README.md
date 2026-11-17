@@ -232,6 +232,15 @@ spaces after spaces and a tab after tabs. Other files keep the line's leading ta
 brackets open nothing; `end` and closing brackets are not outdented as they are typed. YAML, XML, Markdown and Haml
 retain their structural indentation rules; pasted text keeps its own whitespace.
 
+After that indentation, a language server that formats on Enter (`textDocument/onTypeFormatting` with `\n`) is asked
+for its edits, which go in as their own Undo step with the caret left on the new line; Ctrl+Z takes them back and keeps
+the line break. Only Ruby LSP is asked (servers opt in per provider: VS Code leaves format-on-type off, and some servers
+reformat the previous line on Enter). Ruby LSP closes the block just opened with `end` (after `def`, `class`, `module`,
+`if`, `unless`, `while`, `until`, `for`, `case` and `do`), closes a heredoc and continues a `#` comment line. It adds
+`end` only while the file does not parse; because an unrelated error elsewhere also makes it offer one, Lenz drops an
+`end` when the block already has its own (the first line below at the opener's indentation or less is `end` at the
+opener's indentation). An answer that arrives after more typing, a caret move or for several carets is dropped.
+
 The GUI source caret blinks every half second, starts visible after typing or movement, and stays steady
 while a dialog or another control/window has focus. The terminal source caret stays steady.
 

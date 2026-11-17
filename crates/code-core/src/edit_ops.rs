@@ -321,6 +321,65 @@ pub(crate) fn enter_plan(before: &str, after: &str, previous: impl FnOnce() -> O
     EnterPlan { indent: format!("{reference}{step}"), closer }
 }
 
+/// A server's edits in transaction order: inserts at one position joined in the order it sent them (as LSP applies
+/// them), a `$0` cursor marker (a VS Code snippet anchor) dropped. `None` when they overlap.
+pub(crate) fn ordered_server_edits(mut edits: Vec<TextEdit>) -> Option<Vec<TextEdit>> {
+    edits.retain(|e| &*e.text != "$0");
+    // Stable: same-position inserts keep the server's order.
+    edits.sort_by_key(|e| (e.range.start, e.range.end));
+    let mut out: Vec<TextEdit> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if let Some(last) = out.last_mut() {
+            if last.range.is_empty() && last.range == edit.range {
+                last.text = format!("{}{}", last.text, edit.text).into();
+                continue;
+            }
+            if last.range.end > edit.range.start || last.range == edit.range { return None; }
+        }
+        out.push(edit);
+    }
+    Some(out)
+}
+
+/// Whether the edits write a line that is only `end`.
+pub(crate) fn inserts_end(edits: &[TextEdit]) -> bool {
+    edits.iter().any(|e| e.text.split(['\r', '\n']).any(|line| line.trim() == "end"))
+}
+
+/// Whether the block opened by the nearest line with text above `line` is already closed: below it, the first line
+/// with text that is not indented deeper than the opener is `end` (or a closing bracket) at the opener's indentation.
+/// Reads at most a few thousand lines.
+pub(crate) fn block_closed_below(doc: &TextSnapshot, line: usize) -> bool {
+    const LINES: usize = 5000;
+    let text_of = |line: usize| doc.line_range(line).and_then(|r| doc.copy_range(r.start..r.end.min(r.start + 4096)));
+    let depth = |text: &str| text.len() - text.trim_start_matches([' ', '\t']).len();
+    let Some(opener) = (line.saturating_sub(200)..line).rev().find_map(|l| text_of(l).filter(|t| !t.trim().is_empty())) else { return false };
+    let indent = depth(&opener);
+    for l in line..doc.line_count().min(line + LINES) {
+        let Some(text) = text_of(l) else { break };
+        let body = text.trim_start_matches([' ', '\t']);
+        if body.trim().is_empty() || depth(&text) > indent { continue; }
+        let word = body.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+        return depth(&text) == indent && (word == "end" || body.starts_with(['}', ']', ')']));
+    }
+    false
+}
+
+/// Where a caret at `caret` stands after `edits` (ascending, disjoint): text inserted right at it goes after it.
+pub(crate) fn caret_after(edits: &[TextEdit], caret: usize) -> usize {
+    let mut moved = caret as isize;
+    for edit in edits {
+        if edit.range.start >= caret && !(edit.range.start == caret && !edit.range.is_empty()) { break; }
+        if edit.range.end <= caret {
+            moved += edit.text.len() as isize - edit.range.len() as isize;
+        } else {
+            // The caret was inside replaced text: it goes to the replacement's end.
+            moved += (edit.range.start + edit.text.len()) as isize - caret as isize;
+        }
+    }
+    moved.max(0) as usize
+}
+
 /// How many bytes at the end of `indent` one step takes away: a tab, or up to `unit.width` spaces.
 fn removable_in(indent: &str, unit: &IndentUnit) -> usize {
     if indent.ends_with('\t') { return 1; }
@@ -780,6 +839,30 @@ mod tests {
         assert_eq!(super::enter_plan("  ", "", || panic!("not asked"), Ruby, unit).indent, "  ");
         assert_eq!(super::enter_plan("", "  foo", || panic!("not asked"), Ruby, unit).indent, "");
         assert!(super::structured_enter(Some(Ruby)) && !super::structured_enter(Some(Markdown)) && !super::structured_enter(None));
+    }
+
+    #[test]
+    fn server_edits_after_enter_are_ordered_guarded_and_keep_the_caret() {
+        let edit = |range: std::ops::Range<usize>, text: &str| crate::text::TextEdit { range, text: text.into() };
+        // Ruby LSP: "\n" then "  end" at the caret, and a VS Code cursor marker.
+        let ordered = super::ordered_server_edits(vec![edit(5..5, "\n"), edit(9..9, "$0"), edit(5..5, "  end")]).unwrap();
+        assert_eq!(ordered.iter().map(|e| (e.range.clone(), e.text.to_string())).collect::<Vec<_>>(), [(5..5, "\n  end".to_string())]);
+        assert!(super::ordered_server_edits(vec![edit(0..4, "a"), edit(2..6, "b")]).is_none(), "overlapping");
+        assert!(super::inserts_end(&ordered) && !super::inserts_end(&[edit(0..0, "# ")]) && !super::inserts_end(&[edit(0..0, "endless")]));
+        assert_eq!(super::caret_after(&ordered, 5), 5, "text inserted at the caret goes after it");
+        assert_eq!(super::caret_after(&[edit(0..0, "ab"), edit(9..9, "x")], 5), 7);
+        assert_eq!(super::caret_after(&[edit(2..4, "")], 5), 3);
+        assert_eq!(super::caret_after(&[edit(3..8, "xy")], 5), 5, "inside a replacement: its end");
+        let closed = |text: &str, line: usize| {
+            let document = crate::document::Document::decode(std::path::PathBuf::from("/p/a.rb"), 1, text.as_bytes());
+            super::block_closed_below(&crate::text::TextSnapshot::from_document(crate::text::BufferId(1), &document), line)
+        };
+        assert!(closed("  def a\n    \n  end\n", 1));
+        assert!(closed("  def a\n    \n\n    b\n  end\n", 1), "past the body");
+        assert!(!closed("  def a\n    \nend\n", 1), "a less indented end closes an outer block");
+        assert!(!closed("  def a\n    \n  def b\n  end\n", 1), "a sibling at the opener's indentation");
+        assert!(!closed("  def a\n    \n", 1), "the file ends");
+        assert!(closed("  x = {\n    \n  }\n", 1));
     }
 
     #[test]

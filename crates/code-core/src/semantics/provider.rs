@@ -75,6 +75,10 @@ pub struct Provider {
     pub sections: &'static [(&'static str, bool)],
     /// Text its server inserts after a typed character, asked through a request of its own.
     pub auto_insert: Option<AutoInsert>,
+    /// Whether Enter asks its server for `textDocument/onTypeFormatting` edits (when it offers them for `\n`).
+    /// Opt-in per provider: VS Code leaves format-on-type off, and servers that reformat the previous line on Enter
+    /// (typescript-language-server, clangd) would rewrite text the user did not ask to format.
+    pub formats_on_enter: bool,
     /// The project environment its server analyses with, for workspace root, its settings (its configuration
     /// section) and the `PATH` it runs with: one line for Server Details, else why it must not start (the configured
     /// environment is missing, and the server would silently use another). Checked off the UI thread at launch.
@@ -148,6 +152,7 @@ const DEFAULT: Provider = Provider {
     blind_to: &[],
     sections: &[],
     auto_insert: None,
+    formats_on_enter: false,
     environment: None,
     registrations: |_| Vec::new(),
     computed: |_, _| None,
@@ -326,6 +331,9 @@ Provider {
 },
 Provider {
     id: "ruby-lsp",
+    // Its Enter edits close the block just opened with `end` (only while the file does not parse), continue a `#`
+    // comment and close a heredoc.
+    formats_on_enter: true,
     name: "Ruby LSP",
     languages: &[Language::Ruby],
     language_id: |_, _| "ruby",

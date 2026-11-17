@@ -93,6 +93,9 @@ pub enum Question {
     /// What the server inserts at a position after a typed character (its provider's `auto_insert` request). Not in
     /// [`Question::ALL`]: no protocol capability declares it, so only a server that has it lists it as offered.
     AutoInsert,
+    /// The edits a server makes after Enter (`textDocument/onTypeFormatting` with `\n`): Ruby LSP closes the block
+    /// just opened with `end`. Asked only of providers that allow it ([`provider::Provider::formats_on_enter`]).
+    OnTypeFormatting,
 }
 
 /// Which of a server's requests a question replaces: each lane has at most one pending, so a background question
@@ -145,6 +148,7 @@ impl Question {
             Question::Rename => "textDocument/rename",
             // Its provider's own request (see `ask_with`).
             Question::AutoInsert => "",
+            Question::OnTypeFormatting => "textDocument/onTypeFormatting",
         }
     }
 
@@ -168,6 +172,7 @@ impl Question {
             Question::Rename => "renameProvider",
             // No protocol capability: its provider declares it (see `supports`).
             Question::AutoInsert => "",
+            Question::OnTypeFormatting => "documentOnTypeFormattingProvider",
         }
     }
 
@@ -194,6 +199,7 @@ impl Question {
             Question::OrganizeImports => "organize imports",
             Question::Rename => "symbol rename",
             Question::AutoInsert => "automatic closing tags",
+            Question::OnTypeFormatting => "formatting on Enter",
         }
     }
 
@@ -208,7 +214,8 @@ impl Question {
             Question::CodeAction => Lane::CodeAction,
             Question::Formatting | Question::OrganizeImports => Lane::Format,
             Question::Rename => Lane::Rename,
-            Question::AutoInsert => Lane::AutoInsert,
+            // Both insert after a typed character, fenced to the same caret: one is pending at a time.
+            Question::AutoInsert | Question::OnTypeFormatting => Lane::AutoInsert,
             // A hierarchy's root is the user's own request; its levels load in the background.
             Question::IncomingCalls | Question::OutgoingCalls | Question::Supertypes | Question::Subtypes | Question::TypeUsages => Lane::Hierarchy,
             Question::Definition | Question::Usages | Question::Symbols | Question::FileSymbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy => Lane::Foreground,
@@ -216,7 +223,7 @@ impl Question {
     }
 
     /// Every question, for capability views.
-    pub const ALL: [Question; 21] = [
+    pub const ALL: [Question; 22] = [
         Question::Definition,
         Question::Usages,
         Question::Symbols,
@@ -238,6 +245,7 @@ impl Question {
         Question::Formatting,
         Question::OrganizeImports,
         Question::Rename,
+        Question::OnTypeFormatting,
     ];
 }
 
@@ -1154,7 +1162,7 @@ impl Semantics {
                 params = json!({ "textDocument": { "uri": lsp::file_uri(doc.source()) }, "range": { "start": { "line": 0, "character": 0 }, "end": end },
                     "context": { "diagnostics": [], "only": ["source.organizeImports"], "triggerKind": 1 } });
             }
-            Question::Definition | Question::Symbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy | Question::Hover | Question::Highlight | Question::Rename | Question::AutoInsert => {}
+            Question::Definition | Question::Symbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy | Question::Hover | Question::Highlight | Question::Rename | Question::AutoInsert | Question::OnTypeFormatting => {}
         }
         if let (Value::Object(params), Value::Object(extra)) = (&mut params, extra) { params.extend(extra); }
         if !background {
@@ -1311,6 +1319,16 @@ impl Semantics {
             let provider = &PROVIDERS[s.key.provider];
             let Some(auto) = provider.auto_insert.as_ref().filter(|a| a.triggers.contains(&typed)) else { return false };
             self.settings.configuration(provider, Some(&s.key.root), Some(&format!("{}.{}", provider.config_section, auto.setting))) != Value::Bool(false)
+        })
+    }
+
+    /// Whether Enter in `path` asks the initialized server holding it for its on-type edits: its provider allows it
+    /// and the server lists `\n` among its on-type formatting triggers.
+    pub fn formats_on_enter(&self, path: &Path) -> bool {
+        self.servers.iter().filter(|s| s.initialized() && s.open.contains_key(path)).any(|s| {
+            let options = &s.capabilities["documentOnTypeFormattingProvider"];
+            let triggers = std::iter::once(&options["firstTriggerCharacter"]).chain(options["moreTriggerCharacter"].as_array().into_iter().flatten());
+            PROVIDERS[s.key.provider].formats_on_enter && s.supports(Question::OnTypeFormatting) && triggers.into_iter().any(|t| t.as_str() == Some("\n"))
         })
     }
 

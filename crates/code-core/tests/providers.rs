@@ -3980,3 +3980,39 @@ fn builtin_shell_syntax_errors_remain_visible_when_shellcheck_is_missing_and_con
         assert_eq!(std::fs::read(f.root.join("broken.sh")).unwrap(), text.as_bytes());
     }
 }
+
+/// Enter in Ruby with the installed Ruby LSP (`textDocument/onTypeFormatting`): after `def` the body is indented at
+/// once and the server's `end` follows as its own Undo step with the caret left on the body line; a block that already
+/// has its `end` gets no second one even while the file does not parse (when Ruby LSP offers it); Enter after a `#`
+/// comment continues it, as Ruby LSP does in VS Code.
+#[test]
+#[ignore = "needs an installed Ruby LSP; run alone"]
+fn real_ruby_enter_closes_an_open_block_once() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let source = "# note\nclass Shapes\n  def area\nend\n\ndef done\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\n"), (".editorconfig", "root = true\n[*]\nindent_style = space\nindent_size = 2\n"), ("lib/shapes.rb", source)]);
+    f.open_ready("lib/shapes.rb");
+    let tab = f.tab();
+    f.caret("def area", "def area".len());
+    let at = source.find("def area").unwrap() + "def area".len();
+    f.type_at_caret("\n");
+    f.settle("end", Duration::from_secs(10), |s| current_text(s.state()).contains("    \n  end\nend"));
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \n  end\nend\n\ndef done\nend\n");
+    assert_eq!(f.s.state().selection().map(|s| s.range()), Some(at + 5..at + 5));
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \nend\n\ndef done\nend\n", "its `end` is one Undo step");
+    // The file does not parse (`class` lacks its `end`): Ruby LSP offers `end` after `def done`, which has one.
+    f.caret("def done", "def done".len());
+    f.type_at_caret("\n");
+    let rx = f.s.completions();
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until { if let Some(c) = recv(&rx) { f.s.dispatch(c); } }
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \nend\n\ndef done\n  \nend\n");
+    f.caret("# note", "# note".len());
+    f.type_at_caret("\n");
+    f.settle("comment", Duration::from_secs(10), |s| current_text(s.state()).starts_with("# note\n# \n"));
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/shapes.rb")).unwrap(), source, "only the draft changes");
+}
