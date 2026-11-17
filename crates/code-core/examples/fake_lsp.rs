@@ -762,6 +762,8 @@ fn main() {
                 ]).collect();
                 reply(&mut out, Value::Array(actions));
             }
+            // Ruby LSP's add-on list, which Lenz asks behind text changes as a sync barrier.
+            "rubyLsp/workspace/addons" => reply(&mut out, json!([])),
             "textDocument/diagnostic" => {
                 let text = fake.text(m["params"]["textDocument"]["uri"].as_str().unwrap_or_default()).unwrap_or_default();
                 reply(&mut out, json!({ "kind": "full", "items": fake.diagnostics(&text) }));

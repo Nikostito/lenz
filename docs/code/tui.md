@@ -263,8 +263,9 @@ each (**Edit → Lines and Indentation** menu, F10 and the palette in both adapt
   and the commands say "Already on the last line" / "Already on the first line" there.
 - **Ctrl+Y** (IntelliJ preset), or **Cmd+Backspace** where the terminal reports Cmd (the kitty keyboard protocol in
   kitty, WezTerm, Ghostty), deletes the lines the selections touch in one Undo step, as **Delete Line** in the GUI;
-  each caret keeps its column on the line below. Terminals that turn Cmd+Backspace into Ctrl+U deliver no Cmd, so
-  Ctrl+Y and the F10 menu stay the routes there.
+  each caret keeps its column on the line below. Most macOS terminals send Cmd+Backspace as Ctrl+U (iTerm2's Natural
+  Text Editing preset, Ghostty), so on macOS Ctrl+U in the text deletes the line too; elsewhere Ctrl+U is not bound
+  in the text.
 - **Enter** in code indents the new line as its block calls for, as in the GUI (see
   [Lenz Code](README.md)): one step deeper after `def`, `do |x|`, `{` or Python's `:`, the closer
   of `{|}` on its own line, and a blank line inside a body continues it. With Ruby LSP running, its `end` follows as
@@ -459,7 +460,8 @@ the Last saved pane remains read-only.
 | Comment / uncomment | Ctrl-/ or Alt-/ (F10 → Edit when the terminal swallows it) |
 | Move lines down / up | Ctrl-Shift-Down / Ctrl-Shift-Up (VS Code keymap: Alt-Down / Alt-Up) |
 | Duplicate lines below / above | Alt-Shift-Down / Alt-Shift-Up |
-| Delete line | Ctrl-Y; Cmd-Backspace where the terminal reports Cmd |
+| Delete line | Ctrl-Y; Cmd-Backspace (sent as Ctrl-U by macOS terminals, which macOS builds take) |
+| Go to test or subject | Ctrl-Shift-T where the terminal reports it (kitty protocol); the F10 menu |
 | Copy reference (`Foo::Bar::Baz#foo_method`) | Ctrl-Alt-Shift-C where the terminal reports it (kitty protocol); the F10 menu or the right-click menu |
 | Next / previous tab | Ctrl-Tab / Ctrl-Shift-Tab |
 | Split right / down; focus pane | Ctrl-\ / Ctrl-Shift-\; Ctrl-1 / Ctrl-2 |

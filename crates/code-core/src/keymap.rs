@@ -226,6 +226,8 @@ const INTELLIJ: &[Preset] = &[
     (CommandId::DeleteLine, &["Ctrl+Y"]),
     // IntelliJ's Copy Reference (Cmd+Option+Shift+C on macOS, where Ctrl is Cmd).
     (CommandId::CopyReference, &["Ctrl+Alt+Shift+C"]),
+    // IntelliJ's Navigate › Test (Cmd+Shift+T on macOS).
+    (CommandId::GoToTest, &["Ctrl+Shift+T"]),
     // Terminals often deliver Ctrl+/ as Ctrl+_ (or swallow it), so Alt+/ is the route that always arrives.
     (CommandId::ToggleComment, &["Ctrl+/", "Alt+/"]),
     (CommandId::FocusBreadcrumbs, &["Ctrl+Shift+."]),

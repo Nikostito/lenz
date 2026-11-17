@@ -4016,3 +4016,43 @@ fn real_ruby_enter_closes_an_open_block_once() {
     f.settle("comment", Duration::from_secs(10), |s| current_text(s.state()).starts_with("# note\n# \n"));
     assert_eq!(std::fs::read_to_string(f.root.join("lib/shapes.rb")).unwrap(), source, "only the draft changes");
 }
+
+/// Ruby LSP applies text changes on its worker thread but parses a document on its reader thread when a request
+/// about it arrives, so a request sent right behind an edit was answered from the text before it, and that answer
+/// cached under the edited text: a deletion undone within a fraction of a second left the deleted text's syntax errors
+/// shown at the restored text's offsets until the file was reopened. Lenz now waits for an answer from the worker
+/// (a sync barrier) before asking about edited text. Undone at once and after 10 to 300 ms, the problems are those of
+/// the restored text every time.
+#[test]
+#[ignore = "needs an installed Ruby LSP; run alone"]
+fn real_ruby_problems_follow_an_undo_right_behind_a_deletion() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let source = "class Scope\n  def scoped_department_ids(extra: nil)\n    return nil if has_permission?(\"account:view_hr_reports\")\n    @ids ||= begin\n      direct = scope.pluck(:department_id)\n      descendant = member.departments\n        .where(\"ARRAY[?]::integer[] && ancestor_ids\", direct)\n        .pluck(:id)\n      (direct + descendant).uniq\n    end\n  end\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\n"), ("lib/scope.rb", source)]);
+    f.open_ready("lib/scope.rb");
+    let tab = f.tab();
+    let pump = |f: &mut Real, ms: u64| { let rx = f.s.completions(); let until = Instant::now() + Duration::from_millis(ms); while Instant::now() < until { if let Some(c) = recv(&rx) { f.s.dispatch(c); } } };
+    pump(&mut f, 2000);
+    assert!(f.problems().is_empty(), "{:?}", f.problems());
+    let quote = source.find("\"account").unwrap() + 1;
+    // The deleted quote's errors are shown once settled.
+    f.s.dispatch(Command::Select(Selection { anchor: quote, head: quote }));
+    f.s.dispatch(Command::Delete { backward: true, word: false });
+    f.settle("errors", Duration::from_secs(10), |s| s.state().active().and_then(|t| s.state().diagnostics(t.id())).is_some_and(|d| !d.items.is_empty()));
+    f.s.dispatch(Command::Undo { tab });
+    pump(&mut f, 1500);
+    assert!(f.problems().is_empty(), "{:?}", f.problems());
+    for gap in [0u64, 10, 20, 50, 100, 200, 300] {
+        f.s.dispatch(Command::Select(Selection { anchor: quote, head: quote }));
+        f.s.dispatch(Command::Delete { backward: true, word: false });
+        if gap > 0 { pump(&mut f, gap); }
+        f.s.dispatch(Command::Undo { tab });
+        assert_eq!(current_text(f.s.state()), source);
+        pump(&mut f, 1500);
+        assert!(f.problems().is_empty(), "undone {gap} ms after the deletion: {:?}", f.problems());
+    }
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/scope.rb")).unwrap(), source);
+}

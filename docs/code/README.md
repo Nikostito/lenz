@@ -129,6 +129,14 @@ declaration holding the caret: `Foo::Bar::Baz#foo_method` and `Foo::Baz.make` in
 for `def self.` and `class << self` ones), `pkg.module.Class.method` in Python, `com.acme.Box#open` in Java,
 `crate::module::Type::method` in Rust; outside a declaration (and in Markdown, HTML and CSS) it copies `path:line`. It
 names the declaration the caret is in, not a name the caret is on: a call is not resolved to what it calls.
+**Go to Test or Subject** (Ctrl+Shift+T in the IntelliJ preset, Cmd+Shift+T on macOS; also in Navigate) opens the
+active file's test, or from a test the file it tests, found by name in the project: `user.rb` ↔ `user_spec.rb` or
+`user_test.rb`, `mod.py` ↔ `test_mod.py` or `mod_test.py`, `Box.java` ↔ `BoxTest.java` (Kotlin, Scala, PHP, C#, Swift,
+Groovy alike, also `Tests` and `Spec`), `a.ts` ↔ `a.test.ts` or `a.spec.ts` (any of the JavaScript and TypeScript
+extensions), `x.go` ↔ `x_test.go`, `lib.ex` ↔ `lib_test.exs`. Among several, the one whose folders match best wins, with
+`app`, `lib`, `src`, `spec`, `test`, `tests`, `__tests__`, `main` and `java` left out of the comparison
+(`app/models/user.rb` ↔ `spec/models/user_spec.rb`, not `spec/requests/user_spec.rb`); without one it says what it
+looked for. It needs the file's project folder open; files the project's ignore rules leave out are not found.
 
 **Keymap…** lists each command with its chords, the preset origin of each override and any binding an override
 displaced. Enter takes the next key as the selected command's shortcut, Delete restores the preset's chord, Esc

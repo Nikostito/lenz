@@ -2430,8 +2430,13 @@ impl App {
                 self.run(if key.code == KeyCode::Char('x') { CommandId::Cut } else { CommandId::Paste }); true
             }
             // Cmd+Backspace, where the terminal reports Cmd (the kitty keyboard protocol), deletes the lines the
-            // selections touch, as in the GUI and IntelliJ's macOS keymap.
+            // selections touch, as in the GUI and IntelliJ's macOS keymap. Most macOS terminals send it as Ctrl+U
+            // instead (iTerm2's Natural Text Editing, Ghostty), so on macOS Ctrl+U in the text does the same.
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) && !control && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SHIFT) => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
+            }
+            KeyCode::Char('u') if control && !other && !key.modifiers.contains(KeyModifiers::SHIFT) && CMD_BACKSPACE_IS_CTRL_U => {
                 if self.draft_target().is_none() { return false; }
                 self.run(CommandId::DeleteLine); true
             }
@@ -3971,6 +3976,9 @@ impl App {
         }
     }
 }
+/// macOS terminals send Cmd+Backspace as Ctrl+U: there Ctrl+U in the text deletes the line, as Cmd+Backspace does.
+pub(crate) const CMD_BACKSPACE_IS_CTRL_U: bool = cfg!(target_os = "macos");
+
 /// A terminal key as the session keymap names it: its key and the modifiers that ran the binding. Terminals report
 /// shifted symbols for Shift+- = `_`, Shift+\\ = `|`, Shift+. = `>`; the keymap normalizes those itself.
 pub(crate) fn key_press(key: KeyEvent) -> Option<code_core::keymap::KeyPress> {

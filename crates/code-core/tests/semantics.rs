@@ -1324,6 +1324,13 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     f.settle(|s| s.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap().contains("Omega")));
     let log = f.log.clone();
     f.settle_until(move || messages(&log)[start..].iter().any(|m| m["method"] == "textDocument/didChange"));
+    // The refresh waits until Ruby LSP has applied the new text (its sync barrier answered).
+    let log = f.log.clone();
+    f.settle_until(move || {
+        let messages = messages(&log);
+        let tail = &messages[start..];
+        tail.iter().position(|m| m["method"] == "textDocument/didChange").is_some_and(|c| tail[c..].iter().any(|m| m["method"] == "textDocument/documentSymbol"))
+    });
     f.open("b.rb");
     let log = f.log.clone();
     let uri = code_core::semantics::lsp::file_uri(&f.root.join("a.rb"));
@@ -1338,6 +1345,9 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     let changed = tail.iter().position(|m| m["method"] == "textDocument/didChange").unwrap();
     let closed = tail.iter().position(|m| m["method"] == "textDocument/didClose").unwrap();
     assert!(tail[changed + 1..closed].iter().any(|m| m["method"] == "textDocument/documentSymbol"), "refresh must follow the new text");
+    let barrier = tail.iter().position(|m| m["method"] == "rubyLsp/workspace/addons").unwrap();
+    let refresh = changed + tail[changed..].iter().position(|m| m["method"] == "textDocument/documentSymbol").unwrap();
+    assert!(changed < barrier && barrier < refresh, "the refresh is asked once the text is applied");
     assert!(f.s.state().results().is_none(), "the internal reply must not open a symbol panel");
     assert!(f.s.state().asking().is_none());
 }
@@ -3851,6 +3861,31 @@ fn enter_takes_the_servers_end_as_its_own_undo_step_and_never_adds_a_second_end(
     g.pump(300);
     assert_eq!(g.on_types().len(), asked, "no question with several carets");
     assert_eq!(std::fs::read_to_string(g.root.join("a.rb")).unwrap(), closed, "only the draft changes");
+}
+
+/// Ruby LSP parses a document when a request about it arrives but applies text on another thread, so each text
+/// change is followed by a document-free request (its add-on list) and nothing is asked about the new text (its
+/// problems, completion, symbols, hints or tokens) until that is answered.
+#[test]
+fn questions_about_edited_ruby_wait_behind_a_sync_barrier() {
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_PULL_DIAGNOSTICS", "1")], &[("Gemfile", ""), ("a.rb", "def go\n  1\nend\n")], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f.s.dispatch(Command::Select(Selection { anchor: 9, head: 9 }));
+    f.keys("x");
+    f.keys("y");
+    f.pump(1500);
+    let methods: Vec<String> = messages(&f.log).into_iter().filter_map(|m| m["method"].as_str().map(str::to_owned)).collect();
+    let changes: Vec<usize> = methods.iter().enumerate().filter(|(_, m)| *m == "textDocument/didChange").map(|(i, _)| i).collect();
+    assert!(!changes.is_empty() && methods.iter().any(|m| m == "textDocument/diagnostic"), "{methods:?}");
+    for (i, method) in methods.iter().enumerate() {
+        // Every question about a document: its problems, completion, symbols, hints, tokens.
+        if !method.starts_with("textDocument/") || method.starts_with("textDocument/did") { continue; }
+        // The last text change before this question has a barrier between it and the question.
+        let Some(&change) = changes.iter().rev().find(|&&c| c < i) else { continue };
+        assert!(methods[change..i].iter().any(|m| m == "rubyLsp/workspace/addons"), "a question right behind an edit: {methods:?}");
+    }
+    assert_eq!(current_text(f.s.state()), "def go\n  xy1\nend\n");
 }
 
 /// A closing tag answered after more typing is dropped, and one the settings turn off (`autoClosingTags: false`) is

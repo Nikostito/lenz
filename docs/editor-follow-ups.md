@@ -1467,3 +1467,28 @@ to line bounds in both adapters; document bounds and Shift selection share core 
 - **Cmd+Backspace in terminals:** only terminals that report Cmd (the kitty keyboard protocol) deliver it; macOS
   Terminal and iTerm2's defaults turn it into Ctrl+U, which stays unbound. Ctrl+Y and the menus reach Delete Line
   everywhere. Native macOS GUI keys were exercised on the GPUI test platform only.
+
+## Ruby LSP sync barrier, Go to Test and Ctrl+U (2026-11-17)
+
+- **Ruby LSP answered from text before an edit:** Ruby LSP 0.26.11 queues `didChange` to its worker thread but parses
+  a document on its reader thread as soon as a request about it arrives, then caches the answer under the document.
+  A request sent right behind an edit was parsed on the previous text and its answer cached under the edited one: a
+  deletion undone within a fraction of a second left the deleted text's syntax errors at the restored text's
+  offsets until the file was reopened (reported with a screenshot); completion right after a keystroke came back
+  empty. Lenz now sends a document-free request (`rubyLsp/workspace/addons`) behind each burst of text and asks
+  nothing about that text (problems, completion, symbols, hints, tokens) until it is answered, since the worker
+  answers in order. A barrier unanswered for two ticks (about 10 s) is given up on. Evidence (release, this Linux
+  container, Ruby 3.3.6, Ruby LSP 0.26.11): an undo 0–300 ms after a deletion left stale errors in several of 7 tries
+  per run before, none in 22 tries after (`real_ruby_problems_follow_an_undo_right_behind_a_deletion`); completion
+  right after a keystroke had no suggestions 16–18 times in 25 without the barrier and 0 with it, at a median of
+  7.2 ms instead of 5.9–6.2 ms (p90 35–41 ms against 26–50 ms; 20 warm samples each, two runs each). Only Ruby LSP
+  declares a barrier (`Provider::sync_barrier`); other servers were not checked for the same threading.
+- **An attempted fix that was not enough:** cancelling a pending problems request and holding newer text until it was
+  answered removed some failures but not the reader-thread race; it was replaced by the barrier.
+- **Go to Test is by name only:** the counterpart is found among inventoried files by naming convention and folder
+  similarity; RubyMine's own index also knows test-to-class links that differ in name (a controller and its request
+  spec), which this does not. Ruby LSP offers `experimental/goToRelevantFile` for that; it is not used. With several
+  equally good candidates the first by path is opened, without a chooser.
+- **Ctrl+U on macOS:** the terminal app treats Ctrl+U in the text as Cmd+Backspace on macOS only, because macOS
+  terminals send that; a user who types Ctrl+U there gets Delete Line, not readline's delete-to-line-start. Native
+  macOS terminals were not available to verify which byte each sends.

@@ -263,6 +263,8 @@ pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// After initializing, a server without a readiness status (progress reports do not say the workspace is
 /// loaded) may still be loading it for about this long: its answers meanwhile are marked possibly incomplete.
 pub const UNREPORTED_WARMUP: std::time::Duration = std::time::Duration::from_secs(10);
+/// Ticks (see `session::TICK`) questions wait for a sync barrier's answer before the text counts as applied.
+const SETTLE_TICKS: u8 = 2;
 /// Definition targets kept at most.
 pub const TARGET_LIMIT: usize = 200;
 /// How long a server may take to answer `initialize` before it is given up on (its startup slot freed).
@@ -557,6 +559,14 @@ struct Server {
     /// `textDocument/diagnostic` requests in flight (a server that is asked rather than publishing), by id, with the
     /// exact text each asks about.
     pulls: HashMap<i64, Arc<Document>>,
+    /// A server that applies text on another thread than it parses requests on ([`provider::Provider::sync_barrier`]):
+    /// the id of the barrier request sent behind the latest text. Until it is answered the text counts as still on
+    /// its way, so no question about it is sent yet.
+    settling: Option<i64>,
+    /// Ticks the barrier has gone unanswered; the text counts as applied after [`SETTLE_TICKS`].
+    settle_waits: u8,
+    /// Documents whose problems are asked once the barrier is answered.
+    unpulled: std::collections::HashSet<PathBuf>,
     /// Credits survive close/reopen and rename until their writer acknowledgement arrives.
     flights: HashMap<u64, TextFlight>,
     open_epoch: HashMap<PathBuf, u64>,
@@ -939,8 +949,11 @@ impl Semantics {
         self.settings.disabled(&PROVIDERS[provider::primary(provider)], self.browse.as_deref())
     }
 
-    /// Stop servers idle for longer than the idle period (no open documents, nothing pending).
+    /// Stop servers idle for longer than the idle period (no open documents, nothing pending). Text whose barrier
+    /// has gone unanswered too long counts as applied.
     pub fn expire(&mut self) -> bool {
+        let mut repaint = false;
+        for s in &mut self.servers { repaint |= s.settle_late(); }
         let now = (self.clock)();
         let idle = self.idle;
         let waiting = self.waiting.as_ref().map(|w| w.path.clone());
@@ -950,7 +963,7 @@ impl Semantics {
         self.servers = keep;
         let stopped = !stop.is_empty();
         stop.into_iter().for_each(Server::stop);
-        stopped
+        stopped || repaint
     }
 
     /// A new server for `key`, waiting for a startup slot.
@@ -976,7 +989,7 @@ impl Semantics {
             process,
             next_id: 0,
             initializing: None,
-            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), pulls: HashMap::new(),
+            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), pulls: HashMap::new(), settling: None, settle_waits: 0, unpulled: Default::default(),
             flights: HashMap::new(), open_epoch: HashMap::new(), next_text: 0, text_bytes: 0,
             desired_epoch: 0, deferred: HashMap::new(), failed: HashMap::new(), refresh: Default::default(),
             dirty_open: HashMap::new(),
@@ -1962,8 +1975,29 @@ impl Server {
         self.pump_text();
     }
 
+    /// The server has applied the text sent before its barrier: the questions, problem pulls and refreshes held
+    /// for it go now.
+    fn settled(&mut self) {
+        self.settling = None;
+        self.settle_waits = 0;
+        for path in std::mem::take(&mut self.unpulled) {
+            if let Some(doc) = self.open.get(&path).cloned() { self.pull_diagnostics(&path, &doc); }
+        }
+        self.pump_text();
+    }
+
+    /// Called each tick: a barrier unanswered for [`SETTLE_TICKS`] ticks is given up on, so a server that never
+    /// answers it cannot hold every question back.
+    fn settle_late(&mut self) -> bool {
+        if self.settling.is_none() { return false; }
+        self.settle_waits += 1;
+        if self.settle_waits < SETTLE_TICKS { return false; }
+        self.settled();
+        true
+    }
+
     fn text_pending(&self) -> bool {
-        self.desired.iter().any(|(path, doc)| self.open.get(path).is_none_or(|sent| !same_document(sent, doc)))
+        self.settling.is_some() || self.desired.iter().any(|(path, doc)| self.open.get(path).is_none_or(|sent| !same_document(sent, doc)))
     }
 
     fn failed_reply(&self, lane: Lane, request: u64, why: &str) -> Reply {
@@ -1972,6 +2006,7 @@ impl Server {
 
     fn pump_text(&mut self) {
         if !self.initialized() { return; }
+        let mut sent = false;
         let wanted: Vec<_> = self.desired.iter().filter(|(path, doc)| self.open.get(*path).is_none_or(|sent| !same_document(sent, doc)))
             .map(|(path, doc)| (path.clone(), doc.clone())).collect();
         for (path, doc) in wanted {
@@ -1998,12 +2033,26 @@ impl Server {
             if language.is_some() && doc.embedded().is_some_and(|p| p.indexed()) { self.index_now(&path); }
             self.flights.insert(token, TextFlight { path: path.clone(), document: doc.clone(), epoch });
             // A server that answers problems when asked (Kotlin LSP stops publishing after the first versions): ask
-            // about this text, queued behind it so the server has it first.
-            self.pull_diagnostics(&path, &doc);
+            // about this text, queued behind it so the server has it first (behind its barrier, for one that has one).
+            if PROVIDERS[self.key.provider].sync_barrier.is_some() { self.unpulled.insert(path.clone()); } else { self.pull_diagnostics(&path, &doc); }
+            sent = true;
             self.open.insert(path.clone(), doc);
             if language.is_none() && PROVIDERS[self.key.provider].watched_files {
                 self.dirty_open.insert(path.clone(), true);
                 self.refresh.insert(path);
+            }
+        }
+        // Ruby LSP 0.26.11 applies `didChange` on its worker thread but parses a document on its reader thread as soon
+        // as a request about it arrives: a request right behind an edit was parsed on the text before it, answered
+        // from that parse on the worker, and the answer cached under the edited text (a deletion undone at once left
+        // the old text's syntax errors at the restored text's offsets until the file was reopened). Its worker answers
+        // in order, so a document-free request's answer means every text before it has been applied.
+        if sent && let Some(method) = PROVIDERS[self.key.provider].sync_barrier {
+            self.next_id += 1;
+            let id = self.next_id;
+            if self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })).is_ok() {
+                self.settling = Some(id);
+                self.settle_waits = 0;
             }
         }
         if self.text_pending() { return; }
@@ -2079,6 +2128,10 @@ impl Server {
             (None, Some(id)) => {
                 let id = id.as_i64();
                 // Problems asked about one version: kept as a publication for exactly that text would be.
+                if id.is_some() && id == self.settling {
+                    self.settled();
+                    return Outcome { ready: true, repaint: true, ..Outcome::default() };
+                }
                 if let Some(doc) = id.and_then(|id| self.pulls.remove(&id)) {
                     if m["result"]["kind"] != "full" { return Outcome::default(); }
                     let params = json!({ "diagnostics": m["result"]["items"] });

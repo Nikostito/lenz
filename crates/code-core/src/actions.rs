@@ -375,6 +375,7 @@ impl Session {
             CommandId::CopyPath => Command::CopyPath { line: false },
             CommandId::CopyPathLine => Command::CopyPath { line: true },
             CommandId::CopyReference => Command::CopyReference,
+            CommandId::GoToTest => Command::GoToTest,
             CommandId::FileSymbols => Command::FileSymbols,
             CommandId::CopyServerDetails => Command::CopyText(self.language_server_details()),
             CommandId::InstallServer => Command::OpenServerInstall,
@@ -605,7 +606,7 @@ impl CommandId {
             | Self::FocusOtherPane | Self::MoveTabToOtherPane | Self::WidenExplorer | Self::NarrowExplorer | Self::TallerResults | Self::ShorterResults | Self::EnlargeFirstPane | Self::EnlargeSecondPane => G::View,
             Self::GitBranches | Self::NewBranch | Self::CheckoutRevision | Self::ShowLocalChanges | Self::CompareWithRevision | Self::CompareWithBase
             | Self::ShowBranchChanges | Self::CompareWithWorktree | Self::ResolveConflicts => G::Git,
-            Self::GoToLine | Self::FocusBreadcrumbs | Self::Back | Self::Forward | Self::ToggleBookmark
+            Self::GoToLine | Self::GoToTest | Self::FocusBreadcrumbs | Self::Back | Self::Forward | Self::ToggleBookmark
             | Self::SetBookmarkMnemonic | Self::ShowBookmarks | Self::NextBookmark | Self::PreviousBookmark
             | Self::RecentFiles | Self::RecentLocations | Self::NextTab | Self::PreviousTab
             | Self::Definition | Self::PeekDefinition | Self::TypeDefinition | Self::Implementation

@@ -543,6 +543,8 @@ pub enum Command {
     CopyPath { line: bool },
     /// Copy the qualified name of the declaration at the caret (`Foo::Bar::Baz#foo_method`), else `path:line`.
     CopyReference,
+    /// Open the active file's test, or the file the active test tests (see [`crate::relevant`]).
+    GoToTest,
     /// A message from the adapter (a launch it could not start), shown with the core's own.
     Notice(String),
     /// Mark the occurrences of the name at the caret (asked in the background; never cancels another request).
@@ -861,6 +863,8 @@ pub enum CommandId {
     CopyPathLine,
     /// The qualified name of the declaration at the caret (IntelliJ's Copy Reference), else the path and line.
     CopyReference,
+    /// Switch between the active file and its test (RubyMine's Navigate › Test).
+    GoToTest,
     /// The active file in the user's editor at the caret, or with the system's default app.
     OpenInEditor,
     OpenWithDefaultApp,
@@ -1000,7 +1004,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 262] = [
+    pub const ALL: [CommandId; 263] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1093,6 +1097,7 @@ impl CommandId {
         Self::CopyPath,
         Self::CopyPathLine,
         Self::CopyReference,
+        Self::GoToTest,
         Self::OpenInEditor,
         Self::OpenWithDefaultApp,
         Self::CompareWith,
@@ -1454,6 +1459,7 @@ impl CommandId {
             Self::CopyPath => "Copy Path",
             Self::CopyPathLine => "Copy Path:Line",
             Self::CopyReference => "Copy Reference",
+            Self::GoToTest => "Go to Test or Subject",
             Self::OpenInEditor => "Open in Editor",
             Self::OpenWithDefaultApp => "Open with Default App",
             Self::CompareWith => "Compare Saved Disk Inputs…",
@@ -3711,6 +3717,12 @@ impl Session {
             CommandId::CloseSavedComparison => self.state.comparison.is_none().then_some("No saved comparison is open"),
             CommandId::CompareWith => (self.state.active().is_none() && self.state.project.is_none()).then_some("No file or folder is open"),
             CommandId::CompareSelected => (self.state.tree_marks.len() < 2).then_some(MARK_TWO),
+            CommandId::GoToTest => match self.state.active() {
+                None => Some("No file is open"),
+                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
+                Some(t) if self.state.project.as_ref().and_then(|p| p.relative(&t.source)).is_none() => Some("Open the file's project folder first"),
+                Some(_) => None,
+            },
             CommandId::CopyPathLine | CommandId::CopyReference => match self.state.active() {
                 None => Some("No file is open"),
                 Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
@@ -5781,6 +5793,22 @@ impl Session {
                 match reference {
                     Some(name) => Effect { repaint: false, copy: Some(name), ..Effect::default() },
                     None => self.command(Command::CopyPath { line: true }),
+                }
+            }
+            Command::GoToTest => {
+                let Some((root, rel, found)) = self.state.active().filter(|t| !t.untitled()).and_then(|t| {
+                    let project = self.state.project.as_ref()?;
+                    let rel = project.relative(&t.source)?;
+                    let paths = project.paths();
+                    Some((project.root().to_owned(), rel.clone(), crate::relevant::counterpart(&rel, paths.iter().map(|p| &**p))))
+                }) else { return Effect::default() };
+                match found {
+                    Ok(other) => self.command(Command::Open(root.join(other))),
+                    Err(why) => {
+                        let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
+                        self.state.messages.push(format!("Go to Test: {why}: {name}"));
+                        Effect { repaint: true, ..Effect::default() }
+                    }
                 }
             }
             Command::CopyText(text) => Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() },
