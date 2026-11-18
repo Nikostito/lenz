@@ -50,6 +50,7 @@ pub mod shown;
 pub mod breadcrumbs;
 mod reference;
 mod relevant;
+mod ruby_declarations;
 pub mod tabs;
 pub mod template;
 pub mod watch;

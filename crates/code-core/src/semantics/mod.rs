@@ -567,6 +567,11 @@ struct Server {
     settle_waits: u8,
     /// Documents whose problems are asked once the barrier is answered.
     unpulled: std::collections::HashSet<PathBuf>,
+    /// The id of the request for its bundle's gems (see [`provider::Provider::dependencies`]), and their folders.
+    gems_request: Option<i64>,
+    gems: Option<Arc<Vec<PathBuf>>>,
+    /// Their macro declarations by name, built by the first definition that needs them (off the UI thread).
+    gem_index: crate::ruby_declarations::SharedIndex,
     /// Credits survive close/reopen and rename until their writer acknowledgement arrives.
     flights: HashMap<u64, TextFlight>,
     open_epoch: HashMap<PathBuf, u64>,
@@ -989,7 +994,7 @@ impl Semantics {
             process,
             next_id: 0,
             initializing: None,
-            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), pulls: HashMap::new(), settling: None, settle_waits: 0, unpulled: Default::default(),
+            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), pulls: HashMap::new(), settling: None, settle_waits: 0, unpulled: Default::default(), gems_request: None, gems: None, gem_index: Default::default(),
             flights: HashMap::new(), open_epoch: HashMap::new(), next_text: 0, text_bytes: 0,
             desired_epoch: 0, deferred: HashMap::new(), failed: HashMap::new(), refresh: Default::default(),
             dirty_open: HashMap::new(),
@@ -1343,6 +1348,13 @@ impl Semantics {
             let triggers = std::iter::once(&options["firstTriggerCharacter"]).chain(options["moreTriggerCharacter"].as_array().into_iter().flatten());
             PROVIDERS[s.key.provider].formats_on_enter && s.supports(Question::OnTypeFormatting) && triggers.into_iter().any(|t| t.as_str() == Some("\n"))
         })
+    }
+
+    /// The gem folders of server session `session`'s bundle, once it has listed them (see
+    /// [`provider::Provider::dependencies`]).
+    pub(crate) fn gem_roots(&self, session: u64) -> Option<(Arc<Vec<PathBuf>>, crate::ruby_declarations::SharedIndex)> {
+        let server = self.servers.iter().find(|s| s.session == session)?;
+        Some((server.gems.clone()?, server.gem_index.clone()))
     }
 
     /// The characters after which the initialized server holding `path` offers completion unasked.
@@ -2128,6 +2140,12 @@ impl Server {
             (None, Some(id)) => {
                 let id = id.as_i64();
                 // Problems asked about one version: kept as a publication for exactly that text would be.
+                if id.is_some() && id == self.gems_request {
+                    self.gems_request = None;
+                    let paths = m["result"].as_array().map(|gems| gems.iter().filter_map(|g| g["path"].as_str()).map(PathBuf::from).collect()).unwrap_or_default();
+                    self.gems = Some(Arc::new(paths));
+                    return Outcome::default();
+                }
                 if id.is_some() && id == self.settling {
                     self.settled();
                     return Outcome { ready: true, repaint: true, ..Outcome::default() };
@@ -2158,6 +2176,10 @@ impl Server {
                     }
                     self.encoding = Encoding::negotiated(&self.capabilities);
                     self.notify("initialized", json!({}));
+                    if let Some(method) = PROVIDERS[self.key.provider].dependencies {
+                        self.next_id += 1;
+                        if self.send(json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": {} })).is_ok() { self.gems_request = Some(self.next_id); }
+                    }
                     let provider = &PROVIDERS[self.key.provider];
                     for (method, params) in (provider.registrations)(&settings.initialization(provider, Some(&self.key.root))) {
                         self.notify(method, params);

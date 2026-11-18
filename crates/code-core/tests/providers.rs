@@ -4056,3 +4056,45 @@ fn real_ruby_problems_follow_an_undo_right_behind_a_deletion() {
     }
     assert_eq!(std::fs::read_to_string(f.root.join("lib/scope.rb")).unwrap(), source);
 }
+
+/// Go to Definition into gems with the installed Ruby LSP and ActionMailer: `perform_deliveries` is ActionMailer's
+/// `cattr_accessor` (which Ruby LSP's index does not read) and Mail's `attr_accessor`. On a local of unknown type
+/// Ruby LSP names only Mail's, and on the mailer class or `self` nothing; Lenz lists both declarations each time, as
+/// RubyMine does, and opens the chosen one read-only.
+#[test]
+#[ignore = "needs an installed Ruby LSP and the actionmailer gem; run alone"]
+fn real_ruby_definitions_list_gem_declarations_its_index_misses() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let app = "class Messenger < ActionMailer::Base\n  def new_mail_from_candidate\n    message = mail(to: \"a@b.c\")\n    message.perform_deliveries = false\n    Messenger.perform_deliveries\n    perform_deliveries\n  end\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\ngem \"actionmailer\"\n"), ("lib/messenger.rb", app)]);
+    let lock = std::process::Command::new("bundle").args(["lock", "--local"]).current_dir(&f.root).output().unwrap();
+    if !lock.status.success() {
+        println!("SKIPPED: actionmailer is not installed ({})", String::from_utf8_lossy(&lock.stderr));
+        return;
+    }
+    f.open_ready("lib/messenger.rb");
+    for needle in ["message.perform_deliveries", "Messenger.perform_deliveries", "    perform_deliveries\n"] {
+        let skip = needle.find("perform").unwrap() + 2;
+        f.show("lib/messenger.rb");
+        // Answers right after startup may come before indexing finished: asked until both are listed.
+        let asked = Instant::now();
+        loop {
+            f.definition(needle, skip);
+            let files: Vec<String> = f.s.state().results().map(|r| r.hits().iter().map(|h| h.path.to_string()).collect()).unwrap_or_default();
+            if files.iter().any(|p| p.ends_with("action_mailer/delivery_methods.rb")) && files.iter().any(|p| p.ends_with("mail/message.rb")) { break; }
+            assert!(asked.elapsed() < Duration::from_secs(30), "{needle}: {files:?}; {:?}", f.notices());
+            f.s.dispatch(Command::CloseResults);
+            f.show("lib/messenger.rb");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let at = f.s.state().results().unwrap().hits().iter().position(|h| h.path.ends_with("action_mailer/delivery_methods.rb")).unwrap();
+        f.s.dispatch(Command::OpenResult(at));
+        f.settle("open", Duration::from_secs(10), |s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
+        assert!(current_text(f.s.state()).lines().nth(f.s.state().results().unwrap().hits()[at].line).unwrap().contains("cattr_accessor :perform_deliveries"));
+        f.s.dispatch(Command::CloseResults);
+    }
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), app);
+}

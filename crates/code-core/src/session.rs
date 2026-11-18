@@ -2005,6 +2005,42 @@ struct Asking {
     root: Option<Call>,
 }
 
+/// A Ruby definition's by-name search: declarations Ruby LSP's index misses (methods made by ActiveSupport's
+/// `cattr_accessor`, `class_attribute`, `delegate` and the like, in the project and its gems), added as candidates
+/// when the server found nothing (plain `def`s too) or only declarations outside the project (macros only), as
+/// RubyMine lists them. Run off the UI thread with the server's own targets. The project's files are read each time
+/// (they change); the gems' macro declarations are indexed once per server session.
+struct ByName { name: String, gems: Arc<Vec<PathBuf>>, index: crate::ruby_declarations::SharedIndex, files: Vec<PathBuf>, root: Option<PathBuf> }
+
+impl ByName {
+    fn add(&self, targets: &mut semantics::Targets, limit: usize, read: semantics::ReadFile, wanted: &dyn Fn() -> bool) {
+        let in_project = |p: &Path| self.root.as_ref().is_some_and(|r| p.starts_with(r));
+        if !targets.unavailable.is_empty() || targets.found.len() >= limit || targets.found.iter().any(|t| in_project(&t.path)) { return; }
+        let defs = targets.found.is_empty();
+        let mut paths = crate::ruby_declarations::search(&self.name, &self.files, defs, limit - targets.found.len(), wanted);
+        let gems = self.index.get_or_init(|| crate::ruby_declarations::GemIndex::build(&self.gems)).files_declaring(&self.name);
+        let first_gem = paths.len();
+        paths.extend(gems);
+        for (i, path) in paths.into_iter().enumerate() {
+            if !wanted() { return; }
+            // Only macros in gems: their plain `def`s are in the server's index.
+            let defs = defs && i < first_gem;
+            let Ok((stamp, doc)) = read(&path) else { continue };
+            let mut offset = 0;
+            for line in doc.text().split_inclusive('\n') {
+                if let Some(range) = crate::ruby_declarations::declares(line.trim_end_matches(['\n', '\r']), &self.name, defs) {
+                    let (start, end) = (offset + range.start, offset + range.end);
+                    let known = targets.found.iter().any(|t| t.path == path && t.doc.line_of(t.at) == doc.line_of(start));
+                    if !known && targets.found.len() < limit {
+                        targets.found.push(semantics::Target { path: path.clone(), stamp: Some(stamp), doc: doc.clone(), hit: semantics::hit_at(&path, &doc, start, end), at: start, decoded_digest: None });
+                    }
+                }
+                offset += line.len();
+            }
+        }
+    }
+}
+
 /// What the user asked a language server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
@@ -6891,6 +6927,7 @@ impl Session {
         let origin = self.state.semantics.origin(session).unwrap_or_else(|| provider.to_string());
         let limit = if ask.question() == semantics::Question::Definition { semantics::TARGET_LIMIT } else { semantics::USAGE_LIMIT };
         let asked_path = asking.at.as_ref().filter(|_| ask == Ask::FileSymbols).map(|(path, _, _)| path.clone());
+        let by_name = matches!(ask, Ask::Definition | Ask::Peek).then(|| self.ruby_by_name(session, asking.at.as_ref())).flatten();
         let fence = crate::analysis::ResultFence { slot: crate::analysis::ResultSlot::Semantic { server: session, lane: reply.lane }, project, request, stage: crate::analysis::ResultStage::Targets, result_set: None, node: None, source: asking.source.clone() };
         let semantics = &self.state.semantics;
         if self.analysis.request_result(fence.clone(), Priority::Visible, || {
@@ -6916,11 +6953,27 @@ impl Session {
                     (Ask::FileSymbols, None) => semantics::Targets { failed: vec!["the file is no longer open in the language server; ask again".into()], ..Default::default() },
                     _ => semantics::targets_while(&value, limit, encoding, provider, session, &open, &read, &|| lease.wanted()),
                 };
+                if let Some(by_name) = &by_name { by_name.add(&mut targets, limit, &read, &|| lease.wanted()); }
                 semantics::capture_target_digests(targets.found.iter_mut());
                 lease.send(Completion::Targets { request, session, provider, origin, indexing, targets });
             }
         }).is_err() { return self.result_failed(&fence, "semantic analysis capacity is full".into()); }
         Effect::default()
+    }
+
+    /// For a Ruby definition: the method name at the asked place, the project's Ruby files and the gem folders of the
+    /// bundle `session` serves (once it has listed them), for declarations its index misses (see [`ByName`]).
+    fn ruby_by_name(&self, session: u64, at: Option<&(PathBuf, usize, u64)>) -> Option<ByName> {
+        let (gems, index) = self.state.semantics.gem_roots(session)?;
+        let (path, offset, _) = at?;
+        let doc = self.state.current_source().filter(|d| d.source() == path.as_path() && d.language() == Some(lenz_content::highlight::Language::Ruby))?;
+        let line = doc.reader_line_range(doc.line_of(*offset));
+        let word = doc.word_at(*offset);
+        let text = doc.copy_range(line.start..line.end.min(line.start + 4096))?;
+        let name = crate::ruby_declarations::method_name(&text, word.start.checked_sub(line.start)?..word.end.checked_sub(line.start)?)?;
+        let project = self.state.project.as_ref().filter(|p| path.starts_with(p.root()));
+        let files = project.map(|p| p.paths().iter().filter(|r| r.ends_with(".rb")).map(|r| p.root().join(&**r)).collect()).unwrap_or_default();
+        Some(ByName { name, gems, index, files, root: project.map(|p| p.root().to_owned()) })
     }
 
     /// One server's answer to the current request arrived (or failed): the request ends with the last one.

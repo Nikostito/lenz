@@ -3888,6 +3888,45 @@ fn questions_about_edited_ruby_wait_behind_a_sync_barrier() {
     assert_eq!(current_text(f.s.state()), "def go\n  xy1\nend\n");
 }
 
+/// Go to Definition in Ruby where Ruby LSP's index has nothing (the fake, like Ruby LSP, does not read ActiveSupport's
+/// `cattr_accessor`): the bundle's gems (listed by `rubyLsp/workspace/dependencies`) and the project are searched by
+/// name, so the method a gem declares with the macro opens, read-only; with several, they are listed as candidates.
+#[test]
+fn ruby_definitions_find_methods_declared_by_macros_in_gems() {
+    let gems = tempfile::tempdir().unwrap();
+    let mailer = gems.path().join("actionmailer-8.1");
+    let mail = gems.path().join("mail-2.9");
+    for (path, text) in [
+        (mailer.join("lib/action_mailer/delivery_methods.rb"), "module DeliveryMethods\n  included do\n    cattr_accessor :perform_deliveries, default: true\n  end\nend\n"),
+        (mail.join("lib/mail/message.rb"), "class Message\n  attr_accessor :delivery_handler\n  delegate :perform_deliveries, to: :config\nend\n"),
+        (mail.join("test/ignored.rb"), "cattr_accessor :perform_deliveries\n"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let list = format!("{}:{}", mailer.display(), mail.display());
+    let source = "class Messenger < ActionMailer::Base\n  def go\n    Messenger.perform_deliveries\n  end\nend\n";
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_GEMS", &list)], &[("Gemfile", ""), ("lib/messenger.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("lib/messenger.rb");
+    let log = f.log.clone();
+    f.settle_until(move || messages(&log).iter().any(|m| m["method"] == "rubyLsp/workspace/dependencies"));
+    f.pump(300);
+    let at = source.find("perform_deliveries").unwrap() + 3;
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().results().is_some());
+    let hits: Vec<(String, usize, String)> = f.s.state().results().unwrap().hits().iter().map(|h| (h.path.to_string(), h.line, h.text.trim().to_owned())).collect();
+    assert_eq!(hits, [
+        (mailer.join("lib/action_mailer/delivery_methods.rb").display().to_string(), 2, "cattr_accessor :perform_deliveries, default: true".into()),
+        (mail.join("lib/mail/message.rb").display().to_string(), 2, "delegate :perform_deliveries, to: :config".into()),
+    ], "both gems' declarations, not a gem's tests");
+    f.s.dispatch(Command::OpenResult(0));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
+    assert!(f.s.state().notices().iter().any(|n| n.contains("Read-only")), "{:?}", f.s.state().notices());
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), source);
+}
+
 /// A closing tag answered after more typing is dropped, and one the settings turn off (`autoClosingTags: false`) is
 /// never asked; the typed text stays exactly as typed.
 #[test]

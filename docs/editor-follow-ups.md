@@ -1492,3 +1492,22 @@ to line bounds in both adapters; document bounds and Shift selection share core 
 - **Ctrl+U on macOS:** the terminal app treats Ctrl+U in the text as Cmd+Backspace on macOS only, because macOS
   terminals send that; a user who types Ctrl+U there gets Delete Line, not readline's delete-to-line-start. Native
   macOS terminals were not available to verify which byte each sends.
+
+## Ruby definitions by name in gems (2026-11-18)
+
+- **What Ruby LSP misses:** `perform_deliveries` is ActionMailer's `cattr_accessor` and Mail's `attr_accessor`.
+  Ruby LSP 0.26.11 answered `message.perform_deliveries` (an unknown receiver) with Mail's only, and
+  `Messenger.perform_deliveries` or a bare `perform_deliveries` in the mailer with nothing; RubyMine lists both
+  (reported with a screenshot). Lenz now adds macro declarations of the name from the bundle's gems and the project.
+- **Cost (release, this container, Ruby LSP 0.26.11, actionmailer 8.1.3.1 and its 20 dependencies, 817 gem Ruby
+  files; 7 definitions each, medians):** without the search 13.3, 2.4, 2.4 and 10.8 ms for the three
+  `perform_deliveries` calls and `message.deliver`; scanning the gems on every definition 34–36, 31–37, 25 and 33 ms;
+  with the gems' macros indexed once per session 8–10, 2.4–2.5, 2.3–2.5 and 7–9 ms, the first definition paying the
+  index (65–75 ms here). A large Rails bundle (tens of thousands of files) was not measured: its first definition will
+  read all of them once, off the UI thread. The index keeps macro-declared names only (plain `def`s are in Ruby
+  LSP's), so its memory follows the number of macro lines, not of methods; it was not measured.
+- **Limits:** by name, so every macro of the name is a candidate (RubyMine resolves the receiver); a macro whose
+  symbols continue on the next line is read on its first line only; plain gem `def`s that Ruby LSP cannot resolve
+  for a known receiver (methods mixed in through `included do`) are not added; the project's Ruby files are read on
+  each definition that needs it (a large project pays that each time). RubyMine also lists the same gem under each
+  installed Ruby; Lenz lists the bundle's only.

@@ -21,7 +21,7 @@
 //! `FAKE_LSP_PULL_DIAGNOSTICS` publishes only for the first version and otherwise answers `textDocument/diagnostic`.
 //! `html/autoInsert` (VS Code's HTML server's request) closes the `<NAME>` just typed (`slow*` names 400 ms late).
 //! On-type formatting after Enter answers as Ruby LSP does: `end` below a block opener while the file does not parse
-//! (`FAKE_LSP_NO_ON_TYPE`: not offered).
+//! (`FAKE_LSP_NO_ON_TYPE`: not offered). `rubyLsp/workspace/dependencies` lists the gem folders in `FAKE_LSP_GEMS`.
 //! Formatting re-indents by brace depth with the requested options and trims trailing blanks (`slow_format` in the
 //! text answers 400 ms late, `error_format` fails; `FAKE_LSP_NO_FORMAT`: not offered; `FAKE_LSP_LINE_FORMAT`: one edit per
 //! changed line instead of one for the whole text). Organize imports sorts the
@@ -764,6 +764,12 @@ fn main() {
             }
             // Ruby LSP's add-on list, which Lenz asks behind text changes as a sync barrier.
             "rubyLsp/workspace/addons" => reply(&mut out, json!([])),
+            // Ruby LSP's bundle: the gem folders in `FAKE_LSP_GEMS` (`:`-separated).
+            "rubyLsp/workspace/dependencies" => {
+                let gems: Vec<Value> = env("FAKE_LSP_GEMS").unwrap_or_default().split(':').filter(|p| !p.is_empty())
+                    .map(|p| json!({ "name": p.rsplit('/').next().unwrap_or(p), "version": "1.0", "path": p, "dependency": true })).collect();
+                reply(&mut out, Value::Array(gems));
+            }
             "textDocument/diagnostic" => {
                 let text = fake.text(m["params"]["textDocument"]["uri"].as_str().unwrap_or_default()).unwrap_or_default();
                 reply(&mut out, json!({ "kind": "full", "items": fake.diagnostics(&text) }));

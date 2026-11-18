@@ -376,6 +376,16 @@ usual. This also works when reading a single file without an open project. Libra
 visit them; only expanded folders are listed, in background jobs. Adding a library does not add files to the
 local project declaration index. The browsing root stays unchanged.
 
+In Ruby, Go to Definition (Ctrl/Cmd+click, F12) also lists declarations Ruby LSP's index misses, as RubyMine's
+Choose Declaration does: methods a gem or the project declares with ActiveSupport's `cattr_accessor`,
+`mattr_accessor`, `class_attribute` or `delegate`, or with `alias_method`, `define_method` and the `attr_*` macros
+(`perform_deliveries`, ActionMailer's `cattr_accessor` and Mail's `attr_accessor`). They are found by name in the
+bundle's gems (their `lib` and `app` folders, as Ruby LSP lists them) and the project's Ruby files, and added when
+Ruby LSP found nothing (then project `def`s too) or only declarations outside the project. Several are listed in the
+results panel by gem and version; one opens read-only. This is a match by name, not a resolution: every macro
+declaring the name is a candidate, including ones the receiver does not have, and a macro whose names continue on
+the next line is not read past its first line.
+
 Collapse and expand a library folder to refresh its listing after a dependency update or branch checkout.
 Listings are limited to 2,000 entries per directory and 20,000 overall, with a status message when truncated;
 the definition you followed remains visible. At the overall limit, following another definition releases old
