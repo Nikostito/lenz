@@ -6,9 +6,11 @@ mod server_install;
 mod external;
 mod find_replace;
 mod multi_selection;
+mod word_unicode;
 mod structural_edits;
 mod snippet;
 mod save_as;
+mod archive;
 mod preferences;
 mod keymap;
 mod json;
@@ -31,6 +33,10 @@ mod csv;
 mod scrollbar;
 mod problems;
 mod project_syntax;
+mod branch_inventory;
+mod scratch_numbering;
+mod own_save_refresh;
+mod shutdown;
 use crate::tabs::TabId;
 use crate::text::TextSnapshot;
 use std::time::Duration;
@@ -68,6 +74,16 @@ fn word_deletion_removes_one_run_and_then_the_line_break() {
     assert_eq!(after(None, true), "\r\nqux", "nothing before the document's start");
     assert_eq!(after(None, false), "qux", "the CRLF line break as one");
     assert_eq!(after(Some(1), false), "q");
+    assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
+}
+
+#[test]
+fn mac_word_motion_deletes_a_word_with_the_spaces_before_it() {
+    let d = tempfile::tempdir().unwrap(); let path = write(d.path(), "words.txt", b"foo_bar  baz\r\nqux"); let mut s = session(d.path()); open(&mut s, Command::OpenRetained(path.clone()), "words.txt"); s.enable_text_input_for_test();
+    s.dispatch(Command::SetMacWordMotion(true));
+    let mut after = |caret: Option<usize>, backward| { if let Some(at) = caret { s.dispatch(Command::Select(Selection { anchor: at, head: at })); } s.dispatch(Command::Delete { backward, word: true }); source_text(s.state().current_source().unwrap()) };
+    assert_eq!(after(Some(12), true), "foo_bar  \r\nqux");
+    assert_eq!(after(None, true), "\r\nqux", "the spaces go with the word before them");
     assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
 }
 
@@ -1649,6 +1665,16 @@ fn session_clock(dir: &Path, clock: semantics::Clock) -> Session {
 }
 
 /// Apply background results until `done` holds.
+/// Whether a session opened on `dir` sees `seen` within 10 s: settings are saved in the background.
+fn saved(dir: &Path, seen: impl Fn(&Session) -> bool) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if seen(&session(dir)) { return true; }
+        if std::time::Instant::now() > until { return false; }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn settle(s: &mut Session, done: impl Fn(&Session) -> bool) {
     let rx = s.completions();
     let until = std::time::Instant::now() + Duration::from_secs(10);
@@ -2569,7 +2595,7 @@ fn an_empty_session_offers_open_and_explains_the_rest() {
     assert_eq!(disabled(CommandId::CloseTerminal), Some("No terminal is open"));
     assert_eq!(disabled(CommandId::RecoverDrafts), Some("No recovered drafts are offered"));
     assert_eq!(disabled(CommandId::SaveAs), Some("No file is open"));
-    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
+    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Replace in Project…", "Rename Symbol…", "Apply Previewed Edits", "Cancel Edit Preview", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "macOS Word Motion", "Save When Leaving a File", "Search Everywhere: Letters in File Names", "Search Everywhere: Rank by Open and Recent Files", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Copy Reference", "Go to Test or Subject", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Delete Line", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Explorer: Always Select Opened File", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Inline Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
     assert_eq!(disabled(CommandId::LocateFile), Some("No file is open"));
     assert_eq!(disabled(CommandId::WidenExplorer), Some("No folder or library is open"));
     assert_eq!(disabled(CommandId::TallerResults), Some("No search results are shown"));
@@ -2849,6 +2875,22 @@ fn word_motions_stop_at_word_ends_and_starts_and_home_toggles_the_indent() {
     assert_eq!(s.state().selection().unwrap().head, 0, "the document's start stays");
 }
 
+#[test]
+fn mac_word_motion_stops_before_the_value_the_colon_and_the_key_of_a_yaml_entry() {
+    let d = tempfile::tempdir().unwrap();
+    let path = write(d.path(), "c.yaml", b"     column: timestamp\n");
+    let mut s = session(d.path());
+    s.dispatch(Command::Open(path));
+    settle(&mut s, opened);
+    assert_eq!(s.on(CommandId::MacWordMotion), Some(false), "off by default");
+    s.dispatch(Command::SetMacWordMotion(true));
+    assert!(saved(d.path(), |s| s.state().mac_word_motion()), "remembered");
+    s.dispatch(Command::MoveCaret(Motion::LineEnd));
+    let mut head = |m| { s.dispatch(Command::MoveCaret(m)); s.state().selection().unwrap().head };
+    assert_eq!([head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft)], [13, 11, 5, 0], "timestamp, the colon, column, then the indent");
+    assert_eq!([head(Motion::WordRight), head(Motion::WordRight), head(Motion::WordRight)], [11, 12, 22], "column's end, the colon's, timestamp's");
+}
+
 /// Opening and closing many files keeps reloadable content within the inactive budget and releases the rest.
 #[test]
 fn repeated_opening_releases_content_beyond_the_budget() {
@@ -2957,6 +2999,44 @@ fn opening_a_folder_discovers_it_and_the_finder_ranks_its_files() {
     assert!(s.state().project().unwrap().rows().iter().any(|r| &*r.path == "src/ui"));
     s.dispatch(Command::CloseFinder);
     assert!(s.state().project().unwrap().finder().is_none());
+}
+
+#[test]
+fn always_select_opened_file_reveals_each_active_file_in_the_explorer() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    tree(&root, &["src/ui/view.rs", "src/data/store.rs", "a.md"]);
+    let mut s = session(d.path());
+    s.dispatch(Command::OpenRoot(root.clone()));
+    settle(&mut s, scanned);
+    let names = |s: &Session| s.state().project().unwrap().rows().iter().map(|r| r.path.to_string()).collect::<Vec<_>>();
+    let followed = |s: &Session| s.state().tree_follow().map(|(path, ticket)| (path.to_string(), ticket));
+    // Off by default: opening a file leaves the explorer as it is.
+    assert_eq!(s.on(CommandId::AlwaysSelectOpenedFile), Some(false));
+    s.dispatch(Command::Open(root.join("src/ui/view.rs")));
+    settle(&mut s, opened);
+    assert_eq!((names(&s), followed(&s)), (vec!["src".to_string(), "a.md".to_string()], None));
+    // Turned on, the active file is revealed and offered for selection at once.
+    s.dispatch(Command::SetAlwaysSelectOpenedFile(true));
+    assert_eq!(names(&s), ["src", "src/data", "src/ui", "src/ui/view.rs", "a.md"]);
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 1)));
+    // Every change of the active file follows: another file, then back to the first tab.
+    s.dispatch(Command::OpenRetained(root.join("src/data/store.rs")));
+    settle(&mut s, |s| s.state().active_in_tree().as_deref() == Some("src/data/store.rs"));
+    assert!(names(&s).contains(&"src/data/store.rs".to_string()));
+    assert_eq!(followed(&s), Some(("src/data/store.rs".into(), 2)));
+    let first = s.state().tabs().iter().find(|t| t.source().ends_with("view.rs")).unwrap().id();
+    s.dispatch(Command::ActivateTab(first));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    // Other input keeps it: the same file is not offered again.
+    s.dispatch(Command::Scroll(0));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    // Off again, a change of file leaves the explorer.
+    s.dispatch(Command::SetAlwaysSelectOpenedFile(false));
+    s.dispatch(Command::Open(root.join("a.md")));
+    settle(&mut s, |s| s.state().active_in_tree().as_deref() == Some("a.md"));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    assert!(saved(d.path(), |s| !s.state().always_select_opened_file()), "remembered");
 }
 
 #[test]
@@ -4631,7 +4711,7 @@ fn rapid_changes_end_on_the_last_content_and_recheck_works_without_events() {
     settle(&mut s, |s| s.state().current_source().is_some_and(|d| source_line(d, 0) == "50"));
     // A late result for an older check does nothing.
     let id = s.state().active().unwrap().id();
-    let stale = Completion::Refreshed { tab: id, token: 0, result: Refresh::Gone("old".into()) };
+    let stale = Completion::Refreshed { tab: id, token: 0, baseline: s.refresh_baseline(id), result: Refresh::Gone("old".into()) };
     assert_eq!(s.dispatch(stale), Effect::default());
     // Recheck (focus regained) finds what notifications would have.
     s.watcher.set(Default::default());
@@ -8778,6 +8858,46 @@ mod blame {
     }
 
     #[test]
+    fn inline_blame_shows_the_caret_lines_commit_without_the_annotation_column() {
+        let r = repo();
+        put(r.path(), "a.txt", "one\ntwo\n");
+        commit_all(r.path(), "first");
+        let mut s = session(r.path());
+        s.dispatch(Command::Open(r.path().join("a.txt")));
+        settle(&mut s, opened);
+        let t = s.state().active().unwrap().id();
+        assert_eq!((s.on(CommandId::InlineBlame), s.state().caret_blame(t)), (Some(false), None), "off by default");
+        assert!(s.state().active().unwrap().blame.is_none(), "nothing is blamed while it is off");
+        s.dispatch(Command::SetInlineBlame(true));
+        settle(&mut s, blamed);
+        assert_eq!(s.state().caret_blame(t), None, "no caret yet");
+        s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+        let commit = format!("t, {} • first", today());
+        assert_eq!(s.state().caret_blame(t), Some((0, commit.clone())));
+        assert_eq!((s.state().active().unwrap().annotation_cols(), s.annotation(t, 0).is_none(), s.on(CommandId::AnnotateBlame)), (0, true, Some(false)), "no column");
+        assert_eq!(s.state().active().unwrap().blame_status(), None, "the status bar says nothing about it");
+        s.dispatch(Command::MoveCaret(Motion::Down));
+        assert_eq!(s.state().caret_blame(t), Some((1, commit.clone())), "it follows the caret");
+        s.dispatch(Command::Extend(Motion::Right));
+        assert_eq!(s.state().caret_blame(t), None, "not over a selection");
+        // The column reuses the attribution, and closing it leaves inline blame as it was.
+        annotate(&mut s);
+        assert_eq!(s.state().active().unwrap().annotation_cols(), ANNOTATION_COLS);
+        s.dispatch(Command::SetAnnotate(false));
+        s.dispatch(Command::MoveCaret(Motion::Left));
+        assert_eq!((s.state().active().unwrap().annotation_cols(), s.state().caret_blame(t)), (0, Some((1, commit))));
+        // A draft line not yet committed says so.
+        s.enable_text_input_for_test();
+        s.dispatch(Command::InsertText { text: "x".into(), kind: crate::text::EditKind::Typing });
+        settle(&mut s, blamed);
+        assert_eq!(s.state().caret_blame(t), Some((1, "Not committed yet".into())));
+        s.dispatch(Command::SetInlineBlame(false));
+        assert_eq!(s.state().caret_blame(t), None);
+        assert!(s.state().active().unwrap().blame.is_none(), "turned off, its attribution goes");
+        assert!(saved(r.path(), |s| s.on(CommandId::InlineBlame) == Some(false)), "remembered");
+    }
+
+    #[test]
     fn lossless_legacy_encoding_keeps_unchanged_commits_when_one_draft_line_changes() {
         let r = repo();
         let bytes = b"caf\xe9 au lait, cr\xe8me br\xfbl\xe9e\r\n\xe9l\xe8ve d\xe9j\xe0 vu\r\nlast\r\n";
@@ -10459,3 +10579,5 @@ fn lenz_reader_folders_move_to_lenz_code_once_and_never_lose_settings() {
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(kept, base.join("lenz-reader"));
 }
+
+mod workspace_edit;

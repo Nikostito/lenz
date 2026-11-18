@@ -4,6 +4,39 @@
 
 Evidence and decisions from the 2026-10-03 Linux performance work. Keep unsuccessful and superseded approaches here so a later platform, renderer or workload can justify another trial. Results are specific to the machine and measurement method; they are not universal performance claims.
 
+## Release 0.0.14 comparison layout — 2026-11-10
+
+The combined candidate `efe382d` failed the existing normal-release 100k-line
+view-build gate at 3.93 ms against 2.4 ms; isolated repetitions reproduced
+3.67–5.25 ms. Allocating inline-range vectors only when changes need them reduced
+work but still measured about 2.83–3.10 ms. Appending row iterators directly
+improved isolated timings, but the second complete gate still measured 2.51 ms.
+Reserving known uncollapsed row counts completed the fix (`86c6106`); collapsed
+layouts retain their smaller capacity. Refinement tests verify inline ranges
+appearing and being cleared. Budgets were not raised.
+
+Three alternating normal-release process pairs measured median view construction
+at **3.962 → 2.157 ms**. Scroll/layout **14.01 → 13.32 µs** had overlapping ranges.
+Five warm GUI startup pairs measured first paint **215 → 202 ms**, settled RSS
+**210.1 → 208.5 MiB** and peak RSS **423.0 → 420.2 MiB**. Six interaction pairs,
+including three reversed-order confirmations, leave Find-scroll **49.71 → 52.42
+ms** inconclusive: ranges overlap and paired differences vary in sign. Native
+TUI sub-millisecond resize variation is also inconclusive; no universal input
+speedup is claimed. TUIs were built independently without GUI features.
+
+The clean final source `cc44113` passes full local CI, the normal-release gate
+and workload version 7's **133 cases/394 metrics with no skipped workloads**.
+Candidate mixed stress runs **60.027 seconds**, with 312.70 MiB settled RSS and
+zero last-quarter growth, versus **60.005 seconds** and 315.18 MiB median RSS for
+the retained baseline. These are combined-tree candidates, not a pristine
+0.0.13 package comparison. Software-renderer RSS is not GPU allocation, and
+XDamage/PTY feedback is not physical display latency or indefinite leak proof.
+
+The [release validation report](research/release-0.0.14-validation.md) records
+all frontend endpoints, collector/test-fixture repairs and coverage limits.
+Raw samples, configuration, source/executable hashes, failed attempts and
+process identities remain in `perf-results/release-0.0.14/`.
+
 ## Scrollbars with track marks — 2026-10-31
 
 Every text pane in both apps gained an IntelliJ-style scrollbar: a thumb, a track that pages, and priority-merged
@@ -327,7 +360,7 @@ The complete local gate and production dark/light, narrow/tiny, clipboard and
 modal-isolation replays passed. Sixty-second status cycles showed bounded sampled
 RSS and unchanged source/configuration bytes. Two alternating release comparisons
 found timing differences within pair variation. GUI initial sampled RSS rose
-0.6–1.3 MiB, while both 15-second sustained comparisons settled below the saved
+0.6–1.4 MiB, while both 15-second sustained comparisons settled below the saved
 baseline; this distinction remains explicit in the report. The first native GUI
 OCR oracle missed a visible Actions tab and was narrowed to the relevant tab;
 the failed run was retained. No source changes were needed after visual review.
@@ -442,7 +475,7 @@ Linux release builds, same machine, shared-core fixture with 5,001 branches and 
 | Page local branches, remote refs and PRs in batches of about 20 | **Kept.** Local filtering can request the full inventory; PR filtering covers loaded requests. `gh pr list` has no offset, so another PR batch refetches a larger prefix. |
 | Shape a PR description synchronously during render | **Rejected.** Native formatting now runs on the background executor with source, width, theme, font and request identity checks; provisional content remains available. |
 | Reuse the Markdown parser, reading style and native glyph shaping for PR prose and code | **Kept.** The final release test's 35,255-byte description prepares its render in 1.49–1.69 ms; formatting completes in 39.1 ms cold and 4.99–5.11 ms warm in the background. Cached render preparation is 0.020–0.023 ms. These are native-text test measurements, excluding canvas paint and physical presentation; absolute process RSS was 78.1 MiB, not a leak or baseline-memory claim. |
-| Group the on-demand PR Markdown and cached page builders with `#[cold]` | **Kept.** Warmed, same-filesystem plain-TUI RSS overlaps at 10.6–10.8 MiB. Without the hints, the changed binary retained about 1.3 MiB more executable pages. Anonymous memory and thread counts were unchanged. Marking only the Markdown builder fixed plain comparisons; grouping the cached builders also removed a consistent extra 1 MiB in the conflict workflow and a 0.6 ms second-view slowdown. Final paired conflict RSS was 11.93 → 11.76 MiB; second-view timing moved in both directions. A temporary `MADV_RANDOM` diagnostic isolated executable fault-around; no preload, allocator or system configuration ships with the change. |
+| Group the on-demand PR Markdown and cached page builders with `#[cold]` | **Kept.** Warmed, same-filesystem plain-TUI RSS overlaps at 10.6–10.8 MiB. Without the hints, the changed binary retained about 1.4 MiB more executable pages. Anonymous memory and thread counts were unchanged. Marking only the Markdown builder fixed plain comparisons; grouping the cached builders also removed a consistent extra 1 MiB in the conflict workflow and a 0.6 ms second-view slowdown. Final paired conflict RSS was 11.93 → 11.76 MiB; second-view timing moved in both directions. A temporary `MADV_RANDOM` diagnostic isolated executable fault-around; no preload, allocator or system configuration ships with the change. |
 
 The full Linux suite collected 133 passing cases and 394 metrics, including a 10-second sustained mixed workload and three repetitions of the GUI interaction scenarios on a private software-rendered display. Its final comparison guard held the baseline's earlier "running" status; a separate post-collection comparison verified the completed baseline and matching configuration without changing either raw report. Evidence remains under `target/perf/2026-10-17-repository-{before-frozen,after,ux}`.
 
@@ -2320,3 +2353,271 @@ Paired release runs against `v0.0.7`; the table and commands are in the
 |---|---|
 | gpui v1.24.2 → v1.26.2 with the dependency updates (Code and Diff GUI, Code and Diff TUI, two alternating pairs) | **No regression of a millisecond or more.** Code GUI open 158.6–160.8 ms against 159.6–160.0; Diff GUI first paint 252–253 against 250–251.5 ms; Code TUI first feedback +0.7 ms and Diff TUI input +0.3 ms in both pairs, recorded and not pursued; Code GUI edit-run peak RSS +1–3 MiB. |
 | Diff terminal first-paint marker | **Collector fix.** Since 0.0.7 the header names the comparison, so `tui-bench.py`, `markdown-bench.py` and `crash-reporting-check.py` waited for a `Lenz` that never came; they now wait for the status line's `F2 details`. Both builds were measured with it. |
+
+## Journey input and comparison entry (2026-11-08)
+
+The reader and Diff journey fixes share a borrowed, caret-aware input viewport. It walks backward only
+through the visible prefix, then forward to the viewport edge; the initial full-prefix scan was replaced
+before final measurements. A million-character input and combining/emoji boundaries are covered by
+correctness tests. GUI and terminal adapters keep their own shaping and cell placement.
+
+Release baseline `0baf705d8405a33543dfc73616f6551a98502b54`, repository profiles unchanged, four jobs;
+terminal binaries built separately from GUI features. Three private-X11 trials per GUI workload and
+three owned-PTY long-query trials include a 20-second input/resize loop. Long-query first feedback was
+22.82→23.36 ms in the GUI (XDamage), 0.268→0.319 ms in the TUI (PTY bytes). Every fixed trial exposed
+edits at Home; every baseline trial reproduced the hidden prefix. Original file bytes and terminal
+restoration remained exact. Ordinary GUI paging changed 8.19→8.68 ms (Code), 8.97→9.26 ms (Diff).
+
+Alternating warm Diff first-paint samples were 182/156/127→125/127/125 ms, with settled RSS
+145.5–146.3→146.2–146.4 MiB. This is not a speedup claim. An initial Diff TUI startup outlier did not
+repeat: baseline repeats 13.25/6.31/6.70 ms, fixed 6.45/5.17/5.99 ms. GUI mapping is a different,
+noisy endpoint; Code first-readable content was not measured. Code GUI RSS initially rose about
+3 MiB, but baseline repeat 134.04–136.04 MiB overlapped fixed 135.21–135.88 MiB.
+
+Code TUI's small RSS increase remains: roughly 0.6–0.8 MiB of file-backed pages in repeated search
+runs, with anonymous RSS about 2.3 MiB in both. Ordinary 20-second paging measured total RSS
+16.01→16.68 MiB. This is an unresolved executable-residency difference; full memory preservation
+is not established. A bounded ASCII shortcut and a cross-crate inline hint gave no useful improvement
+and were removed. The ASCII trial used a Code-TUI-only feature graph, so its memory comparison is
+inconclusive; the inline trial used the matching two-terminal graph. The simpler bounded Unicode
+implementation remains.
+
+Ignored local evidence is under `perf-results/journey-fixes/`: source and executable identities,
+retained baseline and initial candidate binaries, raw timings and actual durations, native screenshots,
+full local gate, final constructor/input tests, failed attempts and the detailed validation report. The
+original GUI wrapper's elapsed field includes settlement/screenshot time; its timeline bounds the
+stress interval. The final Reader change after the measurements makes compact forms include exactly
+240 px so their error remains visible; final functional replay is separate. Native Wayland/macOS,
+hardware GPU memory, physical presentation, and longer soaks remain unverified. RSS is not leak proof.
+
+
+## Search and popup text editing — 2026-11-09
+
+Shared one-line selection and edit commands now cover Reader/Diff search and popup fields in both adapters. GUI clipboard transport and terminal cell presentation remain separate. Cursor-only movement/copy does not restart query workers; cursor banks are bounded to two active fields. Paint snapshots borrow or copy only the visible range, hidden characters are displayed safely, and GUI carets account for fallback-font advances. Compact Find gives its query priority over counters/options.
+
+The retained baseline includes the preceding journey fixes and `diff show`, with unchanged Cargo profiles. TUI payloads were captured from standalone builds; GUI builds use the same package feature union as that baseline. Full local CI passed, as did real X11 clipboard/keyboard checks and PTY Unicode/resize/cleanup checks.
+
+Evidence: `perf-results/popup-inputs/validation.md`, `metrics.json`, source/binary identities, native screenshots/events, PTY raw output, and initial/paired performance samples. Paired terminal search feedback was 0.314 → 0.315 ms. Repeated source-navigation stress was 0.696 → 0.726 ms (initially 0.673 → 0.760 ms), so a small feedback cost remains in that workload. Reader GUI mapped-window and damage timing samples varied by run. Fixed-viewport anonymous RSS overlapped; approximately 1.4 MiB more executable pages remain resident (smaps), with approximately 1.4 MiB higher total RSS in that diagnostic. This residual is reported, not called zero overhead. There is no new unbounded field history/cache. RSS does not measure GPU allocation or prove absence of leaks.
+
+Early native harness assertions relied on OCR and a simple terminal screen approximation; the final checks use exact clipboard bytes plus adapter cell/paint assertions and inspected screenshots. The 20-second sustained runs passed; longer leak runs, native macOS/Wayland and physical-display timing remain unverified.
+
+## Review fixes after 0.0.13 — 2026-11-09
+
+Save completion now retains recovery for newer dirty edits against the baseline actually written, including Save As. Comparison and typed Open Path inputs preserve exact whitespace. Search/popup fields use isolated native preedit with UTF-16 ranges and shaped click/Shift-click geometry; queries change only on commit. Stale callbacks, modal dismissal, focus loss, replacement limits and reserved Alt shortcuts have explicit regression coverage. Registered macOS Option input goes through AppKit so spacing accents can remain dead keys; reserved shortcuts reach the application first. The short comparison chooser keeps its fields and mode controls above its footer.
+
+Linux's empty replacement of the marked range cancels preedit without deleting the original selection. A physical key name with no committed character stays outside text insertion, including when preedit arrives before the raw key event. Production private-X11 replays verify exact dead-acute + `e` → `é`, independent UTF-8 clipboard paste/copy, emoji grapheme selection/cut, field switching and 240 × 180 layouts. Reader drafts and all fixture bytes stay unchanged. The compact standalone chooser exposes both fields, modes and footer at that size and retains a trailing-space path exactly.
+
+Folder listing retains size/CRC-32/path metadata instead of whole deleted files. Fingerprint matches are verified byte for byte, including real CRC collisions. A 1 MiB total cache, with a 4 KiB per-file cap, preserves the small-file path; two reused 64 KiB buffers handle larger bodies. The index still scales with the number of paths. Duplicate pairing order, empty-file behavior, links, short reads and proc-like files retain their semantics.
+
+The paired detector probe compiles the previous detector and the new one in the same release test executable. Seven alternating pairs measured 128 MiB of renames at **231.50 → 74.94 ms**, peak RSS **138.49 → 7.02 MiB**; pure deletions at **167.73 → 35.79 ms**, **134.59 → 7.03 MiB**; 64 MiB of unchanged paths at **36.13 → 25.04 ms**. Every comparison signature matched. These endpoints include inventory, equality and rename pairing, and exclude archive expansion and frontend painting.
+
+The initial streaming implementation added about 1.5 ms on 100 × 1 KiB renames. Reusing buffers and the bounded tiny-file cache addressed that cost. A 31-pair repeat measured small renames at **14.45 → 14.43 ms** and unchanged paths at **14.17 → 14.00 ms**. Paired differences varied in sign; this is not a speedup claim. The final repeated-process stress lasted **20.18 seconds / 61 pairs** with identical signatures; it does not establish long-lived application leak freedom.
+
+A separate absolute native-model probe ran two 20-second workloads. Its callback bundle (UTF-16 selection/context, marked range and bounded paint projections) measured about **0.007 ms median** on a 512-byte query, and **9.50 ms median / 10.95 ms p95** on a million-byte query. Native surrounding-text replies contain at most 4 KiB and paint results are viewport-sized; a marked projection can temporarily copy up to 4 KiB on each side of its bounded preedit. UTF-16 mapping and marked-source validation still scan long queries. This is an absolute model measurement, with no previous native-field implementation or GUI/display endpoint to compare against.
+
+The final full local CI gate passed, including workspace, GUI, terminal parity, serial memory and Python collector checks. Production binaries exclude test/probe features. Frontend comparisons use the same normal release package feature graph as the retained baseline; terminals were built separately. That baseline reports 0.0.12, but its runtime source matches 0.0.13 before these fixes, apart from version metadata. The published 0.0.13 distribution uses a different LTO profile and was not used for timing comparisons.
+
+| Frontend workload | Baseline → fixed | Interpretation |
+| --- | --- | --- |
+| Diff Find, six alternating runs with 20-second final trials | 17.84 → 17.66 ms median first XDamage; anonymous RSS 61.70–61.93 → 61.35–61.80 MiB | No measured regression; total RSS ranges overlap. |
+| Reader navigation, same alternating schedule | 8.69 → 8.59 ms first XDamage; total RSS 135.07–137.91 → 133.92–136.82 MiB | Ranges overlap; mapped-window timing is noisy and does not measure first readable content. |
+| Reader long search, initial 20-second input/resize pair | 22.69 → 23.26 ms first XDamage; RSS 132.82 → 134.73 MiB | Repeated because of the memory increase. |
+| Long search repeat, ABBA order, fixed 640 × 480 settlement | Baseline 22.93–23.35 ms / 132.05–136.02 MiB; fixed 22.51–22.77 ms / 132.50–134.14 MiB | The initial memory increase did not repeat consistently; raw anonymous/file/shared splits are retained. |
+| Reader terminal long search | 0.320 → 0.311 ms first PTY bytes; RSS 14.50 → 14.49 MiB | Exact edited prefix and terminal restoration passed. |
+| Reader terminal navigation, original then reverse-order repeat | Stress feedback 0.703 → 0.722 ms, then 0.732 → 0.652 ms | No consistent latency increase. Settled RSS remains about 0.10–0.21 MiB higher in these two pairs; this small residual is unassigned, not called zero overhead. |
+| Diff warm startup, three alternating samples | First paint 117–138 → 118–151 ms; settled RSS 144.0–144.6 → 144.0–144.8 MiB | Overlapping ranges; no speedup claim. |
+
+Each sustained frontend run lasted at least 20 seconds; the raw durations, samples and fixture assertions are retained. XDamage and PTY bytes are first-feedback endpoints, not completed actions or physical display latency. The fixed-viewport search repeat records its changed settlement method separately. An early native replay used a test-support binary that disables background updates; that run was discarded, and the final functional replays use production release executables.
+
+Ignored evidence is under `perf-results/fix-review-0.0.13/`: source/binary identities, failed and final regression runs, folder probe variants and raw samples, and native-model samples. Native macOS and Wayland input methods, physical displays and long-duration leak behavior remain unverified. Linux input-handler tests establish transport and state behavior, not native Mac release acceptance.
+
+## Archive editing and recovery checks (2026-11-09)
+
+Code now browses ZIP and TAR containers, including gzip, bzip2, XZ and Zstandard wrappers and nested
+archives. Members use ordinary drafts, editing, Undo/Redo and captured Save receipts. Structured archive
+locations keep virtual member names separate from physical paths; no files are extracted. One writer
+per canonical outer container serializes member saves, rebasing only siblings that shared its confirmed
+prior bytes. Unsupported preserving rewrites stay read-only; valid text can be exported with Save As.
+Restart recovery retains member identity, encoding and draft text. Container writes use guarded atomic
+replacement with no in-place fallback, and uncertain outcomes keep the draft and expose rechecking.
+
+The rigorous review fixes also cover stale selective Undo after external reload, stale hunk menus,
+exact path whitespace, dirty canonical aliases and Save As reservations, per-tab Find cursors, XKB Escape
+cancellation, grapheme-safe word motions, bounded native replacement, launch-relative Git pathspecs,
+commit-history anchors and narrow terminal dialogs. Recovery scanning now retains the newest bounded
+tail instead of collecting every record first; presentation titles cannot invalidate recoverable work.
+
+The local checks passed: workspace tests, all three panic budgets, both strict lint configurations,
+six serial memory checks, Diff GUI tests, Code GUI tests (309 passed), terminal parity (309 passed),
+77 Python collector tests (one conditional skip), standalone terminal builds and the stripped Diff size
+gate. The final GUI-union Diff binary is 69,054,304 bytes stripped. Several early runs found test
+readiness/geometry errors and workspace disk exhaustion; their logs are retained. Final GUI waits
+observe completed source/listing loads and fresh hit geometry, without weakening byte assertions.
+
+Production private-X11 and owned-PTY replays cover actual constructors, typing, Unicode paste,
+copy/paste, Undo/Redo, Save and reopen, nested saves, preserved siblings/comments/metadata and small
+dark/light error/retry/empty/close routes. Separate pre-archive production replays verify the review
+fixes. All owned processes/displays closed and terminal attributes were restored. Native macOS and
+Wayland composition remain unverified.
+
+Performance uses the retained 0.0.13 review baseline and normal release builds with matching package
+feature unions; terminals were built separately. No compiler, other benchmark or unrelated OCR workload
+ran during measurements. First XDamage and PTY bytes measure first feedback, not completed display
+frames. Startup uses fresh processes with warm filesystem caches; memory samples are taken after the
+workload. These are not hardware display measurements or leak proof.
+
+| Ordinary workload | Baseline → candidate | Observation |
+| --- | --- | --- |
+| Diff Find, six alternating runs | 19.29 → 19.05 ms median first XDamage | Final runs lasted 20.09 / 20.09 seconds; RSS ranges overlap. |
+| Code navigation, six alternating runs | 8.99 → 8.66 ms first XDamage | RSS 132.74–137.04 → 133.82–137.60 MiB; a small residency difference remains, not zero overhead. |
+| Code long project search, initial pair | 23.44 → 22.89 ms first XDamage; RSS 131.13 → 134.66 MiB | Repeated because window settlement and RSS differed. |
+| Same search, ABBA repeat settled at 640 × 480 | 23.04–23.33 → 23.05–23.19 ms; RSS 133.51–134.68 → 134.41–134.47 MiB | Ranges overlap; the initial 3.53 MiB increase did not repeat consistently. |
+| Code terminal long search | 0.352 → 0.354 ms first PTY bytes; RSS 14.86 → 15.45 MiB | About 0.49 MiB of the 0.58 MiB increase is file-backed; anonymous RSS rises about 0.09 MiB. |
+| Code terminal navigation | 0.699 → 0.657 ms stress feedback; RSS 15.82 → 16.45 MiB | Both sustained runs lasted at least 20 seconds; terminal restoration and fixture assertions passed. |
+| Code terminal startup, ten alternating pairs after warmup | 9.11 → 7.62 ms median first content | Repeated after a single 8.28 → 11.30 ms pair; no consistent startup slowdown. |
+| Diff startup, three alternating samples | First paint 126–136 → 121–128 ms; RSS 144.1–144.7 → 143.8–144.3 MiB | No speedup claim from this small sample. |
+
+The direct word-stop probe compares the previous contiguous character algorithm with the new borrowed
+4 KiB chunk implementation, in one executable. Five alternating pairs measured a million ASCII bytes at
+4.663 → 2.797 ms and emoji/symbol input at 0.478 → 0.320 ms. A short-word sample initially measured
+31.92 → 35.87 ns; ten further alternating pairs measured 29.30 → 29.21 ns, so that small increase was
+not reproducible. Separate sustained ASCII runs each exceeded 20 seconds with equal results. Decomposed
+Unicode words intentionally have different stops and are excluded from speed comparisons. The probe's
+cursor declaration shim is unmeasured; the measured word/display source and executable hashes are retained.
+
+Archive codec measurements use seven independent processes per format, 5,000 small files, a 4 MiB
+random sibling and a 4 MiB repeated sibling. Listing/read/replace/reparse are completed in-memory API
+calls; they exclude filesystem reads, atomic writes, UI queues and rendering. Replacement changes two
+small members, checks untouched data/metadata and reparses the result.
+
+| Format | List / selected read / replace / reparse | Retained index estimate | Per-process peak RSS |
+| --- | --- | --- | --- |
+| Stored ZIP | 3.323 / 0.039 / 22.349 / 4.409 ms | 15.76 MiB | 86.11 MiB |
+| gzip TAR | 17.096 / 0.009 / 125.209 / 17.265 ms | 19.05 MiB | 128.19 MiB |
+| Zstd TAR | 16.551 / 0.031 / 140.497 / 14.842 ms | 19.02 MiB | 124.41 MiB |
+
+Peak RSS includes fixed input/expected buffers and the four-index cache phase. The browser budget is
+four indexes / 256 MiB, with separately bounded tree metadata. A 32 MiB pressure-cache run completed
+170 checked cycles in 21.118 seconds (21.267 seconds including process overhead), retaining at most
+19.152 MiB of estimated cache data and peaking at 123.77 MiB RSS. First/last thirty sampled RSS medians
+were 104.78 / 103.14 MiB. This finite run does not establish leak freedom. An independent Python/libzstd
+reader verified outputs for all six supported formats; a corrupt unopened ZIP payload also confirmed
+that listing and replacement of another member do not decompress it.
+
+Archive peak RSS uses per-child Linux `os.wait4().ru_maxrss` (KiB). The first attempt stopped before
+timing because `/usr/bin/time` was absent; the scratch collector fallback and unchanged workload,
+profile/features, source/rlib/probe hashes, every raw sample and actual durations are retained. Evidence
+is under `perf-results/archive-editor/` and `perf-results/fix-rigorous-2026-11-09/`, including source
+archives, binary identities, final gate records, native screenshots, frontend repeats and word probes.
+
+## Project replacement and symbol rename — 2026-11-09
+
+Fresh-environment validation now covers the rebased PR #50 tree. The
+[validation report](research/project-replace-rename-validation.md) records exact
+sources, binaries, commands, normal Cargo profiles and raw evidence under
+`perf-results/pr51/`. The complete local gate, 17 focused core checks, three actual
+GUI/TUI input/render replays and normal production GUI light/dark replays pass.
+An integration bug treated inactive retained dirty/undoable tabs as loading;
+shared preflight now validates their actual buffers before publishing any edits,
+then restores views without losing prior text, buffer identity or per-file Undo.
+Scratch-picker, navigation and Save When Leaving a File integration are covered.
+
+| Experiment | Result / decision |
+| --- | --- |
+| Process cleanup on a fresh environment | Eight lifecycle cases, the Rust Trace2 fixture regression and 100 synchronous commits pass. The full gate collects 817 orphans without forced cleanup; global zombies remain at one from an initial unsupervised checkout. No EAGAIN. Old 32,000-zombie runs do not validate this tree. |
+| Same-machine normal release GUI comparison against main after PR #50 | Seven alternating measured launches: mapped-window median 107.256 → 104.197 ms, p95 118.858 → 144.431 ms. Three editing processes / 60 actions: first edit damage 13.047 → 13.096 ms; settled RSS 210.004 → 206.375 MiB and peak 210.004 → 210.883 MiB. Exact-byte Save/Undo/Redo pass. No speedup claimed from repaint timings. |
+| Standalone TUI, eight alternating pairs | First feedback 7.559 → 7.426 ms, content 20.949 → 19.385 ms, pooled key feedback 0.805 → 0.806 ms. Each process scrolls at least 20 seconds, checks bytes, idle and termios. Settled RSS medians 46.146 → 51.062 MiB; peak 56.520 → 61.109 MiB. Both executables reproduce roughly 42/51 MiB settled modes; do not average them into a preservation claim. |
+| Investigate higher initial TUI RSS | Six further short reload trials per build reproduce five high-mode/one low-mode processes in each, with medians 50.076 → 50.461 MiB. Separate glibc diagnostics estimate about 6.42 MiB allocated in both and about 32 MiB free arena space; trim changes residency. Diagnostic instrumentation/short stress are excluded from normal performance samples. Identical default RSS distributions and indefinite leak freedom remain unproved. |
+| Create the workspace cancellation token lazily | Six shorter trials remain in the high residency mode, 50.359–52.012 MiB; no RSS reduction. Reverted. Patch, normal-profile build and binary retained separately. No production allocator tuning or profile exception. |
+| Sustained 40-file / 4,000-edit replacement and per-file Undo | 4,220 cycles in 120.003 seconds. Prepare median/p95 2.332/3.551 ms, Apply 10.454/14.396 ms. Every draft, Undo and all disk bytes pass each cycle. Sampled RSS peak 26.910 MiB; quarter medians 22.748/23.965/25.176/26.176 MiB include retained probe samples and allocator residency. Candidate-only core work, not frontend/provider/Save latency. |
+| Initial tool/header, adapter-fixture and native OCR failures | Retained and corrected: cached tools were outside PATH, matching Clang headers were missing, menu/overlap fixtures made incorrect geometry assumptions, and dark OCR needed contrast preprocessing. One obsolete gate and an initially mis-scoped preload diagnostic were interrupted explicitly. No failed application assertion was suppressed. |
+
+Standalone terminal binaries exclude GPUI and use the normal release profile;
+rebuilding the candidate with the exact baseline command yields the same measured
+hash. Production GUI uses private Xvfb/Mesa lavapipe, so mapped-window, XDamage and
+PTY feedback are distinct from physical presentation. RSS is not GPU accounting
+or leak proof. Native macOS/Windows/Wayland, physical GPU/display checks, old-Git
+container coverage and prolonged external-provider workloads remain unverified.
+
+## Editor feedback, server setup and Find — 2026-11-10
+
+The [validation report](research/editor-feedback-setup-search-validation.md)
+records changes against merged PR #51 (`6f7a186`) and raw evidence under
+`perf-results/editor-diagnostics-install-search/`.
+
+| Experiment | Result / decision |
+| --- | --- |
+| Dirty syntax-error tab switching | Ordinary Java/Rust/Ruby round trips already pass on the base. A split retaining the same source reproduces missing colors on return: delivered analysis was deduplicated after the restored view cleared it. Share only exactly current peer syntax/semantic payloads; keep document text and view positions independent. Core and light/dark GUI/TUI input/render replays pass. |
+| Easier language-server setup | Missing-server footer opens Install; F2 initially selects it. Existing Node can be selected before server installation. Both adapters expose the same preview, progress, cancel, details and retry. Real npm installation passes; fresh offline Ruby installation builds six official cached gems and passes validation/persistence. Live Ruby index and a Go module download are blocked by this environment; do not count them as successful live installs. |
+| Prepare a borrowed literal scanner once per collection | Three independent normal-release process pairs / 21 samples per case: absent ASCII 7.174 → 1.974 ms, sparse sensitive 16.189 → 1.475 ms, common capped 0.742 → 0.460 ms, repeated-prefix absent 4 MiB line 11.961 → 0.151 ms. Keep the original iterator for dense lines and Unicode folding/regex. Exact ranges/caps/cancellation remain checked. |
+| Enlarge the iterator / prepare work per line | Early probes showed dense and Unicode/regex costs; discarded. Final scanner stays local to bounded collection and leaves the public matcher/iterator representation unchanged. Earlier logs/hashes remain; not every transient experimental source snapshot was retained. |
+| Compare against a private copy of old code in one executable | Inconclusive preservation evidence: even unchanged Unicode/regex paths differed because compiler context changed. Build the baseline root implementation separately in its own checkout/target. Independent root comparisons give dense 0.134 → 0.135 ms, Unicode sensitive 0.373 → 0.371 ms, folding 1.376 → 1.349 ms, regex 9.663 → 9.666 ms. |
+| Six sustained scan processes | Each runs 20.001–20.014 seconds with exact old/new results. Sampled RSS 39.26–39.84 MiB; first-to-last growth at most 0.063 MiB. This is bounded stress evidence, not a leak proof. |
+| Production TUI zero-hit query | The core completed the query but returned no repaint when there was no match to reveal. The native counter stayed pending until another input. A permanent test fails before the fix and passes afterward; rebuilt production TUI now paints completion without an extra key. Native paired timings must use the same bounded endpoint on both builds. |
+
+All builds use repository Cargo profiles. Standalone terminal dependencies exclude
+GPUI. Initial process health had one existing Git zombie; an unsupervised Go SDK
+inspection added a detached telemetry orphan. Subsequent supervised checks retain
+the same two PID-1 zombies without fork/thread failures. Preserve that distinction
+in the raw process snapshots. Final frontend and full-gate results are in the report.
+
+The complete local gate passes (2,958 workspace/serial-memory and 925 dedicated
+adapter passes across overlapping invocations; 85 Python tests, one skip).
+Three native TUI pairs measure completed Find/reveal **9.875 → 3.450 ms**, with
+20.156–20.293 seconds of checked queries per process. A separate absent/present
+candidate run lasts 20.399 seconds. Both binaries reproduce roughly 30/39 MiB
+RSS modes, with at most 0.102 MiB settled-quarter growth; identical frequencies
+and indefinite leak freedom remain unproved.
+
+Original GUI attempts on both builds exposed an XDamage collector race: draining
+after rearming could discard a late NonEmpty notification and suppress the next
+paint signal. A deterministic private-Xvfb control reproduces it. Collector
+schema 2 now drains before rearming; the final three pairs use that logic and
+one controlled outside-Git fixture. Exact Save/Undo/Redo pass; pooled first edit
+damage is 12.213 → 9.134 ms and settled RSS 165.359 → 161.812 MiB. Seven startup
+pairs give first received client image 650.508 → 661.158 ms, with overlapping
+ranges and pair differences in both directions. No GUI timing speedup is claimed.
+
+After these measurements, an environment transition killed the eleventh gate's
+outer supervisor with SIGKILL. Its surviving test session orphaned descendants
+at PID 1; the new stopped baseline is 767 zombies. Eight lifecycle tests and 20
+synchronous commits pass with no further growth. The final gate isolates its
+supervisor session; report the interruption and subsequent counts explicitly.
+A later semantic-test fix scopes cancellation to the pending definition request
+ID while retaining successful navigation; leaving the file may cancel background
+highlights. These are test/validation changes; measured production sources stay
+unchanged.
+
+The final isolated gate (ci-local-13.log) passes in 228.554 seconds, collects 821
+orphans without forced cleanup and retains the same 767 PID-1 zombies. Its
+Python suite includes the corrected collector definition. The Diff TUI closed
+Markdown-view test now waits for its cancelled worker to unwind within the
+existing bound and still requires weak ownership to disappear. Final reports
+distinguish all failed/interrupted attempts from this passing gate.
+
+## Code branch picker and workflow audit — 2026-11-10
+
+The [audit report](research/code-branch-picker-audit.md) records the complete local
+gate, native GUI/TUI replays, source/executable hashes and raw evidence under
+`perf-results/app-audit/`. Final runtime files and both rebuilt Code binaries
+match the validated `d7b5566` source/binaries exactly after reverting an experiment.
+All builds use normal Cargo profiles; the TUI is built separately from GUI features.
+
+| Experiment | Result / decision |
+| --- | --- |
+| Reuse branch metadata and remove per-worktree status scans from navigation inventory | Three alternating pairs, 1,000 generated local refs, three worktrees and 2,000 untracked files: usable choices 20.635 → 1.407 ms, pooled p95 27.019 → 2.025 ms. Six checked 20.002–20.073 second runs preserve files/refs/HEADs and restore the terminal. First bytes 0.727 → 1.354 ms now include actual cached choices rather than the loading placeholder. |
+| Ordinary editor preservation, six pairs including reversed starting order | GUI ordinary first-XDamage feedback has a +0.646 ms paired median with mixed signs and lower pooled p95; sustained GUI editing has mixed signs. TUI ordinary/sustained paired medians rise about 0.038/0.050 ms with overlapping repeated ranges. No ordinary editing speedup or exact preservation claim; the user accepted the measured tradeoff on 2026-11-10. |
+| Box the optional cold cache | Measured Session 16,312 → 16,152 bytes; State/Input/BranchesView unchanged. Nine balanced baseline/inline/boxed TUI trials pass. Box versus inline ordinary feedback is mixed/nearly equal; sustained feedback is higher in all three pairs. Reverted. Lower RSS mode does not establish an 8 MiB saving from a 160-byte layout change. Initial baseline ordinary timings overlap metadata hashing; direct inline/Box comparisons and stress do not. |
+| Remove interleaved Saves in a separate GUI diagnostic | Six processes pass outside-timing exact Save/Undo-Save checks. Ordinary 22.666 → 22.213 ms and sustained 21.853 → 21.849 ms have mixed paired signs; the original upward tendency is not reproduced. Supports a Save/repaint confound hypothesis, not a proven cause. Weaker per-cycle buffer oracle and separate metric version are explicit; do not pool with full-Save samples. |
+| Filtering and offscreen-row proposals | Empty-query folding and viewport-formatting drafts remain unapplied. No optimization benefit is claimed from uncompiled proposals. |
+
+The audit fixes scratch focus/origin/filtering/number exhaustion, a deterministic
+own-Save versus late-refresh race, missing Code native Quit wiring, native close
+vetoes/hidden terminal questions and a pending-close repaint/resize feedback loop.
+Final CI passes 2,980 workspace/serial and 941 adapter results across overlapping
+invocations, plus 86 Python tests with one skip. Owned Linux light/dark/narrow
+replays and four X11 close-consent scenarios pass. Actual AppKit/macOS delivery,
+physical presentation, live provider campaigns and indefinite leak freedom remain
+unverified. Existing Vim/installer gate failures whose exact cause could not be
+reproduced retain stronger diagnostics; the report distinguishes them from
+confirmed runtime defects and passing final validation.

@@ -34,6 +34,10 @@ mod scrollbar;
 mod problems;
 #[path = "input_tests/project_syntax.rs"]
 mod project_syntax;
+#[path = "input_tests/archive.rs"]
+mod archive;
+#[path = "input_tests/branch_picker.rs"]
+mod branch_picker;
 use crossterm::event::{KeyEvent, KeyModifiers};
 use lenz_content::theme::{ThemeOverrides, ThemePaths};
 use std::{
@@ -66,6 +70,60 @@ fn app(dir: &Path) -> App {
 
 fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.handle(Event::Key(KeyEvent::new(code, modifiers)));
+}
+
+#[test]
+fn open_prompt_keeps_exact_path_whitespace_and_first_pasted_line() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["file", "file ", " file", " "] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let mut a = app(dir.path());
+    for name in ["file ", " file", " "] {
+        a.run(CommandId::Open);
+        key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.modal.as_ref().is_some_and(|m| m.error.is_some()));
+        a.handle(Event::Paste(format!("{name}\nignored")));
+        assert_eq!(a.modal.as_ref().unwrap().input, name);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        let target = dir.path().join(name);
+        settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == target));
+        let source = a.session.state().current_source().unwrap();
+        assert_eq!(source.copy_range(0..source.len_bytes()).unwrap(), name);
+    }
+    assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), b"file");
+}
+
+#[test]
+fn alt_home_and_end_jump_picker_rows_without_editing_query() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a_item.txt", "b_item.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let mut a = app(dir.path());
+    settle(&mut a, |a| a.session.state().project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    a.handle(Event::Paste("item".into()));
+    navigation_ready(&mut a);
+    assert_eq!(a.session.state().navigation().unwrap().rows.len(), 2);
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::End, KeyModifiers::ALT);
+    assert_eq!(a.modal.as_ref().unwrap().at, 1);
+    assert_eq!(a.modal.as_ref().unwrap().input, "item");
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == dir.path().join("b_item.txt")));
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    a.handle(Event::Paste("item".into()));
+    navigation_ready(&mut a);
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::ALT);
+    assert_eq!(a.modal.as_ref().unwrap().at, 0);
+    assert_eq!(a.modal.as_ref().unwrap().input, "item");
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == dir.path().join("a_item.txt")));
 }
 pub(crate) fn settle(app: &mut App, done: impl Fn(&App) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -979,10 +1037,15 @@ fn server_status_reports_missing_setup_and_offers_restart_or_enable_without_touc
         .layout
         .controls
         .iter()
-        .find(|(id, _)| *id == CommandId::LanguageServer)
+        .find(|(id, _)| *id == CommandId::InstallServer)
         .unwrap()
         .1;
     click(&mut a, control.x, control.y);
+    assert!(matches!(a.modal.as_ref().unwrap().kind, Prompt::Details { kind: Details::Install, .. }));
+    assert!(!a.session.state().server_install().unwrap().running);
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::NONE);
     assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::LanguageServer);
     draw(&mut a, 100, 26);
     assert_eq!(a.choices().len(), 10);
@@ -2365,6 +2428,7 @@ fn server_runtime_dialog_validates_saves_and_preserves_the_document() {
     key(&mut a, KeyCode::Char('a'), KeyModifiers::CONTROL);
     let selected = a.session.state().selection();
     key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::NONE);
     let at = a
         .choices()
         .iter()
@@ -2464,15 +2528,15 @@ fn navigation_shortcuts_cycle_scopes_and_keep_modal_input_isolated() {
     }
     key(&mut a, KeyCode::Char('k'), KeyModifiers::CONTROL);
     a.handle(Event::Paste("α界\nquery".into()));
-    assert_eq!(a.modal.as_ref().unwrap().input, "α界query");
+    assert_eq!(a.modal.as_ref().unwrap().input, "α界");
     key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::Files);
     key(&mut a, KeyCode::BackTab, KeyModifiers::SHIFT);
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::All);
-    assert_eq!(a.session.state().navigation().unwrap().query, "α界query");
+    assert_eq!(a.session.state().navigation().unwrap().query, "α界");
     key(&mut a, KeyCode::Char('s'), KeyModifiers::CONTROL);
     key(&mut a, KeyCode::Backspace, KeyModifiers::NONE);
-    assert_eq!(a.modal.as_ref().unwrap().input, "α界quer");
+    assert_eq!(a.modal.as_ref().unwrap().input, "α");
     assert_eq!(a.session.state().selection(), selection);
     assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
@@ -2775,7 +2839,7 @@ fn navigation_enhanced_keyboard_repeats_move_caret_and_modal_selection() {
 }
 
 #[test]
-fn navigation_scope_shortcuts_preserve_query_inside_modal_and_plain_ctrl_a_clears() {
+fn navigation_scope_shortcuts_preserve_query_and_ctrl_a_selects_before_delete() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = app(dir.path());
     a.run(CommandId::SearchEverywhere);
@@ -2802,6 +2866,8 @@ fn navigation_scope_shortcuts_preserve_query_inside_modal_and_plain_ctrl_a_clear
         assert_eq!(search.query, "α界 typed query");
     }
     key(&mut a, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert!(App::field_cursor(a.modal.as_ref().unwrap()).all_selected(&a.modal.as_ref().unwrap().input));
+    key(&mut a, KeyCode::Backspace, KeyModifiers::NONE);
     assert!(a.modal.as_ref().unwrap().input.is_empty());
     assert!(a.session.state().navigation().unwrap().query.is_empty());
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::All);
@@ -3135,14 +3201,14 @@ fn recent_popup_fuzzy_filters_forgets_and_opens_scrolled_paths_at_saved_caret() 
             .detail
             .contains("folder-3")
     );
-    key(&mut a, KeyCode::Delete, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(6), KeyModifiers::NONE);
     assert_eq!(
         a.session.state().navigation().unwrap().rows.len(),
         1,
         "Delete must reject a stale displayed revision"
     );
     draw(&mut a, 40, 10);
-    key(&mut a, KeyCode::Delete, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(6), KeyModifiers::NONE);
     navigation_ready(&mut a);
     assert!(a.session.state().navigation().unwrap().rows.is_empty());
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
@@ -3479,6 +3545,39 @@ fn about_opens_from_the_application_menu_with_its_logo_and_closes_to_the_documen
     assert!(a.session.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap() == "first\n"));
 }
 
+#[test]
+fn inline_blame_shows_the_caret_lines_commit_faintly_after_its_end() {
+    use lenz_content::git::testing::{commit_all, repo, write};
+    let r = repo();
+    write(r.path(), "a.txt", "one\ntwo\n");
+    commit_all(r.path(), "First line");
+    let mut a = app(r.path());
+    a.dispatch(Command::Open(r.path().join("a.txt")));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "off by default");
+    // The command list reaches the setting.
+    key(&mut a, KeyCode::Char(':'), KeyModifiers::NONE);
+    for c in "inline blame".chars() { key(&mut a, KeyCode::Char(c), KeyModifiers::NONE); }
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(a.session.state().inline_blame(), "on");
+    let tab = a.session.state().active().unwrap().id();
+    settle(&mut a, |a| a.session.state().caret_blame(tab).is_some());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<(u16, String)> = (0..20).map(|y| (y, (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())).filter(|(_, row)| row.contains(" • First line")).collect();
+    assert_eq!(rows.len(), 1, "only the caret line");
+    let (y, row) = &rows[0];
+    assert!(row.contains("two  t, "), "two cells after the line's end: {row}");
+    let x = (3..100u16).find(|&x| ["o", " ", " ", "t"].iter().enumerate().all(|(i, s)| buffer[(x - 3 + i as u16, *y)].symbol() == *s)).unwrap();
+    assert_eq!(buffer[(x, *y)].fg, crate::render::color(a.session.state().palette().dim), "faint");
+    assert_eq!(a.session.state().active().unwrap().annotation_cols(), 0, "no annotation column");
+    key(&mut a, KeyCode::Right, KeyModifiers::SHIFT);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "not over a selection");
+    assert_eq!(std::fs::read(r.path().join("a.txt")).unwrap(), b"one\ntwo\n");
+}
+
 /// An app on a git repository with `a.txt` (two lines) committed as "First line", annotated with Alt+B.
 fn annotated_app() -> (tempfile::TempDir, App, String) {
     use lenz_content::git::testing::{commit_all, git, repo, write};
@@ -3705,12 +3804,12 @@ fn a_rows_menu_makes_a_branch_and_the_revision_prompt_checks_out() {
     let (r, _wt, mut a) = branches_app();
     open_popup(&mut a);
     typed(&mut a, "v1");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     assert!(matches!(prompt_kind(&a), Some(Prompt::BranchMenu { .. })));
     assert_eq!(a.choices().into_iter().map(|c| c.label).collect::<Vec<_>>(), ["Checkout", "New Branch from Here…", "Compare with Working Tree"]);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!((prompt_kind(&a), a.modal.as_ref().unwrap().input.as_str()), (Some(Prompt::Branches), "v1"), "back to the list");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(prompt_kind(&a), Some(Prompt::NewBranch { from: Some("refs/tags/v1".into()), checkout: true }));
@@ -3795,7 +3894,7 @@ fn a_worktree_opens_here_or_in_a_new_view_and_a_tiny_terminal_copes() {
     draw(&mut a, 100, 20);
     a.modal.as_mut().unwrap().input = "second".into();
     a.modal.as_mut().unwrap().at = 0;
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert!(a.new_view);
@@ -3810,8 +3909,8 @@ fn a_worktree_opens_here_or_in_a_new_view_and_a_tiny_terminal_copes() {
 fn enter_on_the_current_branch_or_worktree_does_nothing_and_keeps_the_popup() {
     let (_r, _wt, mut a) = branches_app();
     open_popup(&mut a);
-    for current in ["● main", "Worktrees"] {
-        let at = a.choices().iter().position(|c| c.label.contains(current) && c.label.contains("●")).unwrap();
+    for current in ["Local", "Worktrees"] {
+        let at = a.choices().iter().position(|c| c.section == Some(current) && c.label.contains("●")).unwrap();
         a.modal.as_mut().unwrap().at = at;
         key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!a.session.state().checking_out(), "{current}: no checkout");
@@ -3883,7 +3982,7 @@ fn rows_compare_and_compare_with_worktree_lists_the_other_worktree() {
     let _bin = lenz_diff_beside(&mut a);
     open_popup(&mut a);
     typed(&mut a, "other");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     assert_eq!(a.choices().into_iter().map(|c| c.label).collect::<Vec<_>>(), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here"]);
     for _ in 0..3 { key(&mut a, KeyCode::Down, KeyModifiers::NONE); }
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
@@ -4701,4 +4800,43 @@ fn the_pointer_is_text_over_pane_text_only() {
     assert!(moved(&mut a, text.x + 2, text.y));
     a.handle(Event::Key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)));
     assert!(!moved(&mut a, text.x + 2, text.y), "under a dialog");
+}
+
+#[test]
+fn popup_fields_edit_ranges_and_preserve_document_and_both_carets() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("original.txt");std::fs::write(&path,"original\n").unwrap();
+    let mut a=app(dir.path());a.dispatch(Command::OpenRetained(path.clone()));settle(&mut a,|a|a.session.state().current_source().is_some());
+    let tab=a.session.state().active().unwrap().id();a.prompt(Prompt::SaveAs(tab));a.modal.as_mut().unwrap().input="one é👩🏽‍💻 two".into();a.modal.as_mut().unwrap().selected=false;
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::CONTROL);key(&mut a,KeyCode::Right,KeyModifiers::NONE);
+    for _ in 0..2 {key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);}
+    assert_eq!(App::field_cursor(a.modal.as_ref().unwrap()).selected(&a.modal.as_ref().unwrap().input),Some("é👩🏽‍💻"));
+    key(&mut a,KeyCode::Char('x'),KeyModifiers::CONTROL);assert_eq!(a.modal.as_ref().unwrap().input,"one  two");assert_eq!(a.copy.as_deref(),Some("é👩🏽‍💻"));
+    a.handle(Event::Paste("é👩🏽‍💻".into()));assert_eq!(a.modal.as_ref().unwrap().input,"one é👩🏽‍💻 two");
+    for (w,h) in [(80,24),(24,8),(5,3)] {draw(&mut a,w,h);}
+    key(&mut a,KeyCode::Char('s'),KeyModifiers::CONTROL);key(&mut a,KeyCode::Char('z'),KeyModifiers::CONTROL);key(&mut a,KeyCode::Esc,KeyModifiers::NONE);
+    assert_eq!(std::fs::read(&path).unwrap(),b"original\n");
+    let source=a.session.state().current_source().unwrap();assert_eq!(source.copy_range(0..source.len_bytes()).unwrap(),"original\n");
+    a.prompt(Prompt::Search);a.modal.as_mut().unwrap().input="first".into();a.modal.as_mut().unwrap().secondary="*.rs".into();a.modal.as_mut().unwrap().selected=false;
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);key(&mut a,KeyCode::Tab,KeyModifiers::NONE);
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);key(&mut a,KeyCode::BackTab,KeyModifiers::SHIFT);
+    assert_eq!(App::field_cursor(a.modal.as_ref().unwrap()).selected(&a.modal.as_ref().unwrap().input),Some("f"));
+}
+
+#[path = "input_tests/workspace_edit.rs"]
+mod workspace_edit;
+
+/// Cmd+Backspace as terminals send it: with Cmd reported (kitty protocol) it deletes the line everywhere; as Ctrl+U
+/// (macOS terminals) only on macOS, where Ctrl+U in the text means it. Elsewhere Ctrl+U leaves the text alone.
+#[test]
+fn cmd_backspace_deletes_the_line_as_the_terminal_sends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rb");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let mut a = app(dir.path()); a.dispatch(Command::OpenRetained(path.clone())); settle(&mut a, |a| a.session.state().current_source().is_some()); a.enable_draft_input_for_test(); draw(&mut a, 80, 16);
+    let text = |a: &App| { let s = a.session.state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    key(&mut a, KeyCode::Backspace, KeyModifiers::SUPER);
+    assert_eq!(text(&a), "two\nthree\n");
+    key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    assert_eq!(text(&a), if crate::app::CMD_BACKSPACE_IS_CTRL_U { "three\n" } else { "two\nthree\n" });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
 }

@@ -3,6 +3,7 @@ mod blank_line_completion;
 mod enter_indent;
 mod json;
 mod vim;
+mod setup_and_feedback;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use gpui::{AppContext, TestAppContext, VisualTestContext};
@@ -193,6 +194,156 @@ fn several_cursors_replay_the_same_text_and_selections_in_both_adapters(cx: &mut
     assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
 }
 
+/// Search Everywhere's query edits at its caret in both adapters: arrows by character, Alt (Option) or Ctrl by word,
+/// Backspace and Delete by character or with Alt or Ctrl by word.
+#[gpui::test]
+fn search_everywhere_edits_its_query_at_the_caret_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(path.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().current_source().is_none()) || tui.session.state().current_source().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let query = |s: &Session| s.state().navigation().map(|n| n.query.clone());
+    let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+    visual.simulate_keystrokes("ctrl-k");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('k'), ctrl)));
+    for c in "sketch pad".chars() {
+        visual.simulate_keystrokes(if c == ' ' { "space".to_string() } else { c.to_string() }.as_str());
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none)));
+    }
+    for (gui_key, code, modifiers, expected) in [
+        ("left", KeyCode::Left, none, "sketch pad"),
+        ("left", KeyCode::Left, none, "sketch pad"),
+        ("x", KeyCode::Char('x'), none, "sketch pxad"),
+        ("alt-left", KeyCode::Left, alt, "sketch pxad"),
+        ("_", KeyCode::Char('_'), none, "sketch _pxad"),
+        ("ctrl-left", KeyCode::Left, ctrl, "sketch _pxad"),
+        ("ctrl-left", KeyCode::Left, ctrl, "sketch _pxad"),
+        ("delete", KeyCode::Delete, none, "ketch _pxad"),
+        ("alt-right", KeyCode::Right, alt, "ketch _pxad"),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "ketch"),
+        ("backspace", KeyCode::Backspace, none, "ketc"),
+        ("left", KeyCode::Left, none, "ketc"),
+        ("alt-backspace", KeyCode::Backspace, alt, "c"),
+        ("ctrl-backspace", KeyCode::Backspace, ctrl, "c"),
+        ("right", KeyCode::Right, none, "c"),
+        ("ctrl-backspace", KeyCode::Backspace, ctrl, ""),
+    ] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+        assert_eq!(query(&tui.session).as_deref(), Some(expected), "{gui_key}");
+        assert_eq!(gui.read_with(&visual, |view, _| query(view.session())), query(&tui.session), "{gui_key}");
+    }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('a'), none)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('b'), none)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, none)));
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    let (cursor, row) = (terminal.get_cursor_position().unwrap(), terminal.backend().buffer().content().chunks(100).map(|r| r.iter().map(|c| c.symbol()).collect::<String>()).find(|r| r.contains("› ab")).expect("the query row"));
+    assert_eq!(cursor.x as usize, row[..row.find("› ab").unwrap()].chars().count() + 3, "the terminal cursor sits between a and b");
+    assert_eq!(std::fs::read(path).unwrap(), b"fn main() {}\n");
+}
+
+/// Search in Project's two fields edit at their caret in both adapters: arrows by character, Alt (Option) or Ctrl by
+/// word, Home/End to the ends; Backspace and Delete by character or with Alt or Ctrl by word; Ctrl+A selects the field.
+#[gpui::test]
+fn search_in_project_edits_its_fields_at_the_caret_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("main.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(project.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(project.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let tui_fields = |tui: &App| tui.modal.as_ref().filter(|m| m.kind == crate::app::Prompt::Search).map(|m| {
+        let field = if m.secondary_focus { &m.secondary } else { &m.input };
+        (m.input.clone(), m.secondary.clone(), m.caret.map_or(field.len(), |c| code_core::line_edit::clamp(field, c)))
+    });
+    let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+    // Search in Project needs the folder's file list.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().project().is_none()) || tui.session.state().project().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    visual.simulate_keystrokes("ctrl-shift-f");
+    tui.run(CommandId::SearchProject);
+    for c in "draft notes".chars() {
+        visual.simulate_keystrokes(if c == ' ' { "space".to_string() } else { c.to_string() }.as_str());
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none)));
+    }
+    for (gui_key, code, modifiers, query, files, caret) in [
+        ("left", KeyCode::Left, none, "draft notes", "", 10),
+        ("left", KeyCode::Left, none, "draft notes", "", 9),
+        ("x", KeyCode::Char('x'), none, "draft notxes", "", 10),
+        ("alt-left", KeyCode::Left, alt, "draft notxes", "", 6),
+        ("_", KeyCode::Char('_'), none, "draft _notxes", "", 7),
+        ("ctrl-left", KeyCode::Left, ctrl, "draft _notxes", "", 6),
+        ("ctrl-left", KeyCode::Left, ctrl, "draft _notxes", "", 0),
+        ("end", KeyCode::End, none, "draft _notxes", "", 13),
+        ("home", KeyCode::Home, none, "draft _notxes", "", 0),
+        ("delete", KeyCode::Delete, none, "raft _notxes", "", 0),
+        ("alt-right", KeyCode::Right, alt, "raft _notxes", "", 4),
+        ("ctrl-delete", KeyCode::Delete, ctrl, "raft", "", 4),
+        ("backspace", KeyCode::Backspace, none, "raf", "", 3),
+        ("left", KeyCode::Left, none, "raf", "", 2),
+        ("alt-backspace", KeyCode::Backspace, alt, "f", "", 0),
+        ("tab", KeyCode::Tab, none, "f", "", 0),
+        ("*", KeyCode::Char('*'), none, "f", "*", 1),
+        (".", KeyCode::Char('.'), none, "f", "*.", 2),
+        ("r", KeyCode::Char('r'), none, "f", "*.r", 3),
+        ("left", KeyCode::Left, none, "f", "*.r", 2),
+        ("x", KeyCode::Char('x'), none, "f", "*.xr", 3),
+        ("ctrl-a", KeyCode::Char('a'), ctrl, "f", "*.xr", 4),
+        ("left", KeyCode::Left, none, "f", "*.xr", 0),
+        ("ctrl-a", KeyCode::Char('a'), ctrl, "f", "*.xr", 4),
+        ("backspace", KeyCode::Backspace, none, "f", "", 0),
+    ] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+        let expected = Some((query.to_string(), files.to_string(), caret));
+        assert_eq!(tui_fields(&tui), expected, "TUI {gui_key}");
+        assert_eq!(gui.read_with(&visual, |view, _| view.search_fields_for_test()), expected, "GUI {gui_key}");
+    }
+    // The terminal cursor sits at the caret: between `a` and `b`.
+    for c in "ab".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), none))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, none)));
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!((buffer[(cursor.x - 1, cursor.y)].symbol(), buffer[(cursor.x, cursor.y)].symbol()), ("a", "b"));
+    let query=format!("START_{}TAIL", "abcdefghijklmnopqrstuvwxyz_".repeat(5));
+    visual.simulate_keystrokes("ctrl-a");
+    visual.update(|_,cx|cx.write_to_clipboard(gpui::ClipboardItem::new_string(query.clone())));
+    visual.simulate_keystrokes("ctrl-v home");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('a'),ctrl)));
+    tui.handle(Event::Paste(query));tui.handle(Event::Key(KeyEvent::new(KeyCode::Home,none)));
+    for c in "INSERTED_".chars(){visual.simulate_keystrokes(&c.to_string());tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c),none)));}
+    terminal.draw(|frame|tui.draw(frame)).unwrap();
+    let shown=terminal.backend().buffer().content.iter().map(|c|c.symbol()).collect::<String>();
+    assert!(shown.contains("INSERTED_START_"),"{shown}");
+    assert_eq!(tui_fields(&tui),gui.read_with(&visual,|view,_|view.search_fields_for_test()));
+    assert_eq!(std::fs::read(path).unwrap(), b"fn main() {}\n");
+}
+
 /// IntelliJ's word and document motions: Ctrl+arrows by word, Shift selects, Home toggles the indent, Ctrl+Up/Down scroll.
 #[gpui::test]
 fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut TestAppContext) {
@@ -254,6 +405,53 @@ fn word_and_document_motions_select_the_same_text_in_both_adapters(cx: &mut Test
         assert_eq!(snapshot(tui.session.state()).text.as_deref(), Some(text), "{gui_key}");
         assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
     }
+    assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+}
+
+/// macOS Word Motion: off (the default), Option+Left/Right stay Back/Forward; on, they move by word in both adapters,
+/// spaces going with the word.
+#[gpui::test]
+fn mac_word_motion_moves_by_word_with_option_arrows_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("words.txt");
+    let original = "    let foo = 1;\nend\n";
+    std::fs::write(&path, original).unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(path.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gui.read_with(&visual, |view, _| view.session().state().current_source().is_none()) || tui.session.state().current_source().is_none() {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(done) = tui.session.completions().try_recv() { tui.apply(done); }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    visual.update(|window, cx| { let _ = window.draw(cx); });
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    gui.update(&mut visual, |view, _| view.set_mac_keys_for_test(true));
+    tui.mac_keys = true;
+    let caret = |head| Some(code_core::session::Selection { anchor: head, head });
+    visual.simulate_keystrokes("ctrl-home alt-right");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), caret(0), "off: Option+Right is Forward");
+    assert_eq!(tui.session.state().selection(), caret(0), "off: Alt+Right is Forward");
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetMacWordMotion(true), cx));
+    tui.dispatch(Command::SetMacWordMotion(true));
+    for (gui_key, code, head) in [("alt-right", KeyCode::Right, 7), ("alt-right", KeyCode::Right, 11), ("alt-left", KeyCode::Left, 8), ("alt-left", KeyCode::Left, 4)] {
+        visual.simulate_keystrokes(gui_key);
+        tui.handle(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)));
+        assert_eq!(tui.session.state().selection(), caret(head), "{gui_key}");
+        assert_eq!(snapshot(tui.session.state()), gui.read_with(&visual, |view, _| snapshot(view.session().state())), "{gui_key}");
+    }
+    visual.simulate_keystrokes("alt-shift-right");
+    assert_eq!(gui.read_with(&visual, |view, _| view.session().state().selection()), Some(code_core::session::Selection { anchor: 4, head: 7 }), "Option+Shift selects by word");
     assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
 }
 
@@ -355,6 +553,217 @@ fn project_declaration_search_reads_shifted_drafts_and_refuses_stale_activation_
 #[gpui::test]
 fn project_name_navigation_reads_shifted_drafts_and_refuses_stale_disk_symbols_in_both_adapters(cx: &mut TestAppContext) {
     replay_draft_project_query(cx, DraftQuery::Names);
+}
+
+/// New Scratch File's kinds show their file-type icons in both adapters while File Icons is on: the GUI paints one per
+/// row, the terminal puts the Nerd Font glyph before each label; typing filters the icons with their rows, and Enter
+/// still creates the next `scratch_N.EXT`.
+#[gpui::test]
+fn new_scratch_file_kinds_show_their_icons_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), None, cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(700.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), None);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 44)).unwrap();
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetFileIcons(true), cx));
+    tui.dispatch(Command::SetFileIcons(true));
+    tui.icons_override = Some(true);
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    visual.update(|window, cx| gui.update(cx, |view, cx| view.run(CommandId::NewScratch, window, cx)));
+    tui.run(CommandId::NewScratch);
+    draw(&mut visual, &mut tui, &mut terminal);
+    let glyph = |ext: &str| lenz_content::file_icons::file(&format!("scratch.{ext}")).glyph;
+    let expected: Vec<char> = code_core::scratch::matching("").into_iter().map(|i| glyph(code_core::scratch::KINDS[i].extension)).collect();
+    assert_eq!(gui.read_with(&visual, |view, _| view.painted_modal_icons.clone()), expected, "one icon per GUI row");
+    let labels: Vec<String> = tui.choices().into_iter().map(|c| c.label).collect();
+    for (label, icon) in labels.iter().zip(&expected) { assert!(label.starts_with(*icon), "{label}"); }
+    let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(screen.contains(glyph("rb")) && screen.contains(glyph("json")), "{screen}");
+    // Typing filters the icons with their rows.
+    visual.simulate_keystrokes("r u b y");
+    tui.handle(Event::Paste("ruby".into()));
+    draw(&mut visual, &mut tui, &mut terminal);
+    assert_eq!(gui.read_with(&visual, |view, _| view.painted_modal_icons.clone()), [glyph("rb")]);
+    assert!(tui.choices().first().is_some_and(|c| c.label.starts_with(glyph("rb")) && c.label.ends_with("Ruby")));
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let made = |state: &State| state.current_source().is_some_and(|d| d.source().file_name().is_some_and(|n| n == "scratch_1.rb"));
+    while !(gui.read_with(&visual, |view, _| made(view.session().state())) && made(tui.session.state())) {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+        draw(&mut visual, &mut tui, &mut terminal);
+        assert!(Instant::now() < deadline, "scratch_1.rb did not open in both");
+        std::thread::yield_now();
+    }
+    // With File Icons off, neither shows them.
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetFileIcons(false), cx));
+    visual.update(|window, cx| gui.update(cx, |view, cx| view.run(CommandId::NewScratch, window, cx)));
+    draw(&mut visual, &mut tui, &mut terminal);
+    assert!(gui.read_with(&visual, |view, _| view.painted_modal_icons.is_empty()));
+}
+
+/// Delete Line (Cmd+Backspace where Cmd is reported, and the IntelliJ preset's Ctrl+Y), Enter's block indentation
+/// and Copy Reference replayed through both adapters' real keys and menus: the same text, carets and clipboard.
+#[gpui::test]
+fn delete_line_block_enter_and_copy_reference_alike_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join(".editorconfig"), "root = true\n[*]\nindent_style = space\nindent_size = 2\n").unwrap();
+    let path = root.join("lib/baz.rb");
+    let original = "module Foo\n  class Baz\n    def foo_method\n      one\n    end\n  end\nend\n";
+    std::fs::write(&path, original).unwrap();
+    let mut core = Session::new(config(&dir.path().join("gui")));
+    core.dispatch(Command::OpenRoot(root.clone()));
+    let gui = cx.new(|cx| ReaderView::new(core, Some(path.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(600.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    tui.session.dispatch(Command::Open(path.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx));
+            while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            draw(visual, tui, terminal);
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < deadline, "adapters did not settle: GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| snapshot(view.session().state())), snapshot(tui.session.state()));
+            std::thread::yield_now();
+        }
+    };
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|d| d.source() == path) && state.active().and_then(|t| state.view(t.id())).is_some_and(|v| v.declarations().is_some()));
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let key = |tui: &mut App, code, modifiers| { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); };
+    let check = |visual: &VisualTestContext, tui: &App, expected: &str| {
+        let state = snapshot(tui.session.state());
+        assert_eq!(state.text.as_deref(), Some(expected));
+        assert_eq!(state, gui.read_with(visual, |view, _| snapshot(view.session().state())));
+    };
+    let to_def_end = |visual: &mut VisualTestContext, tui: &mut App| {
+        visual.simulate_keystrokes("ctrl-home down down end");
+        for (code, modifiers) in [(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE)] { key(tui, code, modifiers); }
+    };
+    // Enter after `def foo_method` indents its body one step deeper, not at the `def` line's own indentation.
+    to_def_end(&mut visual, &mut tui);
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    let entered = "module Foo\n  class Baz\n    def foo_method\n      \n      one\n    end\n  end\nend\n";
+    check(&visual, &tui, entered);
+    // Cmd+Backspace deletes the caret's line; the caret keeps its column on the line below.
+    visual.simulate_keystrokes("cmd-backspace");
+    key(&mut tui, KeyCode::Backspace, KeyModifiers::SUPER);
+    check(&visual, &tui, original);
+    // Ctrl+Y (IntelliJ's Delete Line) takes the next one.
+    visual.simulate_keystrokes("ctrl-y");
+    key(&mut tui, KeyCode::Char('y'), KeyModifiers::CONTROL);
+    check(&visual, &tui, "module Foo\n  class Baz\n    def foo_method\n    end\n  end\nend\n");
+    for expected in [original, entered] {
+        visual.simulate_keystrokes("ctrl-z");
+        key(&mut tui, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        check(&visual, &tui, expected);
+    }
+    // Copy Reference on the method: Ctrl+Alt+Shift+C in the GUI (Cmd+Option+Shift+C on macOS), and the same chord
+    // or the menu row in the terminal.
+    to_def_end(&mut visual, &mut tui);
+    visual.simulate_keystrokes("ctrl-alt-shift-c");
+    assert_eq!(visual.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text())).as_deref(), Some("Foo::Baz#foo_method"));
+    key(&mut tui, KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+    assert_eq!(tui.copy.take().as_deref(), Some("Foo::Baz#foo_method"));
+    terminal.draw(|f| tui.draw(f)).unwrap();
+    let button = tui.layout.app_menu;
+    tui.handle(Event::Mouse(crossterm::event::MouseEvent { kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), column: button.x + 1, row: button.y, modifiers: KeyModifiers::NONE }));
+    for row in menu_path(&tui.session, CommandId::CopyReference) {
+        key(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        for _ in 0..row { key(&mut tui, KeyCode::Down, KeyModifiers::NONE); }
+        key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    }
+    assert_eq!(tui.copy.take().as_deref(), Some("Foo::Baz#foo_method"), "from the menu");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "nothing is saved");
+}
+
+/// Ignored files beside the project's files (`.env`, `.env.local`) are in the explorer, the file finder and Find in
+/// Files of both adapters; an ignored folder (`target/`) stays out of all three.
+#[gpui::test]
+fn ignored_env_files_show_in_the_explorer_finder_and_project_search_of_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let files = [(".gitignore", ".env\n.env.*\n!.env.example\ntarget/\n"), (".env", "TOKEN=envneedle\n"), (".env.local", "LOCAL=envneedle\n"), (".env.example", "TOKEN=\n"), ("target/out.rs", "// envneedle\n"), ("main.rs", "fn main() {}\n")];
+    for (name, text) in files {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1100.0), gpui::px(700.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+    let key = |tui: &mut App, code, modifiers| tui.handle(Event::Key(KeyEvent::new(code, modifiers)));
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx));
+            while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            draw(visual, tui, terminal);
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < deadline, "adapters did not settle: GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| snapshot(view.session().state())), snapshot(tui.session.state()));
+            std::thread::yield_now();
+        }
+    };
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.project().is_some_and(|project| matches!(project.coverage(), code_core::project::Coverage::Complete(_))));
+    let rows = |state: &State| state.project().unwrap().rows().iter().map(|row| row.path.to_string()).collect::<Vec<_>>();
+    assert_eq!(rows(tui.session.state()), [".env", ".env.example", ".env.local", ".gitignore", "main.rs"]);
+    assert_eq!(gui.read_with(&visual, |view, _| rows(view.session().state())), rows(tui.session.state()));
+    // The file finder (Ctrl+P) finds and opens the ignored file.
+    visual.simulate_keystrokes("ctrl-p");
+    visual.simulate_keystrokes(&".env.local".chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" "));
+    key(&mut tui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    tui.handle(Event::Paste(".env.local".into()));
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.navigation().is_some_and(|search| !search.pending && search.query == ".env.local" && !search.rows.is_empty()));
+    let shown: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(shown.contains(".env.local"), "{shown}");
+    let labels = gui.read_with(&visual, |view, _| view.modal_rows().into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n"));
+    assert!(labels.contains(".env.local"), "{labels}");
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|source| source.source() == root.join(".env.local")) && state.loading().is_none());
+    // Find in Files (Ctrl+Shift+F) reads both ignored files, not the ignored folder.
+    visual.simulate_keystrokes("ctrl-shift-f");
+    key(&mut tui, KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    for _ in 0..12 { visual.simulate_keystrokes("backspace"); key(&mut tui, KeyCode::Backspace, KeyModifiers::NONE); }
+    visual.simulate_keystrokes(&"envneedle".chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" "));
+    tui.handle(Event::Paste("envneedle".into()));
+    visual.simulate_keystrokes("enter");
+    key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.results().is_some_and(|results| results.done() && results.query() == "envneedle"));
+    let hits = |state: &State| { let mut paths: Vec<_> = state.results().unwrap().hits().iter().map(|hit| hit.path.to_string()).collect(); paths.sort(); paths };
+    assert_eq!(hits(tui.session.state()), [".env", ".env.local"]);
+    assert_eq!(gui.read_with(&visual, |view, _| hits(view.session().state())), hits(tui.session.state()));
+    for (name, text) in files { assert_eq!(std::fs::read_to_string(root.join(name)).unwrap(), text, "{name} unchanged"); }
 }
 
 enum DraftQuery { Text, Declarations, Names }
@@ -707,8 +1116,8 @@ fn gui_and_terminal_project_lsp_actions_save_and_reset_the_same_scope(cx: &mut T
         };
         settle(&mut visual, &mut tui, false, true);
         // Both adapters open the same frozen report from the first F2 action, then copy it after scrolling.
-        visual.simulate_keystrokes("f2 enter");
-        key(&mut tui, KeyCode::F(2)); key(&mut tui, KeyCode::Enter);
+        visual.simulate_keystrokes("f2 home enter");
+        key(&mut tui, KeyCode::F(2)); key(&mut tui, KeyCode::Home); key(&mut tui, KeyCode::Enter);
         for (width, height) in [(26, 8), (1, 1), (80, 24)] {
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| tui.draw(f)).unwrap();
@@ -1158,8 +1567,9 @@ fn gui_and_tui_server_runtime_repairs_produce_the_same_settings(cx: &mut TestApp
             );
         };
         settle(&mut visual, &mut tui, false);
-        visual.simulate_keystrokes("f2");
+        visual.simulate_keystrokes("f2 home");
         key(&mut tui, KeyCode::F(2));
+        key(&mut tui, KeyCode::Home);
         let at = tui
             .session
             .language_server_rows()
@@ -1560,8 +1970,8 @@ fn unified_name_search_replays_files_symbols_actions_caret_and_recents_in_both_a
         "other.txt"
     );
     terminal.draw(|f| tui.draw(f)).unwrap();
-    visual.simulate_keystrokes("delete");
-    key(&mut tui, KeyCode::Delete, KeyModifiers::NONE);
+    visual.simulate_keystrokes("f6");
+    key(&mut tui, KeyCode::F(6), KeyModifiers::NONE);
     settle(&mut visual, &mut tui);
     assert!(tui.session.state().navigation().unwrap().rows.is_empty());
     visual.simulate_keystrokes("escape ctrl-e");
@@ -1928,9 +2338,9 @@ fn gui_and_terminal_git_comparisons_start_the_same_lenz_diff(cx: &mut TestAppCon
     visual.simulate_keystrokes("ctrl-shift-`");
     tui.run(CommandId::GitBranches);
     settle(&mut visual, &mut tui, &|s| s.state().branches().is_some_and(|b| !b.loading));
-    visual.simulate_keystrokes("v 1 right down down enter");
+    visual.simulate_keystrokes("v 1 alt-enter down down enter");
     for c in "v1".chars() { key(&mut tui, KeyCode::Char(c), KeyModifiers::NONE); }
-    key(&mut tui, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut tui, KeyCode::Enter, KeyModifiers::ALT);
     for _ in 0..2 { key(&mut tui, KeyCode::Down, KeyModifiers::NONE); }
     key(&mut tui, KeyCode::Enter, KeyModifiers::NONE);
     let tag = tui_args(&mut tui);
@@ -2460,6 +2870,78 @@ fn problems_and_quick_fixes_show_navigate_and_apply_alike_in_both_adapters(cx: &
     assert!(!root.join("src/other.rs").exists());
 }
 
+/// Enter after a Ruby block opener in both adapters, the fake answering on-type formatting as Ruby LSP does: the body
+/// line is indented at once, the server's `end` follows as its own Undo step with the caret on the body line, and a
+/// block that already has its `end` gets no second one. The same draft and caret in both; the file untouched.
+#[gpui::test]
+fn enter_takes_the_language_servers_end_once_alike_in_both_adapters(cx: &mut TestAppContext) {
+    let profile = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_owned();
+    assert!(std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-q", "--locked", "-p", "code-core", "--example", "fake_lsp"])
+        .current_dir(env!("CARGO_MANIFEST_DIR")).status().unwrap().success());
+    let fake = profile.join("examples/fake_lsp");
+    let text = "class A\n  def go\nend\n\ndef done\nend\nsyntax_error(\n";
+    let dir = tempfile::tempdir().unwrap();
+    let make = |name: &str| {
+        let root = dir.path().join(name).join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Gemfile"), "").unwrap();
+        std::fs::write(root.join(".editorconfig"), "root = true\n[*]\nindent_style = space\nindent_size = 2\n").unwrap();
+        std::fs::write(root.join("a.rb"), text).unwrap();
+        let c = config(&dir.path().join(name).join("config"));
+        let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&c.providers).unwrap()).unwrap();
+        settings["providers"]["ruby-lsp"] = serde_json::json!({"executable": fake, "env": {"FAKE_LSP_NO_DECOR": "1"}});
+        std::fs::write(&c.providers, settings.to_string()).unwrap();
+        (c, root)
+    };
+    let ((gc, groot), (tc, troot)) = (make("gui"), make("tui"));
+    let mut core = Session::new(gc); core.dispatch(Command::OpenRoot(groot.clone()));
+    let gui = cx.new(|cx| ReaderView::new(core, Some(groot.join("a.rb")), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle()); visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(tc, Some(troot.clone())); tui.session.dispatch(Command::Open(troot.join("a.rb")));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    let wait = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, done: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            gui.update(visual, |view, cx| view.poll(cx)); while let Ok(completion) = tui.session.completions().try_recv() { tui.apply(completion); }
+            visual.update(|window, cx| { let _ = window.draw(cx); }); terminal.draw(|frame| tui.draw(frame)).unwrap();
+            if gui.read_with(visual, |view, _| done(view.session().state())) && done(tui.session.state()) { break; }
+            assert!(Instant::now() < until, "GUI {:?}; TUI {:?}", gui.read_with(visual, |view, _| view.session().state().notices()), tui.session.state().notices());
+            std::thread::yield_now();
+        }
+    };
+    let ready = |state: &State| state.current_source().is_some_and(|d| d.source().ends_with("a.rb")) && state.provider().is_some_and(|p| p.status == code_core::semantics::Status::Ready);
+    wait(&mut visual, &mut tui, &mut terminal, &ready);
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let key = |tui: &mut App, code, modifiers| { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); };
+    let same = |visual: &VisualTestContext, tui: &App| {
+        let state = snapshot(tui.session.state());
+        assert_eq!(state, gui.read_with(visual, |view, _| snapshot(view.session().state())));
+        state.text.unwrap_or_default()
+    };
+    // After `def go`: the body line at once, then the server's `end`.
+    visual.simulate_keystrokes("ctrl-home down end enter");
+    for (code, modifiers) in [(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE)] { key(&mut tui, code, modifiers); }
+    let with_end = "class A\n  def go\n    \n  end\nend\n\ndef done\nend\nsyntax_error(\n";
+    wait(&mut visual, &mut tui, &mut terminal, &|state| state.current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).as_deref() == Some(with_end)));
+    assert_eq!(same(&visual, &tui), with_end);
+    assert_eq!(tui.session.state().selection().map(|s| s.range()), Some(21..21), "the caret stays on the body line");
+    // Ctrl+Z takes the `end` back on its own, then the line break.
+    visual.simulate_keystrokes("ctrl-z"); key(&mut tui, KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert_eq!(same(&visual, &tui), "class A\n  def go\n    \nend\n\ndef done\nend\nsyntax_error(\n");
+    // `def done` has its `end`: the fake (seeing `syntax_error(`) offers another, and neither adapter takes it.
+    visual.simulate_keystrokes("ctrl-g 6 enter end enter");
+    for (code, modifiers) in [(KeyCode::Char('g'), KeyModifiers::CONTROL), (KeyCode::Char('6'), KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE), (KeyCode::Enter, KeyModifiers::NONE)] { key(&mut tui, code, modifiers); }
+    let until = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < until { wait(&mut visual, &mut tui, &mut terminal, &|_| true); }
+    assert_eq!(same(&visual, &tui), "class A\n  def go\n    \nend\n\ndef done\n  \nend\nsyntax_error(\n");
+    assert_eq!(std::fs::read_to_string(groot.join("a.rb")).unwrap(), text);
+    assert_eq!(std::fs::read_to_string(troot.join("a.rb")).unwrap(), text);
+}
+
 /// Templates (ticket 57) through both adapters, the fake standing in for Ruby LSP and the HTML server: the problems of
 /// both views of an HTML ERB template drawn alike; a Ruby name typed into an output tag and a word of the markup each
 /// completed by the server of the view the caret is in (Enter), each one Ctrl+Z; the Ruby quick fix by Alt+Enter;
@@ -2893,7 +3375,7 @@ fn server_details_explain_missing_assistance_alike_and_hide_environment_values(c
     let Some(crate::app::Prompt::Details { body, .. }) = tui.modal.as_ref().map(|m| &m.kind) else { panic!("no terminal details") };
     let body = body.clone();
     let offered = shown.iter().find(|r| r.starts_with("Offered by rust-analyzer: ")).unwrap_or_else(|| panic!("{shown:?}"));
-    assert!(offered.contains("Not offered by this server: type hierarchy, formatting;"), "{offered}");
+    assert!(offered.contains("Not offered by this server: type hierarchy, formatting, symbol rename;"), "{offered}");
     assert!(body.contains(offered.as_str()), "both adapters show the same assistance row");
     let env_row = shown.iter().find(|r| r.starts_with("Environment set by provider settings: ")).unwrap_or_else(|| panic!("{shown:?}"));
     for name in ["FAKE_LSP_NO_DECOR", "FAKE_LSP_NO_FORMAT", "API_TOKEN"] { assert!(env_row.contains(name) && body.contains(name), "{env_row}"); }
@@ -6595,3 +7077,330 @@ fn open_find_and_type(tui: &mut App, text: &str) {
     tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)));
     for c in text.chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
 }
+
+/// Go to Definition within one file is a Back step in both adapters: Back (Cmd+[ in the GUI, Alt+Left in the terminal)
+/// returns to each place a definition was asked from, and Forward retraces the steps.
+#[gpui::test]
+fn back_returns_to_each_definition_asked_in_the_same_file_in_both_adapters(cx: &mut TestAppContext) {
+    use code_core::semantics::Status;
+    let profile = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_owned();
+    assert!(std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-q", "--locked", "-p", "code-core", "--example", "fake_lsp"])
+        .current_dir(env!("CARGO_MANIFEST_DIR")).status().unwrap().success());
+    let fake = profile.join("examples/fake_lsp");
+    let source = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let main = root.join("src/main.rs");
+    std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='hops'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(&main, source).unwrap();
+    let make = |name| {
+        let c = config(&dir.path().join(name));
+        let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&c.providers).unwrap()).unwrap();
+        settings["providers"]["rust-analyzer"] = serde_json::json!({"executable": fake});
+        std::fs::write(&c.providers, settings.to_string()).unwrap();
+        c
+    };
+    let gui = cx.new(|cx| ReaderView::new(Session::new(make("gui")), Some(main.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(make("tui"), Some(main.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until, "{:?}", tui.session.state().notices());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some() && s.provider().is_some_and(|p| p.status == Status::Ready));
+    // Editing on, as the reader's: Home goes to the line's first character in both.
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let caret = |s: &State| s.selection().map(|sel| sel.head);
+    let selected = |s: &State| s.selection().map(|sel| sel.range());
+    let first = source.find("fn first").unwrap() + 3;
+    let second = source.find("fn second").unwrap() + 3;
+    // Into `first();` on line 2, F12; then into `second();` in first's body, F12.
+    let mut clicks = Vec::new();
+    for (gui_keys, tui_keys, to) in [
+        ("ctrl-home down home right", vec![(KeyCode::Home, KeyModifiers::CONTROL), (KeyCode::Down, KeyModifiers::NONE), (KeyCode::Home, KeyModifiers::NONE), (KeyCode::Right, KeyModifiers::NONE)], first..first + 5),
+        ("down home right", vec![(KeyCode::Down, KeyModifiers::NONE), (KeyCode::Home, KeyModifiers::NONE), (KeyCode::Right, KeyModifiers::NONE)], second..second + 6),
+    ] {
+        visual.simulate_keystrokes(gui_keys);
+        for (code, modifiers) in tui_keys { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); }
+        let at = caret(tui.session.state());
+        assert_eq!(gui.read_with(&visual, |v, _| caret(v.session().state())), at);
+        clicks.push(at);
+        visual.simulate_keystrokes("f12");
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)));
+        settle(&mut visual, &mut tui, &|s| s.asking().is_none() && selected(s) == Some(to.clone()));
+    }
+    for expected in [clicks[1], clicks[0]] {
+        visual.simulate_keystrokes("cmd-[");
+        tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(caret(tui.session.state()), expected);
+        assert_eq!(gui.read_with(&visual, |v, _| caret(v.session().state())), expected);
+    }
+    visual.simulate_keystrokes("cmd-] cmd-]");
+    for _ in 0..2 { tui.handle(Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT))); }
+    assert_eq!(selected(tui.session.state()), Some(second..second + 6));
+    assert_eq!(gui.read_with(&visual, |v, _| selected(v.session().state())), Some(second..second + 6));
+    assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
+}
+
+/// A definition deep in nested modules lands below their sticky headers in both adapters: the same top line, with the
+/// definition's line under the band of pinned modules.
+#[gpui::test]
+fn a_definition_in_nested_modules_lands_below_the_sticky_headers_in_both_adapters(cx: &mut TestAppContext) {
+    use code_core::semantics::Status;
+    let profile = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_owned();
+    assert!(std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "-q", "--locked", "-p", "code-core", "--example", "fake_lsp"])
+        .current_dir(env!("CARGO_MANIFEST_DIR")).status().unwrap().success());
+    let fake = profile.join("examples/fake_lsp");
+    let filler = "                pub fn filler() {}\n".repeat(30);
+    let body = "                    let _ = 1;\n".repeat(12);
+    let source = format!("pub mod a {{\n    pub mod b {{\n        pub mod c {{\n            pub mod d {{\n{filler}                pub fn deep() {{\n{body}                }}\n            }}\n        }}\n    }}\n}}\nfn main() {{ a::b::c::d::deep(); }}\n");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let main = root.join("src/main.rs");
+    std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='hops'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(&main, &source).unwrap();
+    let make = |name| {
+        let c = config(&dir.path().join(name));
+        let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&c.providers).unwrap()).unwrap();
+        settings["providers"]["rust-analyzer"] = serde_json::json!({"executable": fake});
+        std::fs::write(&c.providers, settings.to_string()).unwrap();
+        c
+    };
+    let gui = cx.new(|cx| ReaderView::new(Session::new(make("gui")), Some(main.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(make("tui"), Some(main.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until, "{:?}", tui.session.state().notices());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some() && s.provider().is_some_and(|p| p.status == Status::Ready));
+    gui.update(&mut visual, |view, _| view.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    visual.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(400.0)));
+    visual.update(|w, cx| { let _ = w.draw(cx); });
+    terminal.draw(|frame| tui.draw(frame)).unwrap();
+    // The caret into `deep` on the last line, then F12.
+    visual.simulate_keystrokes("ctrl-end up end left left left left left");
+    for (code, modifiers) in [(KeyCode::End, KeyModifiers::CONTROL), (KeyCode::Up, KeyModifiers::NONE), (KeyCode::End, KeyModifiers::NONE)] { tui.handle(Event::Key(KeyEvent::new(code, modifiers))); }
+    for _ in 0..5 { tui.handle(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))); }
+    visual.simulate_keystrokes("f12");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)));
+    let def_line = 34;
+    settle(&mut visual, &mut tui, &|s| s.asking().is_none() && s.current_source().is_some_and(|d| s.selection().is_some_and(|sel| d.line_of(sel.head) == def_line))
+        && s.active().is_some_and(|t| s.view(t.id()).is_some_and(|v| v.declarations().is_some())));
+    for _ in 0..2 {
+        visual.update(|w, cx| { let _ = w.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+        settle(&mut visual, &mut tui, &|_| true);
+    }
+    let landed = |s: &State, rows: usize| {
+        let view = s.view(s.active().unwrap().id()).unwrap();
+        let code_core::layout::Query::Ready(sticky) = view.layout_sticky(code_core::tabs::sticky_cap(rows), None) else { panic!("sticky layout pending") };
+        (view.tab().top_line(), sticky.len())
+    };
+    let gui_rows = gui.read_with(&visual, |v, _| v.session().state().text_size(0).map_or(0, |(_, rows)| rows));
+    let tui_rows = tui.session.state().text_size(0).map_or(0, |(_, rows)| rows);
+    for (name, (top, band)) in [("GUI", gui.read_with(&visual, |v, _| landed(v.session().state(), gui_rows))), ("TUI", landed(tui.session.state(), tui_rows))] {
+        assert!(band > 0, "{name}: the modules around it are pinned");
+        assert!(def_line >= top + band, "{name}: `fn deep` (line {def_line}) is under {band} sticky header(s) from top line {top}");
+    }
+    assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
+}
+
+/// Always Select Opened File, turned on from each adapter's command list: the explorer selects each file that becomes
+/// active, its folders opened, in both; a hidden explorer stays hidden and still follows.
+#[gpui::test]
+fn always_select_opened_file_follows_the_active_file_in_both_explorers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    for file in ["src/ui/view.rs", "src/data/store.rs", "a.md"] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x\n").unwrap();
+    }
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+    let mut draw = |visual: &mut VisualTestContext, tui: &mut App| {
+        visual.update(|w, cx| { let _ = w.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    draw(&mut visual, &mut tui);
+    // On from Find Action in the window and from the command list in the terminal.
+    visual.simulate_keystrokes("ctrl-shift-a a l w a y s space s e l e c t");
+    settle(&mut visual, &mut tui, &|_| true);
+    let gui_ready = |v: &ReaderView| v.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "Explorer: Always Select Opened File"));
+    let until = Instant::now() + Duration::from_secs(10);
+    while !gui.read_with(&visual, |v, _| gui_ready(v)) { gui.update(&mut visual, |v, cx| v.poll(cx)); assert!(Instant::now() < until); std::thread::sleep(Duration::from_millis(2)); }
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)));
+    for c in "always select".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(gui.read_with(&visual, |v, _| v.session().state().always_select_opened_file()), "GUI on");
+    assert!(tui.session.state().always_select_opened_file(), "TUI on");
+    let selected = |visual: &mut VisualTestContext, tui: &App| (
+        gui.read_with(visual, |v, _| v.tree_sel.as_deref().map(str::to_owned)),
+        tui.session.state().tree_rows().nth(tui.tree_at).map(|r| r.path.to_string()),
+    );
+    for (file, hide) in [("src/ui/view.rs", false), ("src/data/store.rs", false), ("a.md", true)] {
+        if hide {
+            visual.simulate_keystrokes("ctrl-b");
+            tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)));
+            assert!(!gui.read_with(&visual, |v, _| v.explorer_shown_for_test()) && !tui.tree_shown, "hidden");
+        }
+        gui.update(&mut visual, |v, cx| v.dispatch_for_test(Command::Open(root.join(file)), cx));
+        tui.dispatch(Command::Open(root.join(file)));
+        settle(&mut visual, &mut tui, &|s| s.active_in_tree().as_deref() == Some(file));
+        draw(&mut visual, &mut tui);
+        assert_eq!(selected(&mut visual, &tui), (Some(file.to_string()), Some(file.to_string())), "{file}");
+        if hide { assert!(!gui.read_with(&visual, |v, _| v.explorer_shown_for_test()) && !tui.tree_shown, "a hidden explorer stays hidden"); }
+    }
+}
+
+/// A path pasted into Search Everywhere opens that file, outside the project too, at its line, in both adapters.
+#[gpui::test]
+fn a_pasted_path_in_search_everywhere_opens_a_file_outside_the_project_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let outside = dir.path().join("elsewhere/notes.md");
+    std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    std::fs::write(&outside, "one\ntwo\nthree\n").unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), Some(root.clone()), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), Some(root.clone()));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    let pasted = format!("{}:3", outside.display());
+    visual.simulate_keystrokes("ctrl-k");
+    visual.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(pasted.clone())));
+    visual.simulate_keystrokes("ctrl-v");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)));
+    tui.handle(Event::Paste(pasted.clone()));
+    settle(&mut visual, &mut tui, &|s| s.navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "notes.md")));
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source() == outside) && s.selection().is_some());
+    for state in [gui.read_with(&visual, |v, _| v.session().state().current_source().unwrap().line_of(v.session().state().selection().unwrap().head)), tui.session.state().current_source().unwrap().line_of(tui.session.state().selection().unwrap().head)] {
+        assert_eq!(state, 2, "line 3");
+    }
+    assert_eq!(std::fs::read(&outside).unwrap(), b"one\ntwo\nthree\n");
+}
+
+/// Save When Leaving a File, turned on from each adapter's command list: switching tabs writes the edited file left,
+/// in both adapters; the file shown keeps its own edits.
+#[gpui::test]
+fn save_when_leaving_a_file_writes_it_on_a_tab_switch_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    for side in ["gui", "tui"] {
+        std::fs::create_dir_all(dir.path().join(side)).unwrap();
+        for name in ["a.txt", "b.txt"] { std::fs::write(dir.path().join(side).join(name), "start\n").unwrap(); }
+    }
+    let (gui_a, tui_a) = (dir.path().join("gui/a.txt"), dir.path().join("tui/a.txt"));
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui-state"))), Some(dir.path().join("gui")), cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let focus = gui.read_with(&visual, |v, _| v.focus_handle());
+    visual.update(|w, cx| focus.focus(w, cx));
+    let mut tui = App::new(config(&dir.path().join("tui-state")), Some(dir.path().join("tui")));
+    let settle = |visual: &mut VisualTestContext, tui: &mut App, ready: &dyn Fn(&State) -> bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            gui.update(visual, |v, cx| v.poll(cx));
+            while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+            if gui.read_with(visual, |v, _| ready(v.session().state())) && ready(tui.session.state()) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    settle(&mut visual, &mut tui, &|s| s.project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    gui.update(&mut visual, |v, _| v.enable_draft_input_for_test());
+    tui.enable_draft_input_for_test();
+    // On from Find Action in the window and from the command list in the terminal.
+    visual.simulate_keystrokes("ctrl-shift-a s a v e space w h e n");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !gui.read_with(&visual, |v, _| v.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|r| r.label == "Save When Leaving a File"))) {
+        gui.update(&mut visual, |v, cx| v.poll(cx)); assert!(Instant::now() < until); std::thread::sleep(Duration::from_millis(2));
+    }
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)));
+    for c in "save when leaving".chars() { tui.handle(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))); }
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(gui.read_with(&visual, |v, _| v.session().state().save_on_leave()) && tui.session.state().save_on_leave(), "on in both");
+    // a.txt and b.txt open as kept tabs; an edit in a.txt; Ctrl+Tab to b.txt.
+    for name in ["b.txt", "a.txt"] {
+        gui.update(&mut visual, |v, cx| v.dispatch_for_test(Command::OpenRetained(dir.path().join("gui").join(name)), cx));
+        tui.dispatch(Command::OpenRetained(dir.path().join("tui").join(name)));
+    }
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source().ends_with("a.txt")));
+    visual.simulate_keystrokes("ctrl-end x");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)));
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert_eq!(std::fs::read_to_string(&gui_a).unwrap(), "start\n");
+    visual.simulate_keystrokes("ctrl-tab");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)));
+    settle(&mut visual, &mut tui, &|s| s.current_source().is_some_and(|d| d.source().ends_with("b.txt")));
+    let until = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&gui_a).unwrap() == "start\n" || std::fs::read_to_string(&tui_a).unwrap() == "start\n" {
+        gui.update(&mut visual, |v, cx| v.poll(cx));
+        while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+        assert!(Instant::now() < until, "saved on leaving");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(std::fs::read_to_string(&gui_a).unwrap(), std::fs::read_to_string(&tui_a).unwrap());
+    assert_eq!(std::fs::read_to_string(&tui_a).unwrap(), "start\nx");
+}
+
+mod workspace_edit;

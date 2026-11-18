@@ -15,6 +15,7 @@ path = "src/main.rs"
 gui-test = ["dep:code-gui", "dep:gpui"]
 
 [dependencies]
+lenz-terminal-ui = { path = "../terminal-ui" }
 code-core = { path = "../code-core" }
 lenz-content.workspace = true
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
@@ -32,6 +33,7 @@ code-gui = { path = "../code-gui", optional = true, features = ["test-support"] 
 gpui = { workspace = true, optional = true, features = ["test-support"] }
 
 [dev-dependencies]
+lenz-archive = { path = "../archive", features = ["testing"] }
 code-core = { path = "../code-core", features = ["test-support"] }
 tempfile = "3"
 # Throwaway git repositories for the blame tests.

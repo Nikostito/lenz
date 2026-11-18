@@ -98,7 +98,7 @@ cargo build --locked --release -p lenz-tui
 ./target/release/lenz-tui merge
 ```
 
-`lenz diff --tui` needs an interactive terminal and takes the same arguments as `lenz diff`, including `--about`. Started outside a repository, `lenz diff --tui` and its `log`, `merge` and `pr` first show the shared repository chooser: type a path (Tab completes folders, `~` is home) or pick a recent repository with the arrows or a click, Enter opens it and Esc quits. The GUI has the same chooser plus **Browse…**, which a terminal cannot offer. The chooser has no command menu; **Report last error** is in the menus once a repository opens, and `lenz diff --tui report --last` works anywhere.
+`lenz diff --tui` needs an interactive terminal and takes the same arguments as `lenz diff`, including `--about`. Started outside a repository, plain `lenz diff --tui` offers Compare Files (F1), Compare Folders (F2) and Open Repository (F3). **New Comparison…** in ☰ or F10 opens the same chooser inside an existing comparison and creates an independent view, keeping the original drafts. Tab switches the two paths; Ctrl+Space completes one. Path fields support Ctrl+A, caret/word movement and deletion, and bracketed paste. The `log`, `show`, `merge` and `pr` subcommands first show the shared repository chooser: type a path (Tab completes folders, `~` is home) or pick a recent repository with the arrows or a click, Enter opens it and Esc quits. The GUI has the same chooser plus **Browse…**, which a terminal cannot offer. The chooser has no command menu; **Report last error** is in the menus once a repository opens, and `lenz diff --tui report --last` works anywhere.
 
 ## Keyboard and mouse basics
 
@@ -111,6 +111,16 @@ cargo build --locked --release -p lenz-tui
 - **Modals:** menus, dialogs and prompts consume all input before the panes below them. Quit (Ctrl-Q) and F8/Shift-F8 are the global exceptions.
 - **Lists:** in Files and Commits, typing or Ctrl-F starts a literal, case-insensitive search of that list (file paths; commit subject, author, email and hash in the loaded history). Every row stays visible, matches are highlighted, and Up/Down or F3/Shift-F3 step the candidate without changing the comparison. Enter opens the candidate and keeps the query; Esc clears the search and restores the earlier position; Ctrl-A clears the query; Ctrl-C copies the candidate's path or hash. Plain letters, including `q`, `j`, `k` and `g`, are search text in these lists.
 - **Quitting:** Ctrl-Q quits; `q` closes the current view in a comparison or merge.
+
+## Text in searches and dialogs
+
+Reader and Diff search fields, command filters, path/name prompts and comparison/repository choosers share single-line editing. Left/Right move by grapheme, Ctrl/Alt-Left/Right move by word, and Home/End move to the input's ends. Add Shift to select a range; Ctrl-A selects all. Ctrl-C copies the selection and Ctrl-X cuts it. Backspace/Delete remove a selection or character; Ctrl/Alt-Backspace/Delete remove a word. Reader prompts and Git revision/name prompts take the first pasted line. Other Diff query fields turn line breaks and tabs into spaces.
+
+In a GUI, Ctrl-V (Cmd-V on macOS) pastes from the system clipboard. In a terminal, use the emulator's Paste command, usually Ctrl-Shift-V, which delivers a bracketed paste event. Copy/cut use OSC 52 and require the emulator to allow clipboard writes. Modified motions require a terminal that reports those keys. Popup fields do not implement document undo, Vim operators or multiple cursors.
+
+GUI search and popup fields also accept native text input and input-method composition. Preedit text stays separate from the query until committed. Escape cancels composition; a subsequent Escape dismisses the field or popup. Clicking text places the caret, and Shift-click extends the selection. Printable Option-key characters are accepted where the key is not already a documented field shortcut; for example, Find keeps Alt+C/W/R for its options and Alt+A for Replace All. A terminal receives the text committed by its emulator's input method.
+
+Up/Down and PageUp/PageDown still navigate picker results; Tab switches fields or search scope. Alt-Home/End select the first/last result where the picker supports those jumps. In Reader's branch picker, Alt-Enter opens the selected row's actions, including Open in New Window. F6 forgets a highlighted recent item/bookmark or resets a highlighted keybinding, while Delete edits a nonempty filter. Escape cancels and Enter confirms the active dialog.
 
 ## Comparison controls
 
@@ -229,6 +239,10 @@ Both adapters build their menus, labels, availability and disabled reasons from 
 - The command palette opens with `:` or F10 instead of Ctrl/Cmd+Shift+P; `f` opens the file finder and Alt-0 is Focus.
 - **Diff options…** opens the ⚙ menu, or the palette's Diff group when the button has folded into `⋯`.
 - Alt-Left/Right outside a repository only says that Back and Forward work in repository views.
+- Lenz Code on macOS with macOS Word Motion on: Option+Left/Right move by word in the text when the emulator sends Option as Alt (Esc-prefixed
+  arrows); Terminal.app's default Esc b / Esc f arrive as Alt+B / Alt+F instead. Option+Shift+Left/Right keep moving the
+  tab, so select by word with Ctrl+Shift+Left/Right, and Back/Forward stay in the menus there. Cmd+arrows do not reach a
+  terminal, so Search Everywhere's query has no to-the-ends key (Ctrl+A clears it).
 - The Version Picker's **Take ‹version›** buttons and the Conflict List's **File actions ▾** are toolbar items.
 - Terminal text selection and Linux primary selection belong to the emulator. Clipboard copy uses OSC 52 and needs terminal support; it transports exact text, and source control characters are drawn visibly.
 - Images are limited to cell geometry and colors, except where kitty graphics or Sixel apply as described above.

@@ -1,4 +1,4 @@
-//! Viewport-only diagnostic labels, painted separately from source text and its input geometry.
+//! Viewport-only diagnostic labels and inline blame, painted separately from source text and its input geometry.
 use super::*;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -21,15 +21,24 @@ impl ReaderView {
         let Some(tab) = state.presentation_shown(frame.geom.pane) else { return Vec::new() };
         let Some(view) = state.presentation_view(tab.id()) else { return Vec::new() };
         if state.view(tab.id()).is_none_or(|base| base.snapshot().key() != view.snapshot().key()) { return Vec::new(); }
-        if state.diagnostics(tab.id()).is_none_or(|found| found.items.is_empty()) { return Vec::new(); }
+        // Inline blame: the caret line's commit, faint, where no problem is labelled on that line.
+        let blame = state.caret_blame(tab.id());
+        if blame.is_none() && state.diagnostics(tab.id()).is_none_or(|found| found.items.is_empty()) { return Vec::new(); }
         let logical = view.layout_rows(frame.geom.rows, state.wrap_cols(tab)).rows;
         let band = frame.sticky.iter().map(|(row, _)| row.y + 1.0).reduce(f32::max).unwrap_or(0.0);
         let annotation = |row: &TextRow, logical: &code_core::layout::Row, parts: &[(std::ops::Range<usize>, f32)], sticky| {
             if parts.is_empty() || !logical.last { return None; }
-            let problem = state.inline_problem(tab.id(), logical.line)?;
+            use code_core::semantics::diagnostics::Severity;
+            let palette = state.palette();
+            let (label, color) = match state.inline_problem(tab.id(), logical.line) {
+                Some(problem) => {
+                    let count = if problem.other_count == 0 { String::new() } else { format!(" (+{})", problem.other_count) };
+                    let color = match problem.severity { Severity::Error => palette.error, Severity::Warning => palette.accent, Severity::Information | Severity::Hint => palette.dim };
+                    (format!("{}: {}{count}", problem.severity.label(), problem.message), color)
+                }
+                None => (blame.as_ref().filter(|(line, _)| *line == logical.line)?.1.clone(), palette.dim),
+            };
             if !self.source_row(tab, logical)?.complete() { return None; }
-            let count = if problem.other_count == 0 { String::new() } else { format!(" (+{})", problem.other_count) };
-            let label = format!("{}: {}{count}", problem.severity.label(), problem.message);
             let x = (lenz_gpui::text_x(self.metrics(), 0.0, frame.hscroll)
                 + native_x(window, self.metrics(), row, parts, row.text.len()) + 2.0 * self.char_w)
                 .max(num_w() + 8.0);
@@ -38,9 +47,6 @@ impl ReaderView {
             let label = display::show_bidi(&label);
             let text = fit(window, self.metrics(), &label, width);
             if text.is_empty() { return None; }
-            use code_core::semantics::diagnostics::Severity;
-            let palette = state.palette();
-            let color = match problem.severity { Severity::Error => palette.error, Severity::Warning => palette.accent, Severity::Information | Severity::Hint => palette.dim };
             Some(Annotation { #[cfg(feature = "test-support")] line: logical.line, row: row.y, x, width, text, color, sticky })
         };
         let mut annotations = Vec::new();

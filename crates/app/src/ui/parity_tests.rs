@@ -1562,12 +1562,12 @@ fn gui_parity_go_to_unicode_caret_and_keyboard_menu_keep_semantic_positions() {
         "👩"
     );
     key(&mut cx, &f, ":", false, false, false);
-    key(&mut cx, &f, "end", false, false, false);
+    key(&mut cx, &f, "end", false, false, true);
     f.viewer.read_with(&cx, |v, _| {
         let p = v.command_palette.as_ref().unwrap();
         assert_eq!(p.selected(), Some(p.len() - 1));
     });
-    key(&mut cx, &f, "home", false, false, false);
+    key(&mut cx, &f, "home", false, false, true);
     key(&mut cx, &f, "pagedown", false, false, false);
     assert!(
         f.viewer
@@ -3538,6 +3538,89 @@ fn gui_text_context_menu_lists_only_what_is_under_the_pointer(cx:&mut TestAppCon
 }
 
 #[gpui::test]
+fn gui_hunk_menu_rejects_replaced_diff_and_fresh_actions_work(cx: &mut TestAppContext) {
+    let left = "space\nsecond\nkeep1\nkeep2\nkeep3\nold1\nold2\n";
+    let right = "space \nsecond \nkeep1\nkeep2\nkeep3\nnew1\nnew2\n";
+    for fold in [false, true] {
+        let f = fixture(cx, left, right);
+        let is_action = |action: &MenuAction| match action {
+            MenuAction::Fold(_) => fold,
+            MenuAction::Move(_, Side::Right) => !fold,
+            _ => false,
+        };
+        f.window.update(cx, |v, w, cx| {
+            let _ = v.render(w, cx);
+            assert_eq!(v.comparison.view.change_count(), 2);
+            // The request is new, but the visible hunk indices still belong to the old diff.
+            v.on_key(&event("w", false, false, false), w, cx);
+            assert_eq!(v.comparison.options.whitespace, WhitespaceMode::Trim);
+            assert_ne!(v.comparison.generation, v.comparison.diffed);
+            let (x, y) = v.point_on_line(w, Side::Right, 0);
+            v.on_right_down(&MouseDownEvent {
+                position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+            }, w, cx);
+            let menu = v.menu.as_mut().unwrap();
+            menu.hover = Some(menu.items.iter().position(|(_, action)| is_action(action)).unwrap());
+        }).unwrap();
+        workflow_wait(cx, &f, |v| v.comparison.diffed == v.comparison.generation);
+        assert_eq!(f.viewer.read_with(cx, |v, _| v.comparison.view.change_count()), 1);
+        key(cx, &f, "enter", false, false, false);
+        f.viewer.read_with(cx, |v, _| {
+            assert_eq!(v.doc().unwrap().text(Side::Right), right, "a stale menu must not apply the remaining unrelated hunk");
+            assert!(!v.edits.has_dirty());
+            assert!(!v.comparison.view.folded(0), "a stale menu must not fold the remaining unrelated hunk");
+            assert!(v.toast.as_ref().is_some_and(|t| t.0 == "Comparison changed — reopen the menu"));
+        });
+        assert_eq!(text(&f), right);
+
+        // Reopening the menu on the surviving hunk makes the same actions usable again.
+        f.window.update(cx, |v, w, cx| {
+            let (x, y) = v.point_on_line(w, Side::Right, 5);
+            v.on_right_down(&MouseDownEvent {
+                position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+            }, w, cx);
+            let menu = v.menu.as_mut().unwrap();
+            menu.hover = Some(menu.items.iter().position(|(_, action)| is_action(action)).unwrap());
+        }).unwrap();
+        key(cx, &f, "enter", false, false, false);
+        if fold {
+            assert!(f.viewer.read_with(cx, |v, _| v.comparison.view.folded(0)));
+            assert_eq!(text(&f), right);
+        } else {
+            let expected = "space \nsecond \nkeep1\nkeep2\nkeep3\nold1\nold2\n";
+            assert_eq!(f.viewer.read_with(cx, |v, _| v.doc().unwrap().text(Side::Right).to_owned()), expected);
+            assert_eq!(text(&f), right, "the valid menu move changes only the draft until Save");
+            key(cx, &f, "s", true, false, false);
+            assert_eq!(text(&f), expected);
+        }
+    }
+}
+
+#[gpui::test]
+fn gui_hunk_menu_saved_action_rejects_reloaded_document(cx: &mut TestAppContext) {
+    let f = fixture(cx, "left\n", "old right\n");
+    let menu = f.window.update(cx, |v, w, cx| {
+        let _ = v.render(w, cx);
+        let (x, y) = v.point_on_line(w, Side::Right, 0);
+        v.on_right_down(&MouseDownEvent {
+            position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+        }, w, cx);
+        let mut menu = v.menu.take().unwrap();
+        menu.hover = Some(menu.items.iter().position(|(_, action)| matches!(action, MenuAction::Move(_, Side::Right))).unwrap());
+        menu
+    }).unwrap();
+    std::fs::write(f.dir.path().join("right.txt"), "fresh right\n").unwrap();
+    run(cx, &f, crate::catalog::Action::Interaction(commands::Interaction::Reload));
+    workflow_wait(cx, &f, |v| v.doc().is_some() && v.comparison.diffed == v.comparison.generation);
+    // Even a retained action cannot use the new document's block at the same index.
+    f.viewer.update(cx, |v, _| v.menu = Some(menu));
+    key(cx, &f, "enter", false, false, false);
+    assert_eq!(f.viewer.read_with(cx, |v, _| v.doc().unwrap().text(Side::Right).to_owned()), "fresh right\n");
+    assert!(!f.viewer.read_with(cx, |v, _| v.edits.has_dirty()));
+    assert_eq!(text(&f), "fresh right\n");
+}
+
+#[gpui::test]
 fn gui_single_line_block_has_no_fold_item(cx:&mut TestAppContext) {
     let f=fixture(cx,"a\nb\nkeep\n","a\nB\nkeep\n");
     let labels=right_click_labels(cx,&f,Side::Right,1);
@@ -3580,14 +3663,18 @@ fn gui_app_menu_lists_settings_theme_keys_about_and_report(cx:&mut TestAppContex
     let (f,_repo)=repository_fixture(cx);
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     let labels=f.viewer.read_with(cx,|v,_|v.menu.as_ref().unwrap().items.iter().map(|(l,_)|l.clone()).collect::<Vec<_>>());
-    assert_eq!(labels,["Settings…",commands::Interaction::ChangeTheme.label(),"Keyboard shortcuts",commands::Interaction::About.label(),commands::Interaction::ReportLastError.label()]);
+    assert_eq!(labels,["New Comparison…","Settings…",commands::Interaction::ChangeTheme.label(),"Keyboard shortcuts",commands::Interaction::About.label(),commands::Interaction::ReportLastError.label()]);
     assert!(f.viewer.read_with(cx,|v,_|v.toolbar_slots().iter().any(|s|s.id=="app-menu"&&s.active)),"the open menu marks its button");
-    key(cx,&f,"home",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"enter",false,false,false);
+    key(cx,&f,"home",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"enter",false,false,false);
     assert!(f.viewer.read_with(cx,|v,_|v.help),"Keyboard shortcuts opens help");
     key(cx,&f,"escape",false,false,false);
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     assert!(f.viewer.read_with(cx,|v,_|v.menu.is_none()),"the button toggles its menu");
+    f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
+    key(cx,&f,"home",false,false,false);key(cx,&f,"enter",false,false,false);
+    assert!(f.viewer.read_with(cx,|v,_|v.spawned_comparisons.last().is_some_and(|(args,_)|args==&["--new-comparison"])));
+
 }
 
 #[gpui::test]
@@ -4300,7 +4387,16 @@ fn check_shortcuts(cx:&mut TestAppContext,make:&dyn Fn(&mut TestAppContext)->Fix
         let (k,c)=(by_key.viewer.read_with(cx,|v,_|fingerprint(v)),by_cmd.viewer.read_with(cx,|v,_|fingerprint(v)));
         let untouched=probe.viewer.read_with(cx,|v,_|fingerprint(v));
         if k!=c {wrong.push(format!("{shortcut} for {:?} ({}) — key changed {}",e.action,e.label,if k==untouched {"nothing"} else {"something else"}));}
+        // TestAppContext retains windows until they close. Retire each pair (and
+        // any auxiliary windows its actions opened) before constructing another.
+        let keep = probe.window.window_id();
+        for window in cx.update(|cx|cx.windows()) {
+            if window.window_id() != keep { let _ = window.update(cx,|_,w,_|w.remove_window()); }
+        }
+        drop(by_key); drop(by_cmd);
+        cx.executor().run_until_parked();
     }
+    let _ = probe.window.update(cx,|_,w,_|w.remove_window());
 }
 
 #[gpui::test]
@@ -5029,4 +5125,21 @@ fn gui_summary_scrolled_header_click_only_focuses(cx: &mut TestAppContext) {
         assert!(f.viewer.read_with(cx, |v, _| v.summary_shown()), "header and gap must not open a file");
         assert_eq!(f.viewer.read_with(cx, |v, _| v.comparison.folders.summary().unwrap().selected), 59);
     }
+}
+
+#[gpui::test]
+fn gui_popup_fields_edit_unicode_ranges_and_clipboard(cx:&mut TestAppContext){
+    let f=fixture(cx,"old\n","new\n");
+    for kind in [Modal::GoTo,Modal::Switcher,Modal::Find]{
+        f.viewer.update(cx,|v,_|{v.goto=None;v.switcher=None;v.comparison.find=None;match kind {Modal::GoTo=>v.goto=Some("one é👩🏽‍💻 two".into()),Modal::Switcher=>{v.switcher=Some(Switcher{query:"one é👩🏽‍💻 two".into(),selected:0,hits:Vec::new()});v.update_switcher();},Modal::Find=>v.open_find(),_=>unreachable!()}});
+        if kind==Modal::Find {f.viewer.update(cx,|v,_|v.comparison.find.as_mut().unwrap().query="one é👩🏽‍💻 two".into());}
+        key(cx,&f,"home",false,false,false);key(cx,&f,"right",true,false,false);key(cx,&f,"right",false,false,false);
+        for _ in 0..2{key(cx,&f,"right",false,true,false);}
+        key(cx,&f,"c",true,false,false);
+        assert_eq!(cx.update(|cx|cx.read_from_clipboard().and_then(|c|c.text())).as_deref(),Some("é👩🏽‍💻"));
+        key(cx,&f,"x",true,false,false);
+        f.viewer.read_with(cx,|v,_|{let value=match kind{Modal::GoTo=>v.goto.as_ref().unwrap(),Modal::Switcher=>&v.switcher.as_ref().unwrap().query,_=>&v.comparison.find.as_ref().unwrap().query};assert_eq!(value,"one  two");});
+        key(cx,&f,"v",true,false,false);key(cx,&f,"escape",false,false,false);
+    }
+    assert_eq!(text(&f),"new\n");assert!(!f.viewer.read_with(cx,|v,_|v.edits.has_dirty()));
 }

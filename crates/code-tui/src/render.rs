@@ -504,6 +504,7 @@ impl App {
         fill(frame.buffer_mut(), area, style(p.fg, p.bg));
         if area.is_empty() {
             self.layout = geometry;
+            if let Some(modal) = &mut self.modal { modal.top = 0; }
             for command in self.source_cache.borrow_mut().finish() { self.source_redraw |= self.session.dispatch(command).repaint; }
             self.sync_prompts();
             return;
@@ -517,9 +518,14 @@ impl App {
         );
         self.draw_activity(frame, &mut geometry, &mut body, p);
         self.draw_terminal(frame, &mut geometry, &mut body, p);
-        // A quarter of the width unless its right edge was dragged; the text keeps at least 24 columns.
+        // A browser with no document uses the available cells; a focused virtual tree also remains
+        // usable below the usual split threshold. Opening a member returns narrow windows to text.
+        let archive_browser = !self.session.state().archive_tree().rows().is_empty()
+            && (self.session.state().active().is_none() || area.width < 36 && self.focus == Focus::Tree
+                && self.session.state().tree_rows().nth(self.tree_at).is_some_and(|row| self.session.state().archive_tree().is_virtual(&row.path)));
         let tree_width =
-            if self.tree_shown && self.session.state().has_tree() && area.width >= 36 {
+            if self.tree_shown && self.session.state().has_tree() && archive_browser { body.width }
+            else if self.tree_shown && self.session.state().has_tree() && area.width >= 36 {
                 let dragged = self.explorer_drag.or_else(|| self.session.state().layout().explorer_columns.map(|w| w.min(u32::from(u16::MAX)) as u16));
                 dragged.map_or((area.width / 4).clamp(16, 32), |w| w.clamp(12, area.width - 24))
             } else {
@@ -775,6 +781,15 @@ impl App {
             style(p.fg, p.status_bg).add_modifier(Modifier::UNDERLINED),
         );
         geometry.command_menus.push(commands_rect);
+        if self.focus == Focus::Tree && let Some(row) = self.session.state().tree_rows().nth(self.tree_at)
+            && let Some(hint) = self.session.state().archive_tree().hint(&row.path) {
+            let message = if area.width >= 80 {
+                self.session.state().archive_tree().display_path(&row.path).map_or_else(|| hint.to_owned(), |path| format!("{hint} · {path}"))
+            } else { hint.to_owned() };
+            let rect = Rect::new(area.x, area.y, area.width.saturating_sub(commands_width), 1);
+            line(frame.buffer_mut(), rect, &code_core::chrome::ellipsize(&message, rect.width as usize), style(p.fg, p.status_bg));
+            return;
+        }
         let log_width = 10.min(area.width.saturating_sub(commands_width));
         let log_rect = Rect::new(commands_rect.x.saturating_sub(log_width), area.y, log_width, 1);
         line(frame.buffer_mut(), log_rect, &format!("Logs ({})", self.session.state().activity_log().len()), style(p.accent, p.status_bg));
@@ -789,7 +804,8 @@ impl App {
         }
         let available = area.width.saturating_sub(commands_width + log_width + results_width);
         let state = self.session.state();
-        let lsp = format!(" {} [F2] ", state.language_server_label());
+        let (server_label, server_action) = self.session.language_server_control();
+        let lsp = format!(" {server_label} [F2] ");
         let sql = self.session.sql_dialect_label().map(|label| format!(" {label} ")).unwrap_or_default();
         let save_notice = area.width < 60 && state.active().and_then(|tab| state.view(tab.id()))
             .is_some_and(|view| view.save_status().message().is_some());
@@ -828,7 +844,7 @@ impl App {
         );
         geometry
             .controls
-            .push((CommandId::LanguageServer, lsp_rect));
+            .push((server_action, lsp_rect));
         // The SQL dialect the file is written for, including "not set": never assumed, always visible.
         let sql_width = if save_notice { 0 } else { (sql.width() as u16).min(available.saturating_sub(lsp_width) / 2) };
         let sql_rect = Rect::new(lsp_rect.right(), area.y, sql_width, 1);
@@ -877,7 +893,10 @@ impl App {
             return;
         }
         fill(frame.buffer_mut(), area, style(p.fg, p.sidebar_bg));
-        let title = self.session.state().explorer_search().label().map(std::borrow::Cow::Owned).unwrap_or_else(|| self.session.state().project().map(|p| p.root().file_name().unwrap_or_default().to_string_lossy()).unwrap_or_else(|| "Files".into()));
+        let state = self.session.state();
+        let archive = state.project().is_none() || state.tree_rows().nth(self.tree_at).is_some_and(|row| state.archive_tree().is_virtual(&row.path));
+        let title = state.explorer_search().label().or_else(|| if archive { state.archive_tree().title() } else { None }).map(std::borrow::Cow::Owned)
+            .unwrap_or_else(|| state.project().map(|p| p.root().file_name().unwrap_or_default().to_string_lossy()).unwrap_or_else(|| "Files".into()));
         line(
             frame.buffer_mut(),
             area,
@@ -1274,19 +1293,11 @@ impl App {
                 field.width.saturating_sub(2),
                 field.height,
             );
-            let shown = tail_columns(value, text_area.width.saturating_sub(1) as usize);
-            if value.is_empty() {
-                line(frame.buffer_mut(), text_area, placeholder, style(p.dim, p.bg));
-            } else {
-                line(frame.buffer_mut(), text_area, shown, style(p.fg, if active && modal.selected { p.selected_bg } else { p.bg }));
-            }
-            if active && text_area.height > 0 && text_area.width > 0 {
-                frame.set_cursor_position((
-                    text_area.x
-                        + (shown.width() as u16).min(text_area.width.saturating_sub(1)),
-                    text_area.y,
-                ));
-            }
+            let cursor = modal.editors[i].unwrap_or_else(|| if active { Self::field_cursor(modal) } else { Default::default() });
+            lenz_terminal_ui::paint(frame, lenz_terminal_ui::Field { text: value, cursor, area: text_area, active }, style(p.fg,p.bg), style(p.fg,p.selected_bg));
+            if value.is_empty() { line(frame.buffer_mut(), text_area, placeholder, style(p.dim,p.bg)); }
+
+
         }
         for (((id, label), (dy, dx, w)), on) in labels.iter().zip(placed).zip(on) {
             let r = row(content, toggles_y + dy);
@@ -1398,21 +1409,10 @@ impl App {
             x = x.saturating_add(width + 1);
         }
         if content.height > 1 {
-            let query = tail_columns(&modal.input, content.width.saturating_sub(3) as usize);
-            line(
-                frame.buffer_mut(),
-                row(content, 1),
-                &format!("› {query}"),
-                style(p.fg, p.status_bg),
-            );
-            if content.width > 2 {
-                frame.set_cursor_position((
-                    content.x
-                        + 2
-                        + query.width().min(content.width.saturating_sub(3) as usize) as u16,
-                    content.y + 1,
-                ));
-            }
+            let r=row(content,1);
+            line(frame.buffer_mut(),r,"› ",style(p.fg,p.status_bg));
+            let area=Rect::new(r.x+2.min(r.width),r.y,r.width.saturating_sub(2),r.height);
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:&modal.input,cursor:Self::field_cursor(modal),area,active:true},style(p.fg,p.status_bg),style(p.fg,p.selected_bg));
         }
         let list_y = 2.min(content.height);
         let reserve = u16::from(content.height > list_y);
@@ -1561,6 +1561,16 @@ impl App {
         } else {
             self.choices()
         };
+        let branch_notice = self.modal.as_ref().filter(|m| m.kind == Prompt::Branches)
+            .and_then(|_| self.session.state().branches())
+            .and_then(|b| b.state_text()).map(str::to_owned);
+        let branch_footer = self.session.state().branches().map(|b| {
+            if b.worktrees_only || b.revisions_only {
+                "Enter compares · Alt+Enter actions · Alt+Home/End jumps · Esc closes"
+            } else {
+                "Enter selects · → / Alt+Enter actions · Alt+Home/End jumps · Esc closes"
+            }
+        });
         let Some(modal) = &mut self.modal else {
             return;
         };
@@ -1620,6 +1630,7 @@ impl App {
         };
         geometry.modal = area;
         if area.is_empty() {
+            modal.top = 0;
             return;
         }
         frame.render_widget(Clear, area);
@@ -1677,7 +1688,7 @@ impl App {
             }
             return;
         }
-        let input_rows = if context || themes || modal.kind == Prompt::LanguageServer {
+        let input_rows = if context || themes || matches!(modal.kind, Prompt::LanguageServer | Prompt::BranchMenu { .. }) {
             0
         } else {
             1 + usize::from(
@@ -1688,14 +1699,14 @@ impl App {
             )
         };
         for i in 0..input_rows.min(content.height as usize) {
-            let active = (i == 1) == modal.secondary_focus;
-            let prefix = if modal.kind == Prompt::Branches { "Filter: " } else if active { "› " } else { "  " };
-            let room = content.width.saturating_sub(prefix.len() as u16) as usize;
-            let text = field_text(modal, i == 1);
-            let tail = tail_columns(&text, room);
-            let bg = if modal.kind == Prompt::Branches { p.bg } else { p.status_bg };
-            fill(frame.buffer_mut(), row(content, i as u16), style(p.fg, bg));
-            line(frame.buffer_mut(), row(content, i as u16), &format!("{prefix}{tail}"), style(if active { p.fg } else { p.dim }, bg));
+            let active=(i==1)==modal.secondary_focus;
+            let prefix=if modal.kind==Prompt::Branches { "Filter: ".to_string() } else if i==1 && modal.kind==Prompt::Find { format!("  {}: ",CommandId::ReplaceMatch.label()) } else if active { "› ".into() } else { "  ".into() };
+            let r=row(content,i as u16);let bg=if modal.kind==Prompt::Branches {p.bg}else{p.status_bg};
+            fill(frame.buffer_mut(),r,style(p.fg,bg));line(frame.buffer_mut(),r,&prefix,style(p.dim,bg));
+            let offset=(prefix.width() as u16).min(r.width);
+            let text=if i==1{&modal.secondary}else{&modal.input};
+            let cursor=modal.editors[i].unwrap_or_else(||if active {Self::field_cursor(modal)}else{Default::default()});
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text,cursor,area:Rect::new(r.x+offset,r.y,r.width.saturating_sub(offset),r.height),active},style(p.fg,bg),style(p.fg,p.selected_bg));
         }
         let list_y = input_rows.min(content.height as usize) as u16;
         let reserve = u16::from(!themes && content.height > list_y);
@@ -1709,6 +1720,14 @@ impl App {
         // Wrapped details participate in scrolling: selection remains a choice index, top is a visual row.
         let width = list.width.max(1) as usize;
         let mut rendered = Vec::new();
+        if modal.kind == Prompt::Branches {
+            let notice = branch_notice.as_deref().or(choices.is_empty().then_some("Nothing matches this filter"));
+            if let Some(notice) = notice {
+                for text in wrap_text(notice, width) {
+                    rendered.push((usize::MAX, text, true));
+                }
+            }
+        }
         if themes {
             for header in [
                 "↑/↓ choose · Enter select · Esc close".to_owned(),
@@ -1721,7 +1740,16 @@ impl App {
         }
         let mut selected = 0..0;
         modal.at = modal.at.min(choices.len().saturating_sub(1));
+        let mut previous_section = None;
         for (i, choice) in choices.iter().enumerate() {
+            if choice.section != previous_section {
+                if let Some(section) = choice.section {
+                    for text in wrap_text(code_core::branches::branch_section_label(section), width) {
+                        rendered.push((usize::MAX, text, true));
+                    }
+                }
+                previous_section = choice.section;
+            }
             if modal.kind == Prompt::LanguageServer && matches!(i, 4 | 8) {
                 rendered.push((usize::MAX, if i == 4 { "Setup" } else { "Indexing" }.to_string(), true));
             }
@@ -1792,7 +1820,7 @@ impl App {
                 r,
                 text,
                 style(
-                    if themes && *i == usize::MAX {
+                    if (themes || modal.kind == Prompt::Branches) && *i == usize::MAX {
                         p.accent
                     } else if *disabled {
                         p.dim
@@ -1826,12 +1854,15 @@ impl App {
                         .then_some(runtime_message.as_deref())
                         .flatten()
                 })
+                .or(branch_footer.filter(|_| modal.kind == Prompt::Branches))
                 .unwrap_or(if modal.kind == Prompt::LanguageServer {
                     "Ctrl+C copies details · Enter runs action · Esc closes"
                 } else if modal.kind == Prompt::Menu(None) {
                     "Enter / → open · Esc closes"
                 } else if matches!(modal.kind, Prompt::Menu(Some(_))) {
                     "Enter runs · ← back · Esc closes"
+                } else if matches!(modal.kind, Prompt::BranchMenu { .. }) {
+                    "Enter runs · ← / Esc back"
                 } else {
                     "Enter accepts · Esc closes · ↑↓ selects · Tab field"
                 });
@@ -1849,38 +1880,13 @@ impl App {
                 ),
             );
         }
-        if !context
-            && !themes
-            && modal.kind != Prompt::LanguageServer
-            && content.height > 0
-            && content.width > 2
-        {
-            let text = field_text(modal, modal.secondary_focus);
-            frame.set_cursor_position((
-                content.x
-                    + 2
-                    + UnicodeWidthStr::width(tail_columns(
-                        &text,
-                        content.width.saturating_sub(3) as usize,
-                    ))
-                    .min(content.width.saturating_sub(3) as usize) as u16,
-                content.y + u16::from(modal.secondary_focus).min(content.height - 1),
-            ));
-        }
+
     }
 }
 
 /// What the find prompt's footer says under its fields.
 const FIND_HINT: &str = "Enter replaces · Alt+A all · Tab field · Esc closes";
 const FIND_QUERY_HINT: &str = "Enter next · F3 / Shift+F3 · Tab replace · Esc closes";
-
-/// A prompt field as drawn: the find prompt's second row is its replacement text, labelled so an empty one is
-/// clear; the caret column follows the same text.
-fn field_text(modal: &crate::app::Modal, second: bool) -> std::borrow::Cow<'_, str> {
-    use std::borrow::Cow;
-    let text = if second { modal.secondary.as_str() } else { modal.input.as_str() };
-    if second && modal.kind == Prompt::Find { Cow::Owned(format!("{}: {text}", CommandId::ReplaceMatch.label())) } else { Cow::Borrowed(text) }
-}
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(
@@ -1952,7 +1958,7 @@ fn draw_start(frame: &mut ratatui::Frame, app: &App, items: &[StartItem], geomet
     for (i, item) in items.iter().enumerate() {
         let label = match item {
             StartItem::Command(id) => app.session.key_hint(*id).map_or_else(|| id.label().to_string(), |key| format!("{}  {key}", id.label())),
-            StartItem::RecentFolder(path) | StartItem::RecentFile(path) => path.display().to_string(),
+            StartItem::RecentFolder(path) | StartItem::RecentFile(path) => crate::app::source_path_label(path),
         };
         // Each group of recents under a blank row and its heading.
         if item.heading() != heading {
@@ -2739,6 +2745,13 @@ fn draw_source_row(
             let message = format!("{}: {}{extra}", problem.severity.label(), problem.message);
             line(buf, Rect::new(x, y, area.right() - x, 1), &message, style(fg, base));
         }
+    } else if r.last && !sticky && native.end.is_some() && !native.pending
+        && let Some((_, commit)) = state.caret_blame(tab.id()).filter(|(line, _)| *line == r.line) {
+        // Inline blame: the caret line's commit, faint, where no problem is labelled on that line.
+        let x = end_x.saturating_add(if fold.is_some_and(|(_, shut)| shut) { 2 } else { 0 }).saturating_add(2);
+        if x < area.right() {
+            line(buf, Rect::new(x, y, area.right() - x, 1), &commit, style(p.dim, base));
+        }
     }
 
 }
@@ -3120,18 +3133,6 @@ fn draw_markdown(
     }
 }
 
-fn tail_columns(text: &str, columns: usize) -> &str {
-    let mut width = 0;
-    let mut start = text.len();
-    for (i, g) in text.grapheme_indices(true).rev() {
-        width += UnicodeWidthStr::width(g);
-        if width > columns {
-            break;
-        }
-        start = i;
-    }
-    &text[start..]
-}
 
 /// `text` wrapped to `columns`, at most `max` lines, the last ending in `…` when cut.
 fn wrap(text: &str, columns: usize, max: usize) -> Vec<String> {

@@ -18,7 +18,7 @@ pub(super) struct Layout {
     query: String,
     files: String,
     in_files: bool,
-    selected: bool,
+    cursor: lenz_content::field_edit::Cursor,
     on: [bool; 3],
     char_w: f32,
 }
@@ -29,7 +29,7 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
 
 impl ReaderView {
     pub(super) fn search_layout(&self) -> Option<Layout> {
-        let Some(Modal::Search { query, files, in_files, selected, .. }) = &self.modal else { return None };
+        let Some(Modal::Search { query, files, in_files, .. }) = &self.modal else { return None };
         let (lh, cw) = (line_h(), self.char_w);
         let w = (self.width - 16.0).clamp(0.0, 640.0);
         let x = (self.width - w) / 2.0;
@@ -60,6 +60,9 @@ impl ReaderView {
         // Centered; a window too short for it shows its top.
         let top = ((self.height - h) / 2.0).max(0.0);
         let down = |b: Bounds<Pixels>| Bounds { origin: gpui::point(b.origin.x, b.origin.y + px(top)), size: b.size };
+        let active = usize::from(*in_files);
+        let cursor = self.popup_field().map(|(_, cursor, _)| cursor).unwrap_or_default();
+        let snapshot = self.field_paint_snapshot(active, if *in_files { files } else { query }, cursor, self.columns((right - field_x - 20.0).max(0.0)));
         Some(Layout {
             bounds: rect(x, top, w, h.min(self.height - top)),
             fields: fields.map(down),
@@ -67,10 +70,10 @@ impl ReaderView {
             hint_y: top + hint_y,
             hint,
             refused: refused.is_some(),
-            query: query.clone(),
-            files: files.clone(),
+            query: if *in_files { query.clone() } else { snapshot.text.clone() },
+            files: if *in_files { snapshot.text.clone() } else { files.clone() },
             in_files: *in_files,
-            selected: *selected,
+            cursor: snapshot.cursor,
             on: [o.case, o.word, o.regex],
             char_w: cw,
         })
@@ -85,8 +88,9 @@ impl ReaderView {
         if let Some((option, _)) = l.toggles.iter().find(|(_, b)| b.contains(&point)) {
             self.dispatch(Command::ToggleFindOption(*option), cx);
         } else if let Some(i) = l.fields.iter().position(|b| b.contains(&point))
-            && let Some(Modal::Search { in_files, selected, .. }) = &mut self.modal
+            && let Some(Modal::Search { in_files, selected, caret, .. }) = &mut self.modal
         {
+            if *in_files != (i == 1) { *caret = None; }
             *in_files = i == 1;
             *selected = false;
         }
@@ -111,22 +115,12 @@ impl Layout {
                 lenz_gpui::text(window, cx, m, x + PAD, fy + 4.0, label, if active { p.fg } else { p.dim });
                 lenz_gpui::fill(window, fx, fy, fw, fh, if active { p.accent } else { border });
                 lenz_gpui::fill(window, fx + 1.0, fy + 1.0, fw - 2.0, fh - 2.0, p.bg);
-                let shown = navigation::tail(value, ((fw - 20.0) / self.char_w).max(0.0) as usize);
-                let field = rect(fx + 1.0, fy + 1.0, fw - 2.0, fh - 2.0);
-                window.with_content_mask(Some(gpui::ContentMask { bounds: field }), |window| {
-                    if value.is_empty() {
-                        lenz_gpui::text(window, cx, m, fx + 8.0, fy + 4.0, placeholder, p.dim);
-                    } else {
-                        if active && self.selected {
-                            lenz_gpui::fill(window, fx + 8.0, fy + 3.0, lenz_content::wrap::width(&shown) as f32 * self.char_w, fh - 6.0, p.sel_bg);
-                        }
-                        lenz_gpui::text(window, cx, m, fx + 8.0, fy + 4.0, &shown, p.fg);
-                    }
-                    if active {
-                        let caret_x = fx + 8.0 + lenz_content::wrap::width(&shown) as f32 * self.char_w;
-                        lenz_gpui::fill(window, caret_x, fy + 4.0, 2.0, fh - 8.0, p.caret);
-                    }
-                });
+                if value.is_empty() {
+                    lenz_gpui::text(window, cx, m, fx + 8.0, fy + 4.0, placeholder, p.dim);
+                }
+                lenz_gpui::field::paint(lenz_gpui::field::View { text: value,
+                    cursor: if active { self.cursor } else { Default::default() },
+                    bounds: rect(fx + 8.0, fy + 4.0, (fw - 20.0).max(0.0), self.char_w.max(1.0) * 2.0), char_w: self.char_w, active }, window, cx, m, p);
             }
             for ((option, b), on) in self.toggles.iter().zip(self.on) {
                 let (tx, ty, tw, th) = at(b);

@@ -75,6 +75,16 @@ pub struct Provider {
     pub sections: &'static [(&'static str, bool)],
     /// Text its server inserts after a typed character, asked through a request of its own.
     pub auto_insert: Option<AutoInsert>,
+    /// Whether Enter asks its server for `textDocument/onTypeFormatting` edits (when it offers them for `\n`).
+    /// Opt-in per provider: VS Code leaves format-on-type off, and servers that reformat the previous line on Enter
+    /// (typescript-language-server, clangd) would rewrite text the user did not ask to format.
+    pub formats_on_enter: bool,
+    /// A request whose answer means the server has applied every text sent before it, for a server that applies
+    /// text on another thread than it parses requests on (see `Server::pump_text`): questions wait for it.
+    pub sync_barrier: Option<&'static str>,
+    /// A request listing the bundle's gems and their folders (`[{ name, version, path }]`), asked once a session:
+    /// Go to Definition then also finds declarations its index misses there by name (see `ruby_declarations`).
+    pub dependencies: Option<&'static str>,
     /// The project environment its server analyses with, for workspace root, its settings (its configuration
     /// section) and the `PATH` it runs with: one line for Server Details, else why it must not start (the configured
     /// environment is missing, and the server would silently use another). Checked off the UI thread at launch.
@@ -148,6 +158,9 @@ const DEFAULT: Provider = Provider {
     blind_to: &[],
     sections: &[],
     auto_insert: None,
+    formats_on_enter: false,
+    sync_barrier: None,
+    dependencies: None,
     environment: None,
     registrations: |_| Vec::new(),
     computed: |_, _| None,
@@ -238,7 +251,7 @@ Provider {
     // It names itself and its version when initialized (`typescript-go 7.0.2`).
     version: Version::Initialize,
     tested: Some("7.0.2"),
-    setup: "Install TypeScript 7 in the project (`npm install --save-dev typescript@7`) or globally (`npm install -g typescript@7`, which needs Node.js) so that its `tsc` is in the project's node_modules/.bin or on PATH, or set its `executable` and `env.PATH` in providers.json; the reader never installs or upgrades it",
+    setup: "Install TypeScript 7 in the project (`npm install --save-dev typescript@7`) or globally (`npm install -g typescript@7`, which needs Node.js) so that its `tsc` is in the project's node_modules/.bin or on PATH, or set its `executable` and `env.PATH` in providers.json; Install Language Server offers explicit managed installation where supported; upgrades are never automatic",
     root: typescript_root,
     no_root: "no TypeScript or JavaScript project encloses this file; set a workspace root",
     config_section: "typescript",
@@ -261,7 +274,7 @@ Provider {
     // Its launcher has no version flag (it would start the server); it names its version when initialized.
     version: Version::Initialize,
     tested: Some("1.61.0"),
-    setup: "Install Eclipse JDT LS (a `jdtls` launcher; it needs Python 3 and Java 21 or newer, from JAVA_HOME or PATH) so that `jdtls` is on PATH, or set its `executable` and `env` (PATH, JAVA_HOME) in providers.json; the reader never installs or upgrades it",
+    setup: "Install Eclipse JDT LS (a `jdtls` launcher; it needs Python 3 and Java 21 or newer, from JAVA_HOME or PATH) so that `jdtls` is on PATH, or set its `executable` and `env` (PATH, JAVA_HOME) in providers.json; Install Language Server offers explicit managed installation where supported; upgrades are never automatic",
     root: java_root,
     no_root: "no Java project encloses this file; set a workspace root",
     origins: &[("/.m2/repository/", "a Maven dependency"), ("/.gradle/caches/", "a Gradle dependency")],
@@ -326,6 +339,12 @@ Provider {
 },
 Provider {
     id: "ruby-lsp",
+    // Its Enter edits close the block just opened with `end` (only while the file does not parse), continue a `#`
+    // comment and close a heredoc.
+    formats_on_enter: true,
+    // It answers this from its worker, in order behind text changes, without reading any document.
+    sync_barrier: Some("rubyLsp/workspace/addons"),
+    dependencies: Some("rubyLsp/workspace/dependencies"),
     name: "Ruby LSP",
     languages: &[Language::Ruby],
     language_id: |_, _| "ruby",
@@ -334,7 +353,7 @@ Provider {
     // `--version` prints it and exits before any bundle is composed.
     version: Version::Flag(&["--version"]),
     tested: Some("0.26.11"),
-    setup: "Install it with `gem install ruby-lsp` (for your user: `--user-install`, with that gem bin folder on PATH) so that `ruby-lsp` is on PATH, or set its `executable` and `env` (PATH, GEM_HOME, a version manager's shims) in providers.json; the reader never installs or upgrades it",
+    setup: "Install it with `gem install ruby-lsp` (for your user: `--user-install`, with that gem bin folder on PATH) so that `ruby-lsp` is on PATH, or set its `executable` and `env` (PATH, GEM_HOME, a version manager's shims) in providers.json; Install Language Server offers explicit managed installation where supported; upgrades are never automatic",
     root: ruby_root,
     no_root: "no Gemfile encloses this file; set a workspace root",
     // Installed gems by their installation folders (user, system, version managers, vendored bundles), never a
@@ -388,7 +407,7 @@ Provider {
     // `golang.org/x/tools/gopls v0.24.0` and its build line.
     version: Version::Flag(&["version"]),
     tested: Some("v0.24.0"),
-    setup: "Install it with `go install golang.org/x/tools/gopls@latest` (it needs the Go toolchain) and put its folder (usually ~/go/bin) on PATH, or set its `executable` in providers.json; the reader never installs or upgrades it",
+    setup: "Install it with `go install golang.org/x/tools/gopls@latest` (it needs the Go toolchain) and put its folder (usually ~/go/bin) on PATH, or set its `executable` in providers.json; Install Language Server offers explicit managed installation where supported; upgrades are never automatic",
     root: |file, _| go_root(file),
     no_root: "no go.mod or go.work encloses this file; set a workspace root",
     origins: &[("/pkg/mod/", "a Go module dependency"), ("/go/src/", "the Go standard library")],
@@ -1018,10 +1037,10 @@ impl Settings {
             args: s.and_then(|s| s.args.clone()).unwrap_or_else(|| provider.args.iter().map(|a| a.to_string()).collect()),
             env: s.map(|s| s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
         };
-        if provider.id == "pyright"
+        if super::installer::node_package(provider.id).is_some()
             && let Some(bin) = s.and_then(|s| s.node.as_deref()).and_then(Path::parent)
         {
-            if launch.executable == Path::new(provider.executable) {
+            if provider.id == "pyright" && launch.executable == Path::new(provider.executable) {
                 launch.executable = bin.join(if cfg!(windows) { "pyright-langserver.cmd" } else { "pyright-langserver" });
             }
             let inherited = std::env::var_os("PATH");

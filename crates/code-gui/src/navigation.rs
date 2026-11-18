@@ -15,8 +15,30 @@ pub(super) struct Frame {
     char_w: f32,
     scope: Scope,
     query: String,
+    cursor: lenz_content::field_edit::Cursor,
     status: String,
     rows: Vec<code_core::navigation::Row>,
+}
+
+/// The caret edit a key makes in a one-line text box (Search Everywhere, Search in Project): arrows by character, Alt
+/// (macOS's Option) or Ctrl by word, Cmd to the ends, as in a macOS text field; Backspace and Delete take a character,
+/// with Alt, Ctrl or Cmd a word. Shift moves the caret alike.
+pub(super) fn line_edit_key(ev: &KeyDownEvent) -> Option<code_core::line_edit::Edit> {
+    use code_core::line_edit::Edit;
+    let m = &ev.keystroke.modifiers;
+    let key = ev.keystroke.key.as_str();
+    Some(match key {
+        "left" | "right" if m.platform && !m.control && !m.alt => if key == "left" { Edit::Start } else { Edit::End },
+        "left" if m.alt || m.control => Edit::WordLeft,
+        "right" if m.alt || m.control => Edit::WordRight,
+        "left" => Edit::Left,
+        "right" => Edit::Right,
+        "backspace" if m.alt || m.control || m.platform => Edit::BackspaceWord,
+        "backspace" => Edit::Backspace,
+        "delete" if m.alt || m.control || m.platform => Edit::DeleteWord,
+        "delete" => Edit::Delete,
+        _ => return None,
+    })
 }
 
 impl ReaderView {
@@ -28,19 +50,20 @@ impl ReaderView {
         self.crumb_focus = None;
         self.navigation_drawn = None;
         self.modal_seen.set(None);
-        self.modal = Some(Modal::Navigation { at: 0 });
+        self.modal = Some(Modal::Navigation { at: 0, caret: None });
         self.dispatch(Command::SearchEverywhere { scope, query: String::new() }, cx);
     }
 
-    fn update_navigation(&mut self, scope: Scope, query: String, cx: &mut Context<Self>) {
-        self.modal = Some(Modal::Navigation { at: 0 });
+    /// A new query or scope: the list starts over at its first row; the caret stays where it is (`None`: the end).
+    pub(super) fn update_navigation(&mut self, scope: Scope, query: String, caret: Option<usize>, cx: &mut Context<Self>) {
+        self.modal = Some(Modal::Navigation { at: 0, caret });
         self.modal_seen.set(None);
         self.navigation_drawn = None;
         self.dispatch(Command::SearchEverywhere { scope, query }, cx);
     }
 
     pub(super) fn accept_navigation(&mut self, revision: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Modal::Navigation { at }) = self.modal else { return };
+        let Some(Modal::Navigation { at, .. }) = self.modal else { return };
         let Some(choice) = self.session.navigation_choice(revision, at) else { return };
         if let Chosen::Command(command @ Command::ActivateNavigation { .. }) = choice {
             return self.dispatch(command, cx);
@@ -57,11 +80,13 @@ impl ReaderView {
     }
 
     pub(super) fn navigation_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use code_core::line_edit::{self, Edit};
         let Some(search) = self.session.state().navigation() else { return self.close_modal(cx) };
         let (mut query, mut scope, len) = (search.query.clone(), search.scope, search.rows.len());
         let key = ev.keystroke.key.as_str();
-        let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
-        let scope_shortcut = match (key, ctrl, ev.keystroke.modifiers.shift, ev.keystroke.modifiers.alt) {
+        let m = &ev.keystroke.modifiers;
+        let ctrl = m.control || m.platform;
+        let scope_shortcut = match (key, ctrl, m.shift, m.alt) {
             ("p", true, false, false) | ("n", true, true, false) => Some(Scope::Files),
             ("n", true, true, true) => Some(Scope::Symbols),
             ("a" | "p", true, true, false) => Some(Scope::Actions),
@@ -69,8 +94,16 @@ impl ReaderView {
             ("e", true, false, false) => Some(Scope::Recent),
             _ => None,
         };
-        if let Some(scope) = scope_shortcut { return self.update_navigation(scope, query, cx); }
-        let Some(Modal::Navigation { at }) = &mut self.modal else { return };
+        let Some(Modal::Navigation { at, caret }) = &mut self.modal else { return };
+        let mut caret = caret.map_or(query.len(), |c| line_edit::clamp(&query, c));
+        if let Some(scope) = scope_shortcut { return self.update_navigation(scope, query, Some(caret), cx); }
+        // The query's caret; Delete stays Recent Files' forget-the-row key.
+        let edit = line_edit_key(ev).filter(|edit| scope != Scope::Recent || !matches!(edit, Edit::Delete | Edit::DeleteWord));
+        if let Some(edit) = edit {
+            if line_edit::apply(&mut query, &mut caret, edit) { return self.update_navigation(scope, query, Some(caret), cx); }
+            if let Some(Modal::Navigation { caret: shown, .. }) = &mut self.modal { *shown = Some(caret); }
+            return cx.notify();
+        }
         *at = (*at).min(len.saturating_sub(1));
         let page = self.navigation_drawn.map_or(5, |(_, _, n)| n.max(1));
         match key {
@@ -82,7 +115,7 @@ impl ReaderView {
             "pagedown" => *at = (*at + page).min(len.saturating_sub(1)),
             "home" => *at = 0,
             "end" => *at = len.saturating_sub(1),
-            "delete" if scope == Scope::Recent => {
+            "delete" | "f6" if scope == Scope::Recent => {
                 if let Some((revision, ..)) = self.navigation_drawn {
                     let index = *at;
                     self.dispatch(Command::ForgetNavigation { revision, index }, cx);
@@ -90,21 +123,20 @@ impl ReaderView {
             }
             "tab" if scope != Scope::Recent => {
                 let i = Scope::ALL.iter().position(|s| *s == scope).unwrap_or(0);
-                scope = Scope::ALL[(i + if ev.keystroke.modifiers.shift { 3 } else { 1 }) % 4];
-                self.update_navigation(scope, query, cx);
+                scope = Scope::ALL[(i + if m.shift { 3 } else { 1 }) % 4];
+                self.update_navigation(scope, query, Some(caret), cx);
             }
-            "a" if ctrl => { query.clear(); self.update_navigation(scope, query, cx); }
+            "a" if ctrl => { query.clear(); self.update_navigation(scope, query, None, cx); }
             "v" if ctrl => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    query.extend(text.chars().filter(|c| !c.is_control()));
-                    self.update_navigation(scope, query, cx);
+                    line_edit::insert(&mut query, &mut caret, &text);
+                    self.update_navigation(scope, query, Some(caret), cx);
                 }
             }
-            "backspace" => { query.pop(); self.update_navigation(scope, query, cx); }
             _ => {
-                if !ctrl && !ev.keystroke.modifiers.alt && let Some(text) = ev.keystroke.key_char.as_ref().filter(|s| !s.chars().any(char::is_control)) {
-                    query.push_str(text);
-                    self.update_navigation(scope, query, cx);
+                if !ctrl && !m.alt && let Some(text) = ev.keystroke.key_char.as_ref().filter(|s| !s.chars().any(char::is_control)) {
+                    line_edit::insert(&mut query, &mut caret, text);
+                    self.update_navigation(scope, query, Some(caret), cx);
                 }
             }
         }
@@ -125,12 +157,13 @@ impl ReaderView {
         if y >= 0.0 && y < line_h() && self.session.state().navigation().is_some_and(|n| n.scope != Scope::Recent) {
             let i = (x / (f32::from(bounds.size.width) / 4.0).max(1.0)).floor() as usize;
             if let Some(scope) = Scope::ALL.get(i) && let Some(search) = self.session.state().navigation() {
-                self.update_navigation(*scope, search.query.clone(), cx);
+                let caret = match self.modal { Some(Modal::Navigation { caret, .. }) => caret, _ => None };
+                self.update_navigation(*scope, search.query.clone(), caret, cx);
             }
         } else if y >= HEADER * line_h() && let Some((revision, first, visible)) = self.navigation_drawn {
             let row = ((y - HEADER * line_h()) / (line_h() * 2.0)).floor() as usize;
             if row < visible {
-                if let Some(Modal::Navigation { at }) = &mut self.modal { *at = first + row; }
+                if let Some(Modal::Navigation { at, .. }) = &mut self.modal { *at = first + row; }
                 self.accept_navigation(revision, window, cx);
             }
         }
@@ -146,12 +179,13 @@ impl ReaderView {
         let bounds = self.navigation_bounds();
         let visible = self.navigation_visible(self.session.state().navigation()?.rows.len());
         let search = self.session.state().navigation()?;
-        let Some(Modal::Navigation { at }) = &mut self.modal else { return None };
+        let Some(Modal::Navigation { at, .. }) = &mut self.modal else { return None };
         *at = (*at).min(search.rows.len().saturating_sub(1));
         let at = *at;
         let first = self.modal_first(at, at..at + 1, search.rows.len(), visible);
         self.navigation_drawn = Some((search.revision, first, visible));
-        Some(Frame { bounds, first, at, char_w: self.char_w, scope: search.scope, query: search.query.clone(), status: self.session.navigation_status(), rows: search.rows.iter().skip(first).take(visible).cloned().collect() })
+        let snapshot = self.popup_field_snapshot(self.columns((f32::from(bounds.size.width) - 36.0 - 2.0 * self.char_w).max(0.0)))?;
+        Some(Frame { bounds, first, at, char_w: self.char_w, scope: search.scope, query: snapshot.text, cursor: snapshot.cursor, status: self.session.navigation_status(), rows: search.rows.iter().skip(first).take(visible).cloned().collect() })
     }
 
     pub(super) fn navigation_rows(&self) -> Vec<(String, Option<&'static str>)> {
@@ -180,17 +214,10 @@ impl Frame {
             }
             let input_y = y + 4.0 + line_h();
             lenz_gpui::fill(window, x + 6.0, input_y, (w - 12.0).max(0.0), line_h(), p.bg);
-            let query = tail(&self.query, ((w - 36.0) / self.char_w).max(1.0) as usize);
-            let input = format!("› {query}");
-            let input = lenz_content::display::cap_marks(&input);
-            let input = lenz_content::display::show_bidi(&input).into_owned();
-            let run = gpui::TextRun { len: input.len(), font: m.font.clone(), color: lenz_gpui::color(p.fg), background_color: None, underline: None, strikethrough: None };
-            let line = window.text_system().shape_line(input.into(), px(m.font_size), &[run], None);
-            let tx = (x + 12.0).min(x + w - 14.0 - f32::from(line.width));
-            window.with_content_mask(Some(lenz_gpui::clip(bounds, x + 6.0, w - 12.0)), |window| {
-                let _ = line.paint(gpui::point(px(tx), px(input_y)), px(m.line_h), gpui::TextAlign::Left, None, window, cx);
-                lenz_gpui::fill(window, tx + f32::from(line.width), input_y + 1.0, 2.0, line_h() - 2.0, p.caret);
-            });
+            lenz_gpui::text(window, cx, m, x + 12.0, input_y, "›", p.dim);
+            lenz_gpui::field::paint(lenz_gpui::field::View { text: &self.query, cursor: self.cursor,
+                bounds: Bounds { origin: gpui::point(px(x + 12.0 + 2.0 * self.char_w), px(input_y)), size: gpui::size(px((w - 36.0 - 2.0 * self.char_w).max(0.0)), px(line_h())) },
+                char_w: self.char_w, active: true }, window, cx, m, p);
             let hint = if self.scope == Scope::Recent { format!("{} · Enter open · Esc close", self.status) } else if self.query.is_empty() { format!("{} · Tab category · Enter open · Esc close", self.status) } else { self.status.clone() };
             lenz_gpui::text(window, cx, m, x + 12.0, input_y + line_h(), &hint, p.dim);
             for (i, row) in self.rows.iter().enumerate() {
@@ -232,6 +259,7 @@ fn highlights(query: &str, label: &str, color: u32) -> Vec<(std::ops::Range<usiz
 }
 
 /// Keep the end of a long query and its caret visible in the fixed input row.
+#[cfg(test)]
 pub(super) fn tail(query: &str, columns: usize) -> String {
     use lenz_content::wrap::width;
     if columns == 0 { return String::new(); }

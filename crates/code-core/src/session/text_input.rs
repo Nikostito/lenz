@@ -76,19 +76,59 @@ impl Session {
         self.edit(tab, expected, edits, kind)
     }
 
-    /// Plain Enter preserves each line's existing tabs and spaces before the replacement, without copying its body.
+    /// Plain Enter: in code ([`crate::edit_ops::structured_enter`]) each caret's new line is indented as its block
+    /// calls for ([`crate::edit_ops::enter_plan`]), and Enter between a bracket and its closer opens an indented line
+    /// with the closer below it; elsewhere each line's existing tabs and spaces before the caret are kept, without
+    /// copying its body. One transaction either way; only the caret's line and the lines above a blank one are read.
     fn indented_newline(&mut self, newline: &str) -> Option<Effect> {
-        let (tab, expected, ranges) = self.selection_ranges()?;
+        /// Lines above a blank one searched for text, and the longest line read for its structure.
+        const LOOK_BACK: usize = 200;
+        const LINE_BYTES: usize = 65_536;
+        let (tab, expected, selections, primary) = self.structural_target()?;
         let doc = self.state.view(tab)?.snapshot();
-        let mut edits = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let start = doc.reader_line_range(doc.line_of(range.start)).start;
-            let mut end = start;
-            while end < range.start && matches!(doc.range(end..end + 1).as_deref(), Some(" " | "\t")) { end += 1; }
-            let indent = doc.range(start..end)?;
-            edits.push(TextEdit { range, text: format!("{newline}{indent}").into() });
+        let language = doc.language().filter(|language| crate::edit_ops::structured_enter(Some(*language)));
+        let mut unit = None;
+        let mut edits = Vec::with_capacity(selections.len());
+        let mut after = Vec::with_capacity(selections.len());
+        let mut delta = 0isize;
+        let ranges: Vec<_> = selections.iter().map(|selection| selection.range()).collect();
+        for (i, range) in ranges.iter().enumerate() {
+            let line = doc.line_of(range.start);
+            let start = doc.reader_line_range(line).start;
+            let mut range = range.clone();
+            let plan = match language.filter(|_| range.start - start <= LINE_BYTES) {
+                Some(language) => {
+                    let end = doc.line_range(doc.line_of(range.end)).map_or(range.end, |line| line.end);
+                    let before = doc.copy_range(start..range.start)?;
+                    let rest = doc.copy_range(range.end..end.min(range.end + LINE_BYTES))?;
+                    let previous = || (line.saturating_sub(LOOK_BACK)..line).rev().find_map(|above| {
+                        let text = doc.line_range(above).and_then(|r| doc.copy_range(r.start..r.end.min(r.start + LINE_BYTES)))?;
+                        (!text.trim().is_empty()).then_some(text)
+                    });
+                    let plan = crate::edit_ops::enter_plan(&before, &rest, previous, language, || unit.get_or_insert_with(|| self.indent_unit()).clone());
+                    // The closer's own line starts at the closer: the blanks before it go, up to the next caret.
+                    if plan.closer.is_some() {
+                        let blanks = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+                        range.end = (range.end + blanks).min(ranges.get(i + 1).map_or(usize::MAX, |next| next.start));
+                    }
+                    plan
+                }
+                None => {
+                    let mut end = start;
+                    while end < range.start && matches!(doc.range(end..end + 1).as_deref(), Some(" " | "\t")) { end += 1; }
+                    crate::edit_ops::EnterPlan { indent: doc.range(start..end)?.to_string(), closer: None }
+                }
+            };
+            let text = match &plan.closer {
+                Some(closer) => format!("{newline}{}{newline}{closer}", plan.indent),
+                None => format!("{newline}{}", plan.indent),
+            };
+            let caret = range.start.checked_add_signed(delta)? + newline.len() + plan.indent.len();
+            delta += text.len() as isize - range.len() as isize;
+            edits.push(TextEdit { range, text: text.into() });
+            after.push(Selection { anchor: caret, head: caret });
         }
-        Some(self.edit(tab, expected, edits, EditKind::Typing))
+        Some(self.apply_planned(tab, expected, edits, EditKind::Typing, Some((after, primary))))
     }
 
     fn xml_newline(&mut self, newline: &str) -> Option<Effect> {
@@ -164,12 +204,13 @@ impl Session {
         if self.text_action_disabled(CommandId::Delete).is_some() { return Effect::default(); }
         let Some((tab, expected, ranges)) = self.selection_ranges() else { return Effect::default() };
         let Some(source) = self.state.source(tab) else { return Effect::default() };
+        let spaces = self.state.settings.mac_word_motion;
         // An empty selection takes the neighbouring character (a CRLF pair as one), as a caret alone does.
         let mut removals: Vec<std::ops::Range<usize>> = ranges.into_iter().map(|range| {
             if !range.is_empty() { return range; }
             let at = range.start;
             // Ctrl+Backspace / Ctrl+Delete: to the word stop; at the line's edge, the line break as below.
-            let stop = if word { super::word_stop(source, at, backward) } else { at };
+            let stop = if word { super::word_stop(source, at, backward, spaces) } else { at };
             if stop != at { return stop.min(at)..stop.max(at); }
             if backward {
                 if source.range(at.saturating_sub(2)..at).as_deref() == Some("\r\n") { at - 2..at } else { source.previous_char_boundary(at)..at }

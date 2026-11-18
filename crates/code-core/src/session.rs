@@ -54,6 +54,10 @@ mod close_work;
 mod external_work;
 #[path = "session/save_as.rs"]
 mod save_as_work;
+#[path = "session/archive_save.rs"]
+pub(crate) mod archive_save_work;
+#[path = "session/archive.rs"]
+mod archive_work;
 #[path = "session/scratch.rs"]
 mod scratch_work;
 #[path = "session/create.rs"]
@@ -102,6 +106,9 @@ use lenz_content::{
 };
 
 mod project_search;
+#[path = "session/workspace_edit.rs"]
+mod workspace_edit;
+pub use workspace_edit::WorkspacePlan;
 #[path = "session/project_syntax.rs"]
 mod project_syntax;
 mod navigation_query;
@@ -157,6 +164,15 @@ pub use crate::native::{NativeReveal, NativeViewport};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    PreviewProjectReplace(String),
+    RenameSymbol(String),
+    ApplyWorkspaceEdit,
+    CancelWorkspaceEdit,
+    ToggleWorkspaceFile(usize),
+    MoveWorkspaceFile(isize),
+    ToggleCurrentWorkspaceFile,
+    OpenArchiveEntry(crate::archive::Location),
+    ArchiveTreeParent { path: Arc<str> },
     Terminal(crate::terminal::Command),
     Csv(crate::csv::Command),
     /// A transient input-method display, validated against the captured authoritative source.
@@ -179,6 +195,9 @@ pub enum Command {
     MoveLines { down: bool },
     /// Copy the lines the selections touch directly below (or above) themselves.
     DuplicateLines { down: bool },
+    /// Delete every line the selections touch, endings included, as one transaction; each caret keeps its column on
+    /// the line that takes the deleted lines' place.
+    DeleteLines,
     SetReadOnly(bool),
     CompareSaved,
     CloseSavedComparison,
@@ -202,6 +221,9 @@ pub enum Command {
     NewDocument,
     /// Create a durable personal file in app-owned storage.
     NewScratch(String),
+    /// A new scratch file of [`crate::scratch::KINDS`]`[kind]`, named `scratch_N.<extension>` (the next free N), opened
+    /// with its SQL dialect when it has one.
+    NewScratchFile(usize),
     OpenScratch(PathBuf),
     /// Create `kind` named `name` in folder `dir` (project-relative, `""` the root) and open or select it.
     CreateEntry { kind: crate::create::Kind, dir: Arc<str>, name: String },
@@ -293,6 +315,19 @@ pub enum Command {
     /// Wrap long lines at the pane's width (remembered).
     SetSoftWrap(bool),
     SetRelativeLineNumbers(bool),
+    /// The caret line's commit, faint after the line's end (author, date and summary); remembered.
+    SetInlineBlame(bool),
+    /// The explorer follows the active file: whenever it changes, the explorer selects it; remembered.
+    SetAlwaysSelectOpenedFile(bool),
+    /// macOS-style word motion: Option+Left/Right move by word, and word stops cross the spaces between words; remembered.
+    SetMacWordMotion(bool),
+    /// Leaving a file (another tab, file or pane becomes active) saves its edits as Save does; remembered.
+    SetSaveOnLeave(bool),
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
+    SetNameLetterSearch(bool),
+    /// Search Everywhere ranks files near the open and recent ones higher (and a file named exactly as the query
+    /// first); remembered.
+    SetRankNearbyFiles(bool),
     SetVimEnabled(bool),
     VimKey(keymap::KeyPress),
     /// Show a project file or folder (project-relative) in the explorer, opening the folders above it.
@@ -506,6 +541,10 @@ pub enum Command {
     SetFileIcons(bool),
     /// Copy the active file's path (relative to the open folder), with `:line` of the caret when `line`.
     CopyPath { line: bool },
+    /// Copy the qualified name of the declaration at the caret (`Foo::Bar::Baz#foo_method`), else `path:line`.
+    CopyReference,
+    /// Open the active file's test, or the file the active test tests (see [`crate::relevant`]).
+    GoToTest,
     /// A message from the adapter (a launch it could not start), shown with the core's own.
     Notice(String),
     /// Mark the occurrences of the name at the caret (asked in the background; never cancels another request).
@@ -617,6 +656,7 @@ pub enum Motion {
 /// The user-facing commands, as menus list them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
+    ProjectReplace, RenameSymbol, ApplyWorkspaceEdit, CancelWorkspaceEdit,
     ShowTerminal, NewTerminal, FocusTerminal, FocusEditor, SendSelectionToTerminal, PasteTerminalPath, CloseTerminal, StopTerminal, RenameTerminal, RestartTerminal, NextTerminal, PreviousTerminal, CopyTerminalSelection, FindTerminal,
     CsvTable, CsvHeader, CsvFilter, CsvSort, CsvClearFilter, CsvMoveLeft, CsvMoveRight, CsvDropColumn, CsvEditCell,
     Open,
@@ -645,6 +685,14 @@ pub enum CommandId {
     SoftWrap,
     RelativeLineNumbers,
     VimMode,
+    /// Option+Left/Right move by word (macOS), word stops crossing spaces; remembered, off by default.
+    MacWordMotion,
+    /// Save a file's edits, as Save does, when another tab, file or pane becomes active; remembered, off by default.
+    SaveOnLeave,
+    /// Search Everywhere's All tab finds files by letters in order in their name; remembered, off by default.
+    NameLetterSearch,
+    /// Search Everywhere and Find File rank files near the open and recent ones higher; remembered, off by default.
+    RankNearbyFiles,
     /// Pin the enclosing declarations at the top of each pane; remembered.
     StickyScroll,
     /// The path and declarations bar above each pane's text; remembered.
@@ -754,6 +802,8 @@ pub enum CommandId {
     DuplicateLinesUp,
     /// Copy the lines the selections touch directly below themselves.
     DuplicateLinesDown,
+    /// Delete the lines the selections touch (IntelliJ's Delete Line).
+    DeleteLine,
     ChooseTheme,
     /// The application's name, version, platform, licence and project page (the adapter shows it).
     About,
@@ -811,6 +861,10 @@ pub enum CommandId {
     /// The active file's path (relative to the open folder), and with the caret's line.
     CopyPath,
     CopyPathLine,
+    /// The qualified name of the declaration at the caret (IntelliJ's Copy Reference), else the path and line.
+    CopyReference,
+    /// Switch between the active file and its test (RubyMine's Navigate › Test).
+    GoToTest,
     /// The active file in the user's editor at the caret, or with the system's default app.
     OpenInEditor,
     OpenWithDefaultApp,
@@ -851,6 +905,8 @@ pub enum CommandId {
     /// The tree's order: each folder's folders before its files, or everything by name.
     FoldersFirst,
     AllByName,
+    /// The explorer selects the active file whenever it changes (IntelliJ's Always Select Opened File); remembered.
+    AlwaysSelectOpenedFile,
     GitBranches,
     NewBranch,
     CheckoutRevision,
@@ -864,6 +920,8 @@ pub enum CommandId {
     CompareWithWorktree,
     ResolveConflicts,
     AnnotateBlame,
+    /// The caret line's last commit shown faintly after its end; remembered.
+    InlineBlame,
     CloseAnnotations,
     NarrowAnnotations,
     WidenAnnotations,
@@ -946,13 +1004,13 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 250] = [
+    pub const ALL: [CommandId; 263] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
         Self::OpenRecent,
         Self::FindFile,
-        Self::SearchProject,
+        Self::SearchProject, Self::ProjectReplace, Self::RenameSymbol, Self::ApplyWorkspaceEdit, Self::CancelWorkspaceEdit,
         Self::FindInFile,
         Self::NextMatch,
         Self::PreviousMatch,
@@ -967,6 +1025,10 @@ impl CommandId {
         Self::SoftWrap,
         Self::RelativeLineNumbers,
         Self::VimMode,
+        Self::MacWordMotion,
+        Self::SaveOnLeave,
+        Self::NameLetterSearch,
+        Self::RankNearbyFiles,
         Self::StickyScroll,
         Self::Breadcrumbs,
         Self::FocusBreadcrumbs,
@@ -1034,6 +1096,8 @@ impl CommandId {
         Self::ResolveExternalChange,
         Self::CopyPath,
         Self::CopyPathLine,
+        Self::CopyReference,
+        Self::GoToTest,
         Self::OpenInEditor,
         Self::OpenWithDefaultApp,
         Self::CompareWith,
@@ -1058,6 +1122,7 @@ impl CommandId {
         Self::MoveLinesDown,
         Self::DuplicateLinesUp,
         Self::DuplicateLinesDown,
+        Self::DeleteLine,
         Self::ChooseTheme,
         Self::About,
         Self::NewWindow,
@@ -1120,6 +1185,7 @@ impl CommandId {
         Self::LocateFile,
         Self::FoldersFirst,
         Self::AllByName,
+        Self::AlwaysSelectOpenedFile,
         Self::GitBranches,
         Self::NewBranch,
         Self::CheckoutRevision,
@@ -1130,6 +1196,7 @@ impl CommandId {
         Self::CompareWithWorktree,
         Self::ResolveConflicts,
         Self::AnnotateBlame,
+        Self::InlineBlame,
         Self::CloseAnnotations,
         Self::NarrowAnnotations,
         Self::WidenAnnotations,
@@ -1218,6 +1285,10 @@ impl CommandId {
             Self::OpenRecent => "Open Recent Folder…",
             Self::FindFile => "Find File…",
             Self::SearchProject => "Search in Project…",
+            Self::ProjectReplace => "Replace in Project…",
+            Self::RenameSymbol => "Rename Symbol…",
+            Self::ApplyWorkspaceEdit => "Apply Previewed Edits",
+            Self::CancelWorkspaceEdit => "Cancel Edit Preview",
             Self::FindInFile => "Find in File…",
             Self::NextMatch => "Next Match",
             Self::PreviousMatch => "Previous Match",
@@ -1315,6 +1386,7 @@ impl CommandId {
             Self::MoveLinesDown => "Move Lines Down",
             Self::DuplicateLinesUp => "Duplicate Lines Up",
             Self::DuplicateLinesDown => "Duplicate Lines Down",
+            Self::DeleteLine => "Delete Line",
             Self::ChooseTheme => "Change theme",
             Self::About => crate::chrome::ABOUT_TITLE,
             Self::NewWindow => "New Window",
@@ -1369,6 +1441,11 @@ impl CommandId {
             Self::CompareWithWorktree => "Compare with Worktree…",
             Self::ResolveConflicts => "Resolve Conflicts in Lenz Diff",
             Self::AnnotateBlame => "Annotate with Git Blame",
+            Self::InlineBlame => "Inline Blame",
+            Self::MacWordMotion => "macOS Word Motion",
+            Self::SaveOnLeave => "Save When Leaving a File",
+            Self::NameLetterSearch => "Search Everywhere: Letters in File Names",
+            Self::RankNearbyFiles => "Search Everywhere: Rank by Open and Recent Files",
             Self::CloseAnnotations => "Close Annotations",
             Self::NarrowAnnotations => "Narrow Annotation Gutter",
             Self::WidenAnnotations => "Widen Annotation Gutter",
@@ -1381,6 +1458,8 @@ impl CommandId {
             Self::SemanticHighlighting => "Semantic Highlighting",
             Self::CopyPath => "Copy Path",
             Self::CopyPathLine => "Copy Path:Line",
+            Self::CopyReference => "Copy Reference",
+            Self::GoToTest => "Go to Test or Subject",
             Self::OpenInEditor => "Open in Editor",
             Self::OpenWithDefaultApp => "Open with Default App",
             Self::CompareWith => "Compare Saved Disk Inputs…",
@@ -1413,6 +1492,7 @@ impl CommandId {
             Self::ToggleExplorer => "Show / Hide Explorer",
             Self::LocateFile => "Select Opened File in Explorer",
             Self::FoldersFirst => "Explorer: Folders First",
+            Self::AlwaysSelectOpenedFile => "Explorer: Always Select Opened File",
             Self::AllByName => "Explorer: All by Name",
             Self::SplitRight => "Split Right",
             Self::SplitDown => "Split Down",
@@ -1506,6 +1586,12 @@ pub struct Action {
 
 /// Results of background work, applied through [`Session::dispatch`].
 pub enum Completion {
+    WorkspacePrepared { request: u64, apply: bool, result: Result<WorkspacePlan, String> },
+    ArchiveListed(crate::archive_tree::Listed),
+    ArchiveLoaded(Box<archive_save_work::Loaded>),
+    ArchiveSaved(Box<archive_save_work::Saved>),
+    ArchiveRechecked(Box<archive_save_work::Rechecked>),
+    ArchiveRecovered { ticket: u64, result: Result<Document, String> },
     TerminalStarted { id: crate::terminal::Id, generation: u64, result: Result<crate::terminal::Process, String> },
     TerminalWake { id: crate::terminal::Id, generation: u64 },
     ExplorerCopied { request: u64, result: Result<(), String> },
@@ -1569,7 +1655,7 @@ pub enum Completion {
     /// Filesystem changes, coalesced.
     Changed(Change),
     /// A tab's source was checked against the disk.
-    Refreshed { tab: TabId, token: u64, result: Refresh },
+    Refreshed { tab: TabId, token: u64, baseline: RefreshBaseline, result: Refresh },
     /// Results for search `id`.
     Found { id: u64, found: search::Found },
     ProjectSyntax(project_syntax::Reply),
@@ -1649,6 +1735,10 @@ pub enum Refresh {
     Unstable,
 }
 
+/// Opaque identity of the confirmed content a disk check compared against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshBaseline(Option<SemanticSource>);
+
 pub enum Input {
     Command(Command),
     Completion(Completion),
@@ -1660,6 +1750,11 @@ impl Input {
         match self {
             Input::Command(_) => "command",
             Input::Completion(c) => match c {
+                Completion::ArchiveListed(..) => "archive-listed",
+                Completion::ArchiveLoaded(..) => "archive-loaded",
+                Completion::ArchiveSaved(..) => "archive-saved",
+                Completion::ArchiveRechecked(..) => "archive-rechecked",
+                Completion::ArchiveRecovered { .. } => "archive-recovered",
                 Completion::TerminalStarted { .. } | Completion::TerminalWake { .. } => "terminal",
                 Completion::ExplorerCopied { .. } => "explorer copy",
                 Completion::FileClipboard { .. } => "file clipboard",
@@ -1675,6 +1770,7 @@ impl Input {
                 Completion::PlacesMerged { .. } => "places merged",
                 Completion::PlacesChecked { .. } => "places checked",
                 Completion::Checked { .. } => "checked",
+                Completion::WorkspacePrepared { .. } => "workspace edits",
                 Completion::Loaded { .. } => "loaded",
                 Completion::Highlighted { .. } => "highlighted",
                 Completion::Decorated { .. } => "decorated",
@@ -1771,9 +1867,13 @@ pub struct State {
     palette: Arc<Palette>,
     project: Option<Project>,
     libraries: crate::libraries::Libraries,
+    pub(crate) archive_tree: crate::archive_tree::Tree,
     tree_revision: u64,
     /// The explorer row the session asked the adapters to show and select, with its ticket.
     tree_reveal: Option<(Arc<str>, u64)>,
+    /// Always Select Opened File: the active file's row for the adapters to select (and scroll to, not show the
+    /// explorer for), once per ticket.
+    tree_follow: Option<(Arc<str>, u64)>,
     explorer: crate::workspace::Explorer,
     explorer_search: ExplorerSearch,
     workspace_revision: u64,
@@ -1905,6 +2005,42 @@ struct Asking {
     root: Option<Call>,
 }
 
+/// A Ruby definition's by-name search: declarations Ruby LSP's index misses (methods made by ActiveSupport's
+/// `cattr_accessor`, `class_attribute`, `delegate` and the like, in the project and its gems), added as candidates
+/// when the server found nothing (plain `def`s too) or only declarations outside the project (macros only), as
+/// RubyMine lists them. Run off the UI thread with the server's own targets. The project's files are read each time
+/// (they change); the gems' macro declarations are indexed once per server session.
+struct ByName { name: String, gems: Arc<Vec<PathBuf>>, index: crate::ruby_declarations::SharedIndex, files: Vec<PathBuf>, root: Option<PathBuf> }
+
+impl ByName {
+    fn add(&self, targets: &mut semantics::Targets, limit: usize, read: semantics::ReadFile, wanted: &dyn Fn() -> bool) {
+        let in_project = |p: &Path| self.root.as_ref().is_some_and(|r| p.starts_with(r));
+        if !targets.unavailable.is_empty() || targets.found.len() >= limit || targets.found.iter().any(|t| in_project(&t.path)) { return; }
+        let defs = targets.found.is_empty();
+        let mut paths = crate::ruby_declarations::search(&self.name, &self.files, defs, limit - targets.found.len(), wanted);
+        let gems = self.index.get_or_init(|| crate::ruby_declarations::GemIndex::build(&self.gems)).files_declaring(&self.name);
+        let first_gem = paths.len();
+        paths.extend(gems);
+        for (i, path) in paths.into_iter().enumerate() {
+            if !wanted() { return; }
+            // Only macros in gems: their plain `def`s are in the server's index.
+            let defs = defs && i < first_gem;
+            let Ok((stamp, doc)) = read(&path) else { continue };
+            let mut offset = 0;
+            for line in doc.text().split_inclusive('\n') {
+                if let Some(range) = crate::ruby_declarations::declares(line.trim_end_matches(['\n', '\r']), &self.name, defs) {
+                    let (start, end) = (offset + range.start, offset + range.end);
+                    let known = targets.found.iter().any(|t| t.path == path && t.doc.line_of(t.at) == doc.line_of(start));
+                    if !known && targets.found.len() < limit {
+                        targets.found.push(semantics::Target { path: path.clone(), stamp: Some(stamp), doc: doc.clone(), hit: semantics::hit_at(&path, &doc, start, end), at: start, decoded_digest: None });
+                    }
+                }
+                offset += line.len();
+            }
+        }
+    }
+}
+
 /// What the user asked a language server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
@@ -2008,6 +2144,7 @@ impl Sources {
         entry.saved = entry.snapshot.as_ref().map(|snapshot| SemanticSource::new(snapshot));
         entry.stamp = stamp;
         entry.save.read = doc.write_baseline.as_deref().cloned();
+        entry.save.archive = doc.archive_baseline.clone();
         entry.save.status = crate::save::Status::Ready;
         id
     }
@@ -2031,9 +2168,17 @@ impl<'a> View<'a> {
     pub fn dirty(&self) -> bool { self.draft.is_some_and(crate::draft::Draft::dirty) }
     pub fn can_undo(&self) -> bool { self.tab.read_only_side().is_none() && self.draft.is_some_and(crate::draft::Draft::can_undo) }
     pub fn can_redo(&self) -> bool { self.tab.read_only_side().is_none() && self.draft.is_some_and(crate::draft::Draft::can_redo) }
+    pub(super) fn intrinsic_export_disabled(&self) -> Option<&'static str> {
+        if let Some(side) = self.tab.read_only_side() { side.read_only() }
+        else if self.snapshot.image().is_some() { Some("Images are read-only") }
+        else if self.tab.retrieved.is_some() { Some("Retrieved sources are read-only") }
+        else if self.snapshot.source_meta().is_binary() { Some("Binary files are read-only") }
+        else if self.snapshot.source_meta().is_lossy() { Some("Lossy text is read-only") }
+        else { None }
+    }
     /// Existing confirmed ending preference; typing never normalizes the remaining source.
     pub fn input_newline(&self) -> &'static str {
-        if self.save.read.as_ref().is_some_and(|read| read.snapshot.crlf) { "\r\n" } else { "\n" }
+        if self.save.read.as_ref().is_some_and(|read| read.snapshot.crlf) || self.save.archive.as_ref().is_some_and(|read| read.crlf) { "\r\n" } else { "\n" }
     }
     pub fn read_only(&self) -> bool { self.read_only }
     pub fn edit_disabled(&self) -> Option<&'static str> {
@@ -2043,6 +2188,7 @@ impl<'a> View<'a> {
         if let Some(side) = self.tab.read_only_side() { side.read_only() }
         else if self.snapshot.image().is_some() { Some("Images are read-only") }
         else if self.tab.retrieved.is_some() { Some("Retrieved sources are read-only") }
+        else if self.snapshot.source_meta().archive_read_only_reason().is_some() && !self.tab.recovered { Some("This archive entry cannot be rewritten without losing information") }
         else if self.snapshot.source_meta().is_binary() { Some("Binary files are read-only") }
         else if self.snapshot.source_meta().is_lossy() { Some("Lossy text is read-only") }
         else { None }
@@ -2279,8 +2425,16 @@ impl State {
     }
     /// Whether an explorer row's file has unsaved changes in a tab.
     pub fn row_dirty(&self, row: &project::TreeRow) -> bool {
+        if self.archive_tree.is_virtual(&row.path) {
+            return self.tabs.iter().filter(|tab| tab.read_only_side().is_none() && self.tab_dirty(tab.id)).any(|tab|
+                std::iter::once(tab.source.as_path()).chain(tab.canonical.as_deref()).any(|path|
+                    crate::archive::Location::from_uri(path).is_some_and(|location| crate::archive_tree::row_contains_source(row, &location))));
+        }
         let Some(path) = self.project.as_ref().filter(|_| row.dir.is_none()).map(|p| p.root().join(&*row.path)) else { return false };
-        self.tabs.iter().any(|t| (t.source == path || t.canonical.as_deref() == Some(&path)) && t.read_only_side().is_none() && self.tab_dirty(t.id))
+        self.tabs.iter().filter(|tab| tab.read_only_side().is_none() && self.tab_dirty(tab.id)).any(|tab|
+            tab.source == path || tab.canonical.as_deref() == Some(&path)
+                || std::iter::once(tab.source.as_path()).chain(tab.canonical.as_deref()).any(|source|
+                    crate::archive::Location::from_uri(source).is_some_and(|location| location.container == path)))
     }
     /// Unsaved content is independent of repository status and remains visible for inactive tabs.
     pub fn tab_dirty(&self, id: TabId) -> bool {
@@ -2290,11 +2444,16 @@ impl State {
     pub fn view(&self, id: TabId) -> Option<View<'_>> {
         let tab = self.tabs.iter().find(|tab| tab.id == id)?;
         let buffer = tab.buffer?;
-        let snapshot = self.sources.buffers.get(&buffer)?.snapshot.as_ref()?;
+        let entry = self.sources.buffers.get(&buffer)?;
+        let snapshot = entry.snapshot.as_ref()?;
         if !tab.loaded { return None; }
+        Some(self.view_of_snapshot(tab, entry, snapshot))
+    }
+    /// The same editing guards for an inactive retained buffer or a validated reload candidate.
+    fn view_of_snapshot<'a>(&'a self, tab: &'a Tab, entry: &'a CurrentSource, snapshot: &'a Arc<crate::text::TextSnapshot>) -> View<'a> {
         let undecided = !self.undecided_recovery.is_empty() && tab.is_file()
             && self.undecided_recovery.iter().any(|path| *path == tab.source || tab.canonical.as_deref() == Some(path.as_path()));
-        Some(View { snapshot, tab, read_only: self.sources.buffers.get(&buffer)?.read_only, draft: self.sources.buffers.get(&buffer)?.draft.as_ref(), save: &self.sources.buffers.get(&buffer)?.save, undecided })
+        View { snapshot, tab, read_only: entry.read_only, draft: entry.draft.as_ref(), save: &entry.save, undecided }
     }
 
     fn admit_current(&mut self, id: TabId, doc: &Arc<Document>, stamp: Option<Stamp>) -> Vec<TabId> {
@@ -2348,7 +2507,7 @@ impl State {
     /// List `list`'s places matching `query` (fuzzy on the path, or a plain match in the line's text), in the list's
     /// order. Recent files lead with the file left last, the open one second.
     pub fn place_rows(&self, list: PlaceList, query: &str) -> Vec<PlaceRow> {
-        let rel = |p: &Path| self.project.as_ref().and_then(|pr| pr.relative(p)).map_or_else(|| p.display().to_string(), |r| r.to_string());
+        let rel = |p: &Path| crate::archive::Location::from_uri(p).map_or_else(|| self.project.as_ref().and_then(|pr| pr.relative(p)).map_or_else(|| p.display().to_string(), |r| r.to_string()), |location| location.display_path());
         let mark = |m: &crate::places::Mark, place: Place| {
             let key = m.mnemonic.map_or_else(|| "·".to_string(), String::from);
             let label = match list {
@@ -2391,7 +2550,7 @@ impl State {
     /// folder; empty once a file or folder is open
     /// (or opening); split panes show it in the first. Adapters resolve a chosen row by its index here at use time.
     pub fn start_items(&self) -> Vec<StartItem> {
-        if self.project.is_some() || !self.tabs.is_empty() || self.loading.is_some() {
+        if self.has_tree() || !self.tabs.is_empty() || self.loading.is_some() {
             return Vec::new();
         }
         [CommandId::Open, CommandId::OpenFolder].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
@@ -2403,16 +2562,21 @@ impl State {
     }
     /// Cached project and library rows, with stable identities shared by both explorers.
     pub fn tree_rows(&self) -> impl DoubleEndedIterator<Item = &project::TreeRow> + Clone {
-        self.project.as_ref().map_or(&[][..], |p| p.rows()).iter().chain(self.libraries.rows())
+        self.project.as_ref().map_or(&[][..], |p| p.rows()).iter().chain(self.libraries.rows()).chain(self.archive_tree.rows().iter())
     }
-    pub fn has_tree(&self) -> bool { self.project.is_some() || !self.libraries.rows().is_empty() }
+    pub fn has_tree(&self) -> bool { self.project.is_some() || !self.libraries.rows().is_empty() || !self.archive_tree.rows().is_empty() }
+    pub fn archive_tree(&self) -> &crate::archive_tree::Tree { &self.archive_tree }
     /// Changes when navigation asks the adapters to reveal the active library file.
     pub fn tree_revision(&self) -> u64 { self.tree_revision }
     /// The explorer row the session asked the adapters to show and select, and its ticket:
     /// adapters apply it when the ticket changes, after any revision reset.
     pub fn tree_reveal(&self) -> Option<(Arc<str>, u64)> { self.tree_reveal.clone() }
+    /// Always Select Opened File's row to select (the active file's), and its ticket: a newer ticket asks again. The
+    /// explorer stays hidden if it is.
+    pub fn tree_follow(&self) -> Option<(Arc<str>, u64)> { self.tree_follow.clone() }
     pub fn active_in_tree(&self) -> Option<Arc<str>> {
         let t = self.active()?;
+        if self.archive_tree.contains_source(&t.source) { return Some(t.source.to_string_lossy().as_ref().into()); }
         if self.libraries.contains(&t.source) { return Some(t.source.to_string_lossy().as_ref().into()); }
         let p = self.project.as_ref()?;
         p.relative(&t.source).filter(|rel| p.has_file(rel))
@@ -2508,11 +2672,11 @@ impl State {
             false => format!("Read-only source retrieved from {}; its server session has ended ({})", v.provider, v.uri),
         });
         // Outside the browsing root, or a dependency inside it (node_modules, a project's virtualenv): its origin.
-        let origin = tab.filter(|t| t.is_file()).zip(self.project.as_ref()).and_then(|(t, p)| {
+        let origin = tab.filter(|t| t.is_file() && crate::archive::Location::from_uri(&t.source).is_none()).zip(self.project.as_ref()).and_then(|(t, p)| {
             let language = self.source(t.id).map_or(t.language.flatten(), |d| d.language());
             let origin = semantics::provider::origin(&t.source, language);
             let inside = t.source.starts_with(p.root());
-            (!inside || origin != semantics::provider::OUTSIDE).then(|| format!("Read-only source from {origin}"))
+            (!inside || origin != semantics::provider::OUTSIDE).then(|| format!("Source from {origin}"))
         });
         let read_only = tab.and_then(|t| self.view(t.id)).and_then(|view| view.edit_disabled().map(str::to_owned));
         let saving = tab.and_then(|t| self.view(t.id)).and_then(|v| v.save_status().message().map(str::to_owned));
@@ -2637,7 +2801,13 @@ impl State {
             CommandId::DocumentationOnHover => Some(self.settings.documentation_on_hover),
             CommandId::AutoCompletion => Some(self.settings.auto_completion),
             CommandId::FileIcons => Some(self.settings.file_icons),
-            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.blame.is_some())),
+            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.annotating())),
+            CommandId::InlineBlame => Some(self.settings.inline_blame),
+            CommandId::AlwaysSelectOpenedFile => Some(self.settings.always_select_opened_file),
+            CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
+            CommandId::SaveOnLeave => Some(self.settings.save_on_leave),
+            CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
+            CommandId::RankNearbyFiles => Some(self.settings.rank_nearby_files),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
                 let indent = self.project_preferences()?.indent;
                 Some(indent == match id { CommandId::IndentTabs => Some(Indent::Tabs), CommandId::IndentTwoSpaces => Some(Indent::Spaces(2)), CommandId::IndentFourSpaces => Some(Indent::Spaces(4)), _ => None })
@@ -2683,7 +2853,7 @@ impl State {
     /// What is inside crumb `crumb` of pane `pane`'s bar.
     pub fn siblings(&self, pane: u8, crumb: usize) -> Vec<Sibling> {
         let (Some(bar), Some(tab)) = (self.breadcrumbs_for(pane), self.shown(pane)) else { return Vec::new() };
-        crate::breadcrumbs::inside(&bar, crumb, tab, self.view(tab.id).as_ref(), self.project.as_ref())
+        crate::breadcrumbs::inside(&bar, crumb, tab, self.view(tab.id).as_ref(), self.project.as_ref(), &self.archive_tree)
     }
     /// Whether parses should find declarations (sticky scroll or breadcrumbs is on).
     fn wants_declarations(&self) -> bool {
@@ -2869,6 +3039,12 @@ pub struct Session {
     projections: crate::projection_jobs::Scheduler,
     layouts: crate::layout_jobs::Scheduler,
     layout_intents: [Option<LayoutIntent>; 2],
+    /// A navigation's landing (a definition, Back/Forward) whose caret line must end below the sticky headers: kept
+    /// until the tab's declarations, which make the headers, are known; any later user input gives it up.
+    band_goal: Option<TabId>,
+    /// Always Select Opened File: the active file it last revealed, and whether its row was selected (a library's
+    /// folders may still be read).
+    followed: Option<(Arc<str>, bool)>,
     native: crate::native::Reveals,
     jobs: Jobs,
     analysis: crate::analysis::Analysis,
@@ -2881,6 +3057,8 @@ pub struct Session {
     file_clipboard: explorer_work::ClipboardWork,
     navigation_query: Option<navigation_query::NavigationQuery>,
     save_seq: u64,
+    archive_saves: archive_save_work::Saves,
+    pub(crate) archive_browser: crate::archive_tree::Browser,
     /// Recoverable versions of unsaved work, offered at start and kept current off the UI thread.
     recovery: crate::recovery::Recovery,
     /// Names this session's New File identities, so another window's Untitled-1 is another document.
@@ -2979,6 +3157,7 @@ pub struct Session {
     find_options: lenz_content::find::FindOptions,
     /// What Replace and Replace All write instead of a match, while the reader runs.
     replace_text: String,
+    workspace_edit: workspace_edit::Work,
     find_seq: u64,
     /// Where to go once a source opened by [`Command::OpenAt`] or a place jump is shown.
     pending_goto: Option<(PathBuf, Goto)>,
@@ -2994,7 +3173,7 @@ pub struct Session {
     /// What the server inserts after the character just typed (a closing tag), on its way.
     pending_auto_insert: Option<auto_insert::AutoInsertRequest>,
     /// The tab whose typed character its server inserts after: asked once the command is over.
-    auto_insert_due: Option<TabId>,
+    auto_insert_due: Option<(TabId, char)>,
     pending_code_action: Option<code_action::CodeActionRequest>,
     /// The server command running for the user's pick.
     pending_command: Option<server_command::CommandWait>,
@@ -3040,7 +3219,9 @@ pub struct Session {
     repo_requests: u64,
     /// What the running checkout does, to run again from its dialog when git refuses.
     pending_checkout: Option<crate::branches::Retry>,
-    branches_requests: u64,
+    branches_requests: Arc<AtomicU64>,
+    /// One repository's metadata, retained across popup dismissal; refreshed on every open.
+    branches_cache: Option<(PathBuf, lenz_content::branches::Refs, Vec<lenz_content::branches::Worktree>)>,
     /// The last file-status read asked for; a running read stops when it is no longer this one.
     git_status_requests: Arc<AtomicU64>,
     git_status_running: bool,
@@ -3133,8 +3314,10 @@ impl Session {
                 palette: themes.snapshot().palette,
                 project: None,
             libraries: Default::default(),
+            archive_tree: Default::default(),
             tree_revision: 0,
             tree_reveal: None,
+            tree_follow: None,
                 explorer: Default::default(), explorer_search: Default::default(), workspace_revision: 0,
                 recent,
                 recent_alone,
@@ -3192,13 +3375,15 @@ impl Session {
             file_clipboard: Default::default(),
             navigation_query: None,
             save_seq: 0,
+            archive_saves: Default::default(),
+            archive_browser: Default::default(),
             recovery,
             recovery_token: format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())),
             untitled_seq: 0, replacing: None,
             semantic_wait: Default::default(),
             projections: Default::default(),
             layouts: Default::default(),
-            layout_intents: Default::default(), native: Default::default(),
+            layout_intents: Default::default(), band_goal: None, followed: None, native: Default::default(),
             themes,
             theme_preview: None,
             request: 0,
@@ -3256,6 +3441,7 @@ impl Session {
             results_forward: Vec::new(),
             find_options: Default::default(),
             replace_text: String::new(),
+            workspace_edit: Default::default(),
             find_seq: 0,
             pending_goto: None,
             search_seq: 0,
@@ -3292,7 +3478,8 @@ impl Session {
             repo_git_seen: None,
             repo_requests: 0,
             pending_checkout: None,
-            branches_requests: 0,
+            branches_requests: Arc::new(AtomicU64::new(0)),
+            branches_cache: None,
             git_status_requests: Arc::new(AtomicU64::new(0)),
             git_status_running: false,
             git_status_again: false,
@@ -3388,8 +3575,17 @@ impl Session {
 
     pub fn disabled(&self, id: CommandId) -> Option<&'static str> {
         if self.closed {return Some("This reader view is closed");}
+        if self.state.explorer.selected.as_deref().is_some_and(|path| self.state.archive_tree.is_virtual(path)) && matches!(id,
+            CommandId::NewExplorerFile | CommandId::NewExplorerFolder | CommandId::RenameExplorerEntry | CommandId::MoveExplorerEntry
+            | CommandId::DeleteExplorerEntry | CommandId::DeleteExplorerPermanently | CommandId::CopyExplorerEntry | CommandId::PasteExplorerEntry) {
+            return Some("Archive entries support content editing; filesystem entry operations are unavailable inside an archive");
+        }
+        if self.state.current_source().is_some_and(|source| source.source_meta().archive().is_some()) && matches!(id,
+            CommandId::OpenInEditor | CommandId::OpenWithDefaultApp | CommandId::AnnotateBlame | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix) {
+            return Some("This action requires a file on disk; the current document is an archive entry");
+        }
         if self.state.active().is_some_and(|tab| tab.csv.is_some()) && matches!(id,
-            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
+            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
         if self.csv_pending() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
         if (self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || self.install_running.is_some()) && matches!(id,
             CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
@@ -3404,7 +3600,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::SaveOnLeave | CommandId::NameLetterSearch | CommandId::RankNearbyFiles | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -3443,6 +3639,7 @@ impl Session {
             CommandId::CloseAllTabs | CommandId::CloseOtherTabs | CommandId::CloseTabsLeft | CommandId::CloseTabsRight => self.bulk_close_disabled(id),
             CommandId::NewScratch | CommandId::ScratchFiles => None,
             CommandId::OpenRecent => self.state.recent.is_empty().then_some("No recent folders"),
+            CommandId::ProjectReplace | CommandId::RenameSymbol | CommandId::ApplyWorkspaceEdit | CommandId::CancelWorkspaceEdit => self.workspace_disabled(id),
             CommandId::SearchProject => self.state.project.is_none().then_some("No folder is open"),
             CommandId::FindInFile => match self.state.active() {
                 _ if !open => Some("No file is open"),
@@ -3537,7 +3734,7 @@ impl Session {
             }
             CommandId::ResolveConflicts => self.state.stash_conflicts.is_none().then_some("Smart Checkout left no conflicts"),
             CommandId::NarrowAnnotations | CommandId::WidenAnnotations => {
-                if self.state.active().is_none_or(|t| t.blame.is_none()) { Some("Annotations are off") }
+                if self.state.active().is_none_or(|t| !t.annotating()) { Some("Annotations are off") }
                 else if id == CommandId::NarrowAnnotations && self.state.layout().annotation_cols() <= 12 { Some("Annotation gutter is at its minimum width") }
                 else if id == CommandId::WidenAnnotations && self.state.layout().annotation_cols() >= 80 { Some("Annotation gutter is at its maximum width") }
                 else { None }
@@ -3545,15 +3742,9 @@ impl Session {
             CommandId::AnnotateBlame | CommandId::CloseAnnotations => match self.state.active() {
                 None => Some("No file is open"),
                 // Turning annotations off always works, also once the file has gone.
-                Some(t) if t.blame.is_some() => None,
-                Some(t) if t.read_only_side().is_some() => Some("A comparison side has no live Git attribution"),
-                Some(t) if t.retrieved.is_some() => Some("Source from a language server has no Git history"),
-                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
-                Some(t) if t.unavailable.is_some() => Some("The file is unavailable"),
-                Some(t) if !t.loaded && self.state.loading().is_some() => Some("The file is still loading"),
-                // An SVG shown as its source is text.
-                Some(t) if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) => Some("Only text can be annotated"),
-                Some(t) if id == CommandId::CloseAnnotations && t.blame.is_none() => Some("Annotations are off"),
+                Some(t) if t.annotating() => None,
+                Some(t) if let Some(why) = self.blame_refused(t) => Some(why),
+                Some(t) if id == CommandId::CloseAnnotations && !t.annotating() => Some("Annotations are off"),
                 Some(_) => None,
             },
             // The explorer's selection, which only the adapter knows, is checked when it asks.
@@ -3562,7 +3753,13 @@ impl Session {
             CommandId::CloseSavedComparison => self.state.comparison.is_none().then_some("No saved comparison is open"),
             CommandId::CompareWith => (self.state.active().is_none() && self.state.project.is_none()).then_some("No file or folder is open"),
             CommandId::CompareSelected => (self.state.tree_marks.len() < 2).then_some(MARK_TWO),
-            CommandId::CopyPathLine => match self.state.active() {
+            CommandId::GoToTest => match self.state.active() {
+                None => Some("No file is open"),
+                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
+                Some(t) if self.state.project.as_ref().and_then(|p| p.relative(&t.source)).is_none() => Some("Open the file's project folder first"),
+                Some(_) => None,
+            },
+            CommandId::CopyPathLine | CommandId::CopyReference => match self.state.active() {
                 None => Some("No file is open"),
                 Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
                 Some(t) if !t.loaded => Some("No text to point at"),
@@ -3593,7 +3790,7 @@ impl Session {
                     None => Some("No file is open"),
                     Some(view) if view.save_status().busy() => Some("A save operation is running"),
                     Some(view) if id == CommandId::ConfirmRecheckedSave => (!matches!(view.save_status(), crate::save::Status::Checked(crate::save::DiskMatch::Baseline | crate::save::DiskMatch::Attempted))).then_some("Recheck must match the baseline or attempted save first"),
-                    Some(view) => (!view.write_path_changed() && !matches!(view.save_status(), crate::save::Status::Uncertain(_) | crate::save::Status::Rejected(_) | crate::save::Status::Checked(_))).then_some("No save outcome needs rechecking"),
+                    Some(view) => (!view.write_path_changed() && !self.archive_requires_recheck(view.snapshot().key().buffer) && !matches!(view.save_status(), crate::save::Status::Uncertain(_) | crate::save::Status::Rejected(_) | crate::save::Status::Checked(_))).then_some("No save outcome needs rechecking"),
                 },
             },
             CommandId::Undo | CommandId::Redo => match self.state.active().and_then(|tab| self.state.view(tab.id)) {
@@ -3605,7 +3802,7 @@ impl Session {
             },
             CommandId::Cut | CommandId::Paste | CommandId::Delete => self.text_action_disabled(id),
             CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment
-            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown => self.structural_action_disabled(id),
+            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine => self.structural_action_disabled(id),
             CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections => self.selection_action_disabled(id),
             CommandId::ReadOnlyMode => self.state.active().and_then(|t| self.state.view(t.id)).map_or(Some("No loaded file is open"), |view| view.intrinsic_edit_disabled()),
             CommandId::Copy if self.state.active().and_then(|tab| tab.csv.as_ref()).is_some() => {
@@ -3651,7 +3848,7 @@ impl Session {
                 _ => None,
             },
             CommandId::ServerRuntime => if self.state.provider_saves > 0 { Some("Waiting for provider settings to finish saving") }
-                else if self.runtime_kind().is_none() { Some("Open a Java or Python source file to choose its server runtime") } else { None },
+                else if self.runtime_kind().is_none() { Some("Open a Java or Node-based language source file to choose its server runtime") } else { None },
             CommandId::RestartServer => match self.state.provider() {
                 None => Some("No language server for this file"),
                 Some(v) if v.status == semantics::Status::Disabled => Some("Disabled for this folder"),
@@ -3746,8 +3943,7 @@ impl Session {
     fn runtime_kind(&self) -> Option<semantics::runtime::Kind> {
         match self.state.current()?.language()? {
             highlight::Language::Java => Some(semantics::runtime::Kind::Java),
-            highlight::Language::Python => Some(semantics::runtime::Kind::PyrightNode),
-            _ => None,
+            _ => self.install_provider().filter(|p| semantics::installer::node_package(p.id).is_some()).map(|p| semantics::runtime::Kind::Node(p.id)),
         }
     }
 
@@ -4056,9 +4252,9 @@ impl Session {
         let text = tab.is_some_and(|t| t.loaded) && !matches!(self.state.rendering(), Some(Rendering::Preview(_) | Rendering::Pending));
         let mut entries = Vec::new();
         if text {
-            entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation].map(C));
+            entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation, CommandId::RenameSymbol].map(C));
             entries.extend([Separator, C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll)]);
-            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine)]);
+            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference)]);
         } else {
             if matches!(self.state.rendering(), Some(Rendering::Preview(_))) {
                 entries.extend([C(CommandId::Copy), Separator, C(CommandId::ShowInSource), C(CommandId::FollowLink), Separator]);
@@ -4070,7 +4266,7 @@ impl Session {
         }
         entries.push(C(CommandId::LocateFile));
         if text {
-            match tab.is_some_and(|t| t.blame.is_some()) {
+            match tab.is_some_and(|t| t.annotating()) {
                 true => entries.extend([Separator, C(CommandId::ShowCommit), C(CommandId::ShowCommitDiff), C(CommandId::CopyRevision), C(CommandId::CloseAnnotations)]),
                 false => entries.extend([Separator, C(CommandId::AnnotateBlame)]),
             }
@@ -4100,7 +4296,42 @@ impl Session {
 
     /// Line `line`'s annotation in tab `tab`, while its annotations are on and git has reached it.
     pub fn annotation(&self, tab: TabId, line: usize) -> Option<crate::blame::Annotation<'_>> {
-        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref()?, line, self.state.layout().annotation_cols())
+        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref().filter(|b| b.column)?, line, self.state.layout().annotation_cols())
+    }
+
+    /// Why tab `t` cannot be attributed with Git blame, if it cannot.
+    fn blame_refused(&self, t: &crate::tabs::Tab) -> Option<&'static str> {
+        if t.read_only_side().is_some() { Some("A comparison side has no live Git attribution") }
+        else if t.retrieved.is_some() { Some("Source from a language server has no Git history") }
+        else if t.untitled() { Some(UNTITLED_NO_FILE) }
+        else if t.unavailable.is_some() { Some("The file is unavailable") }
+        else if !t.loaded && self.state.loading().is_some() { Some("The file is still loading") }
+        // An SVG shown as its source is text.
+        else if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) { Some("Only text can be annotated") }
+        else { None }
+    }
+
+    /// Inline blame keeps attribution for the shown tabs, without their annotation column, and drops it elsewhere.
+    /// A pass over the tabs; the blame itself runs only for content not yet attributed.
+    fn sync_inline_blame(&mut self) {
+        let on = self.state.settings.inline_blame;
+        let (mut start, mut stop) = (Vec::new(), Vec::new());
+        for t in &self.state.tabs {
+            let wanted = on && self.is_shown(t.id) && self.blame_refused(t).is_none();
+            match &t.blame {
+                None if wanted => start.push(t.id),
+                Some(b) if !b.column && !wanted => stop.push((t.id, t.buffer)),
+                _ => {}
+            }
+        }
+        for (id, buffer) in stop {
+            if let Some(t) = self.tab_mut(id) { t.blame = None; }
+            if let Some(buffer) = buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+        }
+        for id in start {
+            if let Some(t) = self.tab_mut(id) { t.blame = Some(crate::blame::Blame::inline()); }
+            self.annotate(id);
+        }
     }
 
     /// A new request for the checkout about to run (an older one's answer is then dropped).
@@ -4173,6 +4404,8 @@ impl Session {
         self.markers_epoch += 1;
         self.state.marker_sets.clear();
         self.state.branches = None;
+        self.branches_requests.fetch_add(1, Ordering::Relaxed);
+        self.branches_cache = None;
         self.state.checkout_problem = None;
         self.state.stash_conflicts = None;
         let Some(anchor) = anchor else { return };
@@ -4217,7 +4450,7 @@ impl Session {
             return Ok((c.sha.clone(), c.root.clone()));
         }
         let t = self.state.active().ok_or("No file is open")?;
-        let b = t.blame.as_ref().ok_or("Annotations are off")?;
+        let b = t.blame.as_ref().filter(|b| b.column).ok_or("Annotations are off")?;
         if b.error.is_some() { return Err("Blame failed"); }
         if !b.done { return Err("Blame pending"); }
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head)).ok_or("No line is selected")?;
@@ -4231,7 +4464,7 @@ impl Session {
     /// The caret line's annotation in the active tab (the status line's commit).
     pub fn caret_annotation(&self) -> Option<crate::blame::Annotation<'_>> {
         let t = self.state.active()?;
-        let b = t.blame.as_ref()?; // nothing more while annotations are off
+        let b = t.blame.as_ref().filter(|b| b.column)?; // nothing more while annotations are off
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head))?;
         crate::blame::annotation(b, line, self.state.layout().annotation_cols())
     }
@@ -4258,6 +4491,7 @@ impl Session {
             None => Err("No file is open"),
             Some(t) if t.read_only_side().is_some() => Err("A comparison's read-only side is an immutable snapshot; open the current side externally"),
             Some(t) if t.retrieved.is_some() => Err("Source from a language server has no file to open"),
+            Some(t) if crate::archive::Location::from_uri(&t.source).is_some() => Err("An archive entry has no standalone file to open; use Save As to export it"),
             Some(t) if t.untitled() => Err(UNTITLED_NO_FILE),
             Some(t) if t.unavailable.is_some() => Err("The file is unavailable"),
             Some(t) => Ok(t),
@@ -4347,6 +4581,7 @@ impl Session {
         // (Home while an End seek is pending, for example). Adapter layout/metric feedback is not user input.
         if matches!(&input, Input::Command(command) if !matches!(command, Command::PrepareLayout { .. } | Command::PrepareProjection(_) | Command::CancelProjection { .. } | Command::ClampColumn { .. } | Command::SetTextSize { .. } | Command::SetNativeContext { .. } | Command::MeasuredReveal { .. } | Command::TakeExternal { .. })) {
             self.layout_intents = Default::default();
+            self.band_goal = None;
             self.native.cancel();
         }
         if !self.vim_group_edit && matches!(&input, Input::Command(command) if !matches!(command, Command::Edit { .. } | Command::Delete { .. } | Command::InsertText { .. }
@@ -4357,14 +4592,14 @@ impl Session {
             }
         }
         let laid_out = matches!(&input, Input::Completion(Completion::LaidOut(_)));
-        if matches!(&input, Input::Command(Command::CompareSaved | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
+        if matches!(&input, Input::Command(Command::CompareSaved | Command::OpenArchiveEntry(_) | Command::ArchiveTreeParent { .. } | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
         let expansion_completion = match &input {
             Input::Completion(Completion::SelectionSteps { request, .. }) => Some(*request),
             Input::Completion(Completion::Analyzed { result, .. }) => match result.as_ref() { Completion::SelectionSteps { request, .. } => Some(*request), _ => None },
             Input::Command(_) | Input::Completion(_) => None,
         };
         let edit_reveal = matches!(&input, Input::Command(Command::Cut | Command::Paste(_) | Command::Delete { .. } | Command::InsertText { .. } | Command::AddCursorBelow | Command::AddCursorAbove
-            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
+            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::DeleteLines | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
         let reveal_selection = (edit_reveal || matches!(&input, Input::Command(Command::VimKey(_) | Command::MoveCaret(_) | Command::Extend(_) | Command::ExtendSelection | Command::ShrinkSelection)) || expansion_completion.is_some())
             && !expansion_completion.is_some_and(|request| self.expanding.is_some_and(|e| e.3 == request && !e.4));
         let markers_due = matches!(input, Input::Completion(Completion::MarkersDue));
@@ -4372,7 +4607,7 @@ impl Session {
         let retire_messages = matches!(&input, Input::Command(_)) && (edit_reveal || reveal_selection) && !self.state.messages.is_empty();
         if retire_messages { self.state.messages.clear(); }
         // Tabs and layout, not each caret move: what an interrupted session reopens.
-        let arranged = matches!(&input, Input::Command(Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
+        let arranged = matches!(&input, Input::Command(Command::OpenArchiveEntry(_) | Command::ArchiveTreeParent { .. } | Command::ActivateTree { .. } | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
             | Command::Pin(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_)
             | Command::SetLayout(_) | Command::ResizeAnnotations { commit: true, .. } | Command::SetSoftWrap(_) | Command::ChooseRecoveredDraft { .. }));
         let input = match input {
@@ -4395,7 +4630,7 @@ impl Session {
         }
         if arranged { self.checkpoint_workspace(); }
         if std::mem::take(&mut self.signature_due) { effect.repaint |= self.signature_at_caret(false).repaint; }
-        if let Some(tab) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab).repaint; }
+        if let Some((tab, typed)) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab, typed).repaint; }
         if self.pending_auto_insert.as_ref().is_some_and(|p| !p.current(&self.state)) { self.cancel_auto_insert(); }
         if self.pending_doc.as_ref().is_some_and(|p| !self.is_shown(p.tab) || !self.state.view(p.tab).is_some_and(|v| p.source.matches(v.snapshot()))) { self.cancel_documentation(); }
         // A popup or request whose tab, version, caret or server is no longer current is gone, not hidden.
@@ -4417,6 +4652,9 @@ impl Session {
         }
         self.invalidate_result_analysis();
         self.sync_project_syntax();
+        effect.repaint |= self.settle_band_goal();
+        effect.repaint |= self.follow_active_file();
+        self.sync_inline_blame();
         self.refresh_blame();
         // A shown draft's change markers follow its text: only a version or baseline that changed is compared again.
         self.refresh_markers(markers_due);
@@ -4643,6 +4881,13 @@ impl Session {
 
         let repaint = Effect { repaint: true, copy: None, ..Effect::default() };
         match command {
+            Command::PreviewProjectReplace(text) => self.preview_project_replace(text),
+            Command::RenameSymbol(name) => self.rename_symbol(name),
+            Command::ApplyWorkspaceEdit => self.apply_workspace_edit(),
+            Command::CancelWorkspaceEdit => self.cancel_workspace_edit(),
+            Command::MoveWorkspaceFile(by) => self.move_workspace_file(by),
+            Command::ToggleCurrentWorkspaceFile => self.toggle_current_workspace_file(),
+            Command::ToggleWorkspaceFile(i) => self.toggle_workspace_file(i),
             Command::Terminal(command) => self.terminal_command(command),
             Command::Csv(command) => self.csv_command(command),
             Command::PresentText { tab, base, base_selection, edit, selected } => self.present_text(tab, base, base_selection, edit, selected),
@@ -4662,6 +4907,7 @@ impl Session {
             Command::ChooseReplace { ticket, choice } => self.choose_replace(ticket, choice),
             Command::NewDocument => self.new_document(),
             Command::NewScratch(name) => self.new_scratch(name),
+            Command::NewScratchFile(kind) => self.new_scratch_file(kind),
             Command::OpenScratch(path) => self.open_scratch(path),
             Command::CopyExplorerPath { kind } => self.copy_explorer_path(kind),
             Command::CopyExplorerEntry => self.copy_explorer_entry(),
@@ -4728,6 +4974,8 @@ impl Session {
                 if self.state.project.is_none() && !is_virtual(&path) { self.remember_alone(normalized(&path)); }
                 self.navigate(path, false, None, true)
             }
+            Command::OpenArchiveEntry(location) => if location.members.is_empty() { self.browse_archive(location) } else { self.navigate(location.to_uri(), true, None, true) },
+            Command::ArchiveTreeParent { path } => self.archive_tree_parent(&path).unwrap_or_default(),
             Command::OpenRetained(path) => self.navigate(path, true, None, true),
             Command::ActivateTab(id) => {
                 let Some(pane) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.pane) else { return Effect::default() };
@@ -4804,7 +5052,7 @@ impl Session {
                 let files: std::collections::BTreeSet<PathBuf> = p.bookmarks().iter().map(|m| m.source.to_path_buf()).chain(p.recent_files().iter().cloned()).chain(p.recent_locations().iter().map(|m| m.source.to_path_buf())).collect();
                 let (tx, generation) = (self.tx.clone(), self.project_generation.load(Ordering::Relaxed));
                 self.jobs.submit(Priority::Background, move || {
-                    let missing = files.into_iter().filter(|f| !f.exists()).collect();
+                    let missing = files.into_iter().filter(|f| !crate::archive::physical_path(f).exists()).collect();
                     let _ = tx.send_blocking(Completion::PlacesChecked { generation, missing });
                 });
                 Effect::default()
@@ -4941,6 +5189,38 @@ impl Session {
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
+            Command::SetSaveOnLeave(on) => {
+                self.state.settings.save_on_leave = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetMacWordMotion(on) => {
+                self.state.settings.mac_word_motion = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetRankNearbyFiles(on) => {
+                self.state.settings.rank_nearby_files = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetNameLetterSearch(on) => {
+                self.state.settings.name_letter_search = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetAlwaysSelectOpenedFile(on) => {
+                self.state.settings.always_select_opened_file = on;
+                self.followed = None;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetInlineBlame(on) => {
+                self.state.settings.inline_blame = on;
+                self.save_settings();
+                self.sync_inline_blame();
+                Effect { repaint: true, ..Effect::default() }
+            }
             Command::SetVimEnabled(on) => self.set_vim_enabled(on),
             Command::VimKey(key) => self.vim_key(key),
             Command::SetSoftWrap(on) => {
@@ -4955,6 +5235,7 @@ impl Session {
                 Effect { repaint: true, copy: None, ..Effect::default() }
             }
             Command::RevealInTree(rel) => {
+                if let Some(effect) = self.archive_reveal(&rel) { return effect; }
                 let changed = self.state.project.as_mut().is_some_and(|p| p.reveal(&rel) || p.reveal_folder(&rel));
                 Effect { repaint: changed, copy: None, ..Effect::default() }
             }
@@ -5136,6 +5417,7 @@ impl Session {
             Command::ActivateTree { path, retain } => self.activate_tree(path, retain),
             Command::ExplorerSearch(input) => self.explorer_search(input),
             Command::ToggleDir(dir) => {
+                if let Some(effect) = self.activate_archive_tree(&dir, false) { return effect; }
                 self.state.explorer_search = Default::default();
                 if self.state.libraries.rows().iter().any(|r| r.path.as_ref() == dir) {
                     let requests = self.state.libraries.toggle(&dir, self.state.settings.folders_first);
@@ -5146,6 +5428,8 @@ impl Session {
                 Effect { repaint: changed, copy: None, ..Effect::default() }
             }
             Command::Locate => {
+                if let Some(path) = self.state.active().map(|tab| tab.source.to_string_lossy().into_owned())
+                    && let Some(effect) = self.archive_reveal(&path) { return effect; }
                 if let Some(path) = self.state.active().map(|t| t.source.clone()) && self.state.libraries.contains(&path) {
                     let requests = self.state.libraries.reveal(&path, self.state.settings.folders_first);
                     self.read_libraries(requests);
@@ -5237,27 +5521,36 @@ impl Session {
                     return Effect::default();
                 }
                 let Some(root) = self.state.repo.as_ref().map(|r| r.root.clone()) else { return Effect::default() };
-                self.state.branches = Some(crate::branches::BranchesView { loading: true, worktrees_only, revisions_only, ..Default::default() });
-                self.branches_requests += 1;
-                let (request, tx) = (self.branches_requests, self.tx.clone());
+                let mut view = crate::branches::BranchesView { loading: true, worktrees_only, revisions_only, ..Default::default() };
+                if let Some((_, refs, worktrees)) = self.branches_cache.as_ref().filter(|(cached, _, _)| *cached == root) {
+                    view.refs = refs.clone();
+                    view.refs.current = self.state.repo.as_ref().and_then(|r| r.head.branch.clone());
+                    view.worktrees = worktrees.clone();
+                    view.has_snapshot = true;
+                }
+                self.state.branches = Some(view);
+                let request = self.branches_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                let (latest, tx) = (self.branches_requests.clone(), self.tx.clone());
                 self.jobs.submit(Priority::Visible, move || {
-                    // Changed paths are counted only when the Worktrees section shows (more than one).
-                    // Compare with Worktree… shows neither the refs nor the current worktree.
+                    if latest.load(Ordering::Relaxed) != request { return; }
                     let refs = if worktrees_only { Ok(Default::default()) } else { lenz_content::branches::refs(&root) };
                     let result = refs.and_then(|r| {
-                        // Compare with Branch, Tag or Revision… lists no worktrees.
-                        let mut worktrees = if revisions_only { Vec::new() } else { lenz_content::branches::worktree_list(&root)? };
-                        match worktrees.len() > 1 {
-                            true => worktrees.iter_mut().filter(|w| !(worktrees_only && w.current)).for_each(|w| lenz_content::branches::count_changes(std::slice::from_mut(w))),
-                            false => worktrees.iter_mut().for_each(|w| w.dirty = None),
-                        }
+                        if latest.load(Ordering::Relaxed) != request { return Err("superseded".into()); }
+                        // This is a navigation inventory: do not enumerate changed/untracked files
+                        // in every worktree just to let the user choose a branch.
+                        let worktrees = if revisions_only { Vec::new() } else { lenz_content::branches::worktree_list(&root)? };
                         Ok((r, worktrees))
                     });
-                    let _ = tx.send_blocking(Completion::Branches { request, root, result });
+                    if latest.load(Ordering::Relaxed) == request {
+                        let _ = tx.send_blocking(Completion::Branches { request, root, result });
+                    }
                 });
                 repaint
             }
-            Command::CloseBranches => Effect { repaint: self.state.branches.take().is_some(), copy: None, ..Effect::default() },
+            Command::CloseBranches => {
+                self.branches_requests.fetch_add(1, Ordering::Relaxed);
+                Effect { repaint: self.state.branches.take().is_some(), copy: None, ..Effect::default() }
+            }
             Command::MarkTreeRow { path, selected } => {
                 if path.contains("://") {
                     self.state.messages.push("Compare Selected: this entry has no file on disk".into());
@@ -5328,12 +5621,21 @@ impl Session {
                     return Effect::default();
                 }
                 let Some(t) = self.active_mut() else { return Effect::default() };
-                if on == t.blame.is_some() {
+                if on == t.annotating() {
                     return Effect::default();
                 }
-                t.blame = on.then(crate::blame::Blame::new);
+                // Inline blame's attribution becomes the column's, and stays when the column goes (it drops it
+                // itself once it is off).
+                match (on, t.blame.as_mut()) {
+                    (_, Some(b)) => b.column = on,
+                    (true, None) => t.blame = Some(crate::blame::Blame::new()),
+                    (false, None) => {}
+                }
                 let id = t.id;
-                if !on && let Some(buffer) = t.buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                if !on && !self.state.settings.inline_blame {
+                    if let Some(t) = self.tab_mut(id) { t.blame = None; }
+                    if let Some(buffer) = self.tab_mut(id).and_then(|t| t.buffer) { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                }
                 self.annotate(id);
                 repaint
             }
@@ -5394,6 +5696,7 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::MoveCaret(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 if doc.source_meta().image().is_some() && !t.image_source { return Effect::default(); }
                 let s = t.selection().unwrap_or_else(|| {
@@ -5408,8 +5711,8 @@ impl Session {
                     Motion::Right if s.anchor != s.head => s.anchor.max(s.head),
                     Motion::Left if s.head <= range.start && line > 0 => doc.reader_line_range(visible.step(line,-1)).end,
                     Motion::Right if s.head >= range.end && visible.step(line,1) > line => doc.reader_line_range(visible.step(line,1)).start,
-                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion)),
-                    _ => moved(&doc, &visible, s.head, motion),
+                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion, spaces)),
+                    _ => moved(&doc, &visible, s.head, motion, spaces),
                 };
                 let head = if visible.hidden(doc.line_of(head)) { doc.reader_line_range(visible.shown(doc.line_of(head))).end } else { head };
                 t.place_selection(Some(Selection {anchor:head,head}));
@@ -5428,12 +5731,13 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::Extend(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 let s = t.selection().unwrap_or_else(|| {
                     let origin = if wrap_cols.is_none() { doc.reader_line_range(t.top_line).start } else { 0 };
                     Selection { anchor: origin, head: origin }
                 });
-                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion));
+                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion, spaces));
                 let line = doc.line_of(head);
                 // Keep the head on screen as far as the core knows the view: at or below the top line, and below the
                 // sticky lines.
@@ -5503,6 +5807,46 @@ impl Session {
                 let at = self.state.view(t.id).map_or(0, |view| t.selection().map_or(0, |s| view.snapshot().line_of(s.head)) + 1);
                 Effect { repaint: false, copy: Some(if line { format!("{path}:{at}") } else { path }), ..Effect::default() }
             }
+            Command::CopyReference => {
+                let Some(t) = self.state.active().filter(|t| !t.untitled()) else { return Effect::default() };
+                let relative = self.state.project.as_ref().and_then(|p| t.source.strip_prefix(p.root()).ok())
+                    .map(|relative| relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                let reference = self.state.view(t.id).and_then(|view| {
+                    let doc = view.snapshot();
+                    let at = t.selection().map_or_else(|| doc.reader_line_range(t.top_line).start, |s| s.head);
+                    match view.declarations() {
+                        Some(declarations) => crate::reference::qualified_name(doc, declarations, at, relative.as_deref()),
+                        // Right after an edit the declarations are still being extracted: this explicit action
+                        // extracts them once itself rather than copy a path where a name was asked for.
+                        None if !doc.is_large() => {
+                            let text: Arc<str> = doc.copy_range(0..doc.len_bytes())?.into();
+                            let declarations = lenz_content::highlight::declarations_while(doc.language()?, text, || true)?;
+                            crate::reference::qualified_name(doc, &declarations, at, relative.as_deref())
+                        }
+                        None => None,
+                    }
+                });
+                match reference {
+                    Some(name) => Effect { repaint: false, copy: Some(name), ..Effect::default() },
+                    None => self.command(Command::CopyPath { line: true }),
+                }
+            }
+            Command::GoToTest => {
+                let Some((root, rel, found)) = self.state.active().filter(|t| !t.untitled()).and_then(|t| {
+                    let project = self.state.project.as_ref()?;
+                    let rel = project.relative(&t.source)?;
+                    let paths = project.paths();
+                    Some((project.root().to_owned(), rel.clone(), crate::relevant::counterpart(&rel, paths.iter().map(|p| &**p))))
+                }) else { return Effect::default() };
+                match found {
+                    Ok(other) => self.command(Command::Open(root.join(other))),
+                    Err(why) => {
+                        let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
+                        self.state.messages.push(format!("Go to Test: {why}: {name}"));
+                        Effect { repaint: true, ..Effect::default() }
+                    }
+                }
+            }
             Command::CopyText(text) => Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() },
             Command::Notice(text) => {
                 self.state.messages.push(text);
@@ -5513,6 +5857,7 @@ impl Session {
             Command::ToggleComment => self.toggle_comment(),
             Command::MoveLines { down } => self.move_lines(down),
             Command::DuplicateLines { down } => self.duplicate_lines(down),
+            Command::DeleteLines => self.delete_lines(),
             Command::InsertText { text, kind } => self.insert_text(text, kind),
             Command::AddCursorBelow => self.add_cursor(true),
             Command::AddCursorAbove => self.add_cursor(false),
@@ -5951,13 +6296,13 @@ impl Session {
                 semantics::Lane::CodeAction => self.pending_code_action.as_ref().is_some_and(|p| p.request() == wait.request),
                 semantics::Lane::Format => self.state.formatting.as_ref().is_some_and(|f| f.request() == wait.request),
                 semantics::Lane::AutoInsert => self.pending_auto_insert.as_ref().is_some_and(|p| p.request() == wait.request),
-                semantics::Lane::CompletionDetail => false,
+                semantics::Lane::CompletionDetail | semantics::Lane::Rename => false,
             };
             if !current || !requested {
                 if requested { match lane { semantics::Lane::Foreground => { self.state.asking = None; repaint = true; }, semantics::Lane::Hover => self.cancel_documentation(), semantics::Lane::Highlight => self.pending_highlight = None, semantics::Lane::Completion => self.cancel_completion(), semantics::Lane::Signature => self.cancel_signature(), semantics::Lane::CodeAction => self.cancel_code_action(), semantics::Lane::Format => {
                     let why = if self.state.formatting.as_ref().is_some_and(|f| f.tool()) { "the file changed before the project's formatter could run" } else { "the file changed before the language server could be asked" };
                     repaint |= self.format_unavailable(why.into()).repaint;
-                } semantics::Lane::AutoInsert => self.cancel_auto_insert(), semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail => {} } }
+                } semantics::Lane::AutoInsert => self.cancel_auto_insert(), semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::Rename => {} } }
                 continue;
             }
             let Some(doc) = self.admitted_document(wait.tab, Priority::Visible) else { self.semantic_wait.insert(lane, wait); continue };
@@ -5978,7 +6323,7 @@ impl Session {
                     semantics::Lane::Signature => { let manual = self.pending_signature.as_ref().map(|p| p.manual()); if let Some(manual) = manual { repaint |= self.signature_unavailable(manual, why).repaint; } }
                     semantics::Lane::CodeAction => { if self.pending_code_action.is_some() { repaint |= self.code_action_unavailable(why).repaint; } }
                     semantics::Lane::Format => repaint |= self.format_unavailable(why).repaint,
-                    semantics::Lane::Foreground | semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::AutoInsert => {}
+                    semantics::Lane::Foreground | semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::AutoInsert | semantics::Lane::Rename => {}
                 }
             }
         }
@@ -6342,13 +6687,13 @@ impl Session {
             true => {
                 let mut seen = std::collections::HashSet::new();
                 // A template keeps the servers of each of its embedded languages warm.
-                self.state.tabs.iter().filter(|t| t.is_file() && seen.insert(&t.source)).flat_map(|t| match crate::template::languages(&t.source) {
+                self.state.tabs.iter().filter(|t| t.is_file() && !is_virtual(&t.source) && seen.insert(&t.source)).flat_map(|t| match crate::template::languages(&t.source) {
                     [] => vec![(t.source.as_path(), t.language.unwrap_or_else(|| highlight::detect(&t.source, "")))],
                     languages => languages.iter().map(|l| (t.source.as_path(), Some(*l))).collect(),
                 }).collect()
             }
         };
-        let files: Vec<&Path> = self.state.tabs.iter().filter(|t| t.is_file()).map(|t| t.source.as_path()).collect();
+        let files: Vec<&Path> = self.state.tabs.iter().filter(|t| t.is_file() && !is_virtual(&t.source)).map(|t| t.source.as_path()).collect();
         self.state.semantics.sync(&docs, &held, &files, browse.as_deref(), &mut resolve, &self.tx);
     }
 
@@ -6383,7 +6728,7 @@ impl Session {
                     semantics::Lane::Foreground => state.asking.as_ref().is_some_and(|asking| asking.request == fence.request && asking.project == fence.project && asking.source == fence.source),
                     semantics::Lane::Hierarchy => state.results.as_ref().is_some_and(|r| Some(r.id) == fence.result_set && r.hierarchy.as_ref().is_some_and(|h| h.session == server && h.loading(fence.request) == fence.node
                         && fence.node.and_then(|node| h.nodes.get(node)).is_some_and(|node| Self::hierarchy_item_current(state, &node.call)))),
-                    semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert => false,
+                    semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert | semantics::Lane::Rename => false,
                 }
             }
         }
@@ -6498,7 +6843,7 @@ impl Session {
                         && let Some(node) = h.loading(fence.request).filter(|node| Some(*node) == fence.node)
                     { h.failed(node, fence.request, why); r.rebuild_hierarchy(); return Effect { repaint: true, copy: None, ..Effect::default() }; }
                 }
-                semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert => {}
+                semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert | semantics::Lane::Rename => {}
             },
         }
         Effect::default()
@@ -6522,6 +6867,7 @@ impl Session {
             semantics::Lane::Signature => return self.signature_reply(reply),
             semantics::Lane::CodeAction => return self.code_action_reply(reply),
             semantics::Lane::Format => return self.format_reply(reply),
+            semantics::Lane::Rename => return self.rename_reply(reply),
             semantics::Lane::AutoInsert => return self.auto_insert_reply(reply),
         }
         let project = self.state.project.as_ref().map_or(0, |p| p.generation());
@@ -6581,6 +6927,7 @@ impl Session {
         let origin = self.state.semantics.origin(session).unwrap_or_else(|| provider.to_string());
         let limit = if ask.question() == semantics::Question::Definition { semantics::TARGET_LIMIT } else { semantics::USAGE_LIMIT };
         let asked_path = asking.at.as_ref().filter(|_| ask == Ask::FileSymbols).map(|(path, _, _)| path.clone());
+        let by_name = matches!(ask, Ask::Definition | Ask::Peek).then(|| self.ruby_by_name(session, asking.at.as_ref())).flatten();
         let fence = crate::analysis::ResultFence { slot: crate::analysis::ResultSlot::Semantic { server: session, lane: reply.lane }, project, request, stage: crate::analysis::ResultStage::Targets, result_set: None, node: None, source: asking.source.clone() };
         let semantics = &self.state.semantics;
         if self.analysis.request_result(fence.clone(), Priority::Visible, || {
@@ -6606,11 +6953,27 @@ impl Session {
                     (Ask::FileSymbols, None) => semantics::Targets { failed: vec!["the file is no longer open in the language server; ask again".into()], ..Default::default() },
                     _ => semantics::targets_while(&value, limit, encoding, provider, session, &open, &read, &|| lease.wanted()),
                 };
+                if let Some(by_name) = &by_name { by_name.add(&mut targets, limit, &read, &|| lease.wanted()); }
                 semantics::capture_target_digests(targets.found.iter_mut());
                 lease.send(Completion::Targets { request, session, provider, origin, indexing, targets });
             }
         }).is_err() { return self.result_failed(&fence, "semantic analysis capacity is full".into()); }
         Effect::default()
+    }
+
+    /// For a Ruby definition: the method name at the asked place, the project's Ruby files and the gem folders of the
+    /// bundle `session` serves (once it has listed them), for declarations its index misses (see [`ByName`]).
+    fn ruby_by_name(&self, session: u64, at: Option<&(PathBuf, usize, u64)>) -> Option<ByName> {
+        let (gems, index) = self.state.semantics.gem_roots(session)?;
+        let (path, offset, _) = at?;
+        let doc = self.state.current_source().filter(|d| d.source() == path.as_path() && d.language() == Some(lenz_content::highlight::Language::Ruby))?;
+        let line = doc.reader_line_range(doc.line_of(*offset));
+        let word = doc.word_at(*offset);
+        let text = doc.copy_range(line.start..line.end.min(line.start + 4096))?;
+        let name = crate::ruby_declarations::method_name(&text, word.start.checked_sub(line.start)?..word.end.checked_sub(line.start)?)?;
+        let project = self.state.project.as_ref().filter(|p| path.starts_with(p.root()));
+        let files = project.map(|p| p.paths().iter().filter(|r| r.ends_with(".rb")).map(|r| p.root().join(&**r)).collect()).unwrap_or_default();
+        Some(ByName { name, gems, index, files, root: project.map(|p| p.root().to_owned()) })
     }
 
     /// One server's answer to the current request arrived (or failed): the request ends with the last one.
@@ -6647,6 +7010,12 @@ impl Session {
 
     fn complete_source(&mut self, completion: Completion, buffer: Option<crate::text::BufferId>) -> Effect {
         match completion {
+            Completion::WorkspacePrepared { request, apply, result } => self.workspace_prepared(request, apply, result),
+            Completion::ArchiveListed(listed) => self.archive_listed(listed),
+            Completion::ArchiveLoaded(loaded) => self.archive_loaded(*loaded),
+            Completion::ArchiveSaved(saved) => self.archive_saved(*saved),
+            Completion::ArchiveRechecked(reply) => self.archive_rechecked(*reply),
+            Completion::ArchiveRecovered { ticket, result } => self.restore_archive_loaded(ticket, result),
             Completion::TerminalStarted { id, generation, result } => self.terminal_started(id, generation, result),
             Completion::TerminalWake { id, generation } => self.terminal_wake(id, generation),
             Completion::ExplorerCopied { request, result } => self.explorer_copied(request, result),
@@ -6746,6 +7115,7 @@ impl Session {
                         self.state.semantics.reload_runtime(kind.provider());
                         self.synced = 0;
                         if let Some(model) = &mut self.state.server_runtime { model.configured = path; }
+                        self.refresh_install_runtime(kind.provider());
                         format!("{} runtime saved. Enabled {} language servers are restarting.", kind.label(), kind.provider())
                     }
                     Err(why) => format!("{} runtime was not changed: {why}", kind.label()),
@@ -6943,11 +7313,17 @@ impl Session {
             }
             Completion::ReconcileRead { ticket, result } => self.reconcile_read(ticket, result),
             Completion::ReconcileChecked { ticket, choice, result } => self.reconcile_checked(ticket, choice, result),
-            Completion::Branches { request, root, result } => match self.state.branches.as_mut().filter(|_| request == self.branches_requests && self.state.repo.as_ref().is_some_and(|r| r.root == root)) {
+            Completion::Branches { request, root, result } => match self.state.branches.as_mut().filter(|_| request == self.branches_requests.load(Ordering::Relaxed) && self.state.repo.as_ref().is_some_and(|r| r.root == root)) {
                 Some(v) => {
                     v.loading = false;
                     match result {
-                        Ok((refs, worktrees)) => (v.refs, v.worktrees) = (refs, worktrees),
+                        Ok((refs, worktrees)) => {
+                            if !v.worktrees_only && !v.revisions_only {
+                                self.branches_cache = Some((root, refs.clone(), worktrees.clone()));
+                            }
+                            (v.refs, v.worktrees) = (refs, worktrees);
+                            v.has_snapshot = true;
+                        }
                         Err(e) => v.error = Some(e),
                     }
                     let none = v.worktrees_only && v.error.is_none() && self.state.branch_rows("").is_empty();
@@ -7007,11 +7383,10 @@ impl Session {
                         });
                         let f = t.find.as_mut().expect("checked above");
                         f.current = f.at_or_after(at.0, at.1);
-                        if f.reveal {
-                            self.show_match(tab)
-                        } else {
-                            Effect { repaint: true, ..Effect::default() }
-                        }
+                        let mut effect = if f.reveal { self.show_match(tab) } else { Effect::default() };
+                        // Completion changes the counter even when there is no match to reveal.
+                        effect.repaint = true;
+                        effect
                     }
                 }
             }
@@ -7483,7 +7858,7 @@ impl Session {
                 }
                 self.changed(change)
             }
-            Completion::Refreshed { tab, token, result } => self.refreshed(tab, token, result),
+            Completion::Refreshed { tab, token, baseline, result } => self.refreshed(tab, token, baseline, result),
             Completion::Watch { key, folders } => {
                 if self.watching.as_ref() == Some(&key) {
                     self.inventory_folders = Some((key.0.clone(), folders.clone()));
@@ -8039,6 +8414,7 @@ impl Session {
     /// Keep tree activation out of the dispatcher used by scrolling and startup.
     #[cold]
     fn activate_tree(&mut self, path: Arc<str>, retain: bool) -> Effect {
+        if let Some(effect) = self.activate_archive_tree(&path, retain) { return effect; }
         let Some(row) = self.state.tree_rows().find(|r| r.path == path).cloned() else { return Effect::default() };
         if row.dir.is_some() {
             return if retain { Effect::default() } else { self.command(Command::ToggleDir(path.to_string())) };
@@ -8383,13 +8759,22 @@ impl Session {
         self.check(id, None);
     }
 
+    fn refresh_baseline(&self, id: TabId) -> RefreshBaseline {
+        RefreshBaseline(self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer)
+            .and_then(|buffer| self.state.sources.buffers.get(&buffer))
+            .and_then(|entry| entry.draft.as_ref().map(|draft| &draft.baseline).or(entry.snapshot.as_ref()))
+            .map(|source| SemanticSource::new(source)))
+    }
+
     /// Check tab `id` off the UI thread. With `moved_to`, follow the rename when the file there is the same file
     /// (identity) and nothing new took its old place; otherwise check the old path like any refresh.
     fn check(&mut self, id: TabId, moved_to: Option<PathBuf>) {
+        if let Some(location) = self.state.tabs.iter().find(|tab| tab.id == id).and_then(|tab| crate::archive::Location::from_uri(&tab.source)) { self.check_archive(id, location); return; }
         let replacement = self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer).is_some_and(|buffer| self.replacement_current(buffer));
         let snapshot = self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer)
             .and_then(|buffer| self.state.sources.buffers.get(&buffer))
             .and_then(|entry| entry.draft.as_ref().map(|draft| draft.baseline.clone()).or_else(|| entry.snapshot.clone()));
+        let baseline = RefreshBaseline(snapshot.as_deref().map(SemanticSource::new));
         let token = self.next_refresh();
         let Some(t) = self.tab_mut(id) else { return };
         t.refresh = token;
@@ -8417,7 +8802,7 @@ impl Session {
                     Err(ReadError::Failed(why)) => Refresh::Gone(why),
                 }
             } else { check(&path, stamp, shown.as_ref(), &versions) };
-            let _ = tx.send_blocking(Completion::Refreshed { tab: id, token, result });
+            let _ = tx.send_blocking(Completion::Refreshed { tab: id, token, baseline, result });
         });
     }
 
@@ -8426,8 +8811,15 @@ impl Session {
         self.refresh_seq
     }
 
-    fn refreshed(&mut self, id: TabId, token: u64, result: Refresh) -> Effect {
+    fn refreshed(&mut self, id: TabId, token: u64, baseline: RefreshBaseline, result: Refresh) -> Effect {
         let Some(tab) = self.state.tabs.iter().find(|t| t.id == id && t.refresh == token) else { return Effect::default(); };
+        if baseline != self.refresh_baseline(id) {
+            // Save (or another confirmed baseline change) overtook this read. Its result may
+            // describe our own write as external. Check the current disk against the new
+            // baseline instead, so a genuine later external write is still detected.
+            self.check(id, None);
+            return Effect::default();
+        }
         let buffer = tab.buffer;
         let replacement = buffer.is_some_and(|buffer| self.replacement_current(buffer));
         if let Some(buffer) = buffer {
@@ -8549,13 +8941,13 @@ impl Session {
     /// navigation must not pay for them.
     fn rewatch(&mut self) {
         // An opened file cannot wait for inventory discovery or delivery, even in an already-known folder.
-        let mut immediate: std::collections::BTreeSet<_> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| t.source.parent()).map(Path::to_path_buf).collect();
+        let mut immediate: std::collections::BTreeSet<_> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| crate::archive::physical_path(&t.source).parent().map(Path::to_path_buf)).collect();
         if let Some(p) = &self.state.project { immediate.insert(p.root().to_owned()); }
         let _ = self.watcher.include(immediate);
         let project = self.state.project.as_ref().map(|p| (p.root().to_owned(), p.walk, p.files(), !p.refreshing() && !matches!(p.coverage(), project::Coverage::Scanning(_))));
         // Tabs inside the inventory's folders add nothing: opening one of the project's files costs no rebuild.
         let inside = |d: &Path| self.state.project.as_ref().is_some_and(|p| d == p.root() || d.strip_prefix(p.root()).is_ok_and(|r| p.has_dir(&r.to_string_lossy())));
-        let extra: std::collections::BTreeSet<PathBuf> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| t.source.parent()).filter(|d| !inside(d)).map(Path::to_path_buf).collect();
+        let extra: std::collections::BTreeSet<PathBuf> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| crate::archive::physical_path(&t.source).parent().map(Path::to_path_buf)).filter(|d| !inside(d)).collect();
         let key: WatchKey = (project, extra);
         if self.watching.as_ref() == Some(&key) {
             return;
@@ -8638,6 +9030,9 @@ impl Session {
         self.restore_workspace = self.state.tabs.is_empty();
         self.state.explorer = Default::default(); self.state.explorer_search = Default::default(); self.state.workspace_revision += 1;
         self.state.libraries = Default::default();
+        self.archive_browser = Default::default();
+        self.state.archive_tree = Default::default();
+        self.state.tree_reveal = None;
         let root = normalized(&root);
         self.pending_goto = None;
         let generation = self.root_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8740,7 +9135,7 @@ impl Session {
         }
         if n.scope == S::Symbols && n.query.is_empty() { parts.push("Type a symbol name".into()); }
         if let Some(message) = &n.message { parts.push(message.clone()); }
-        if n.scope == S::Recent { parts.push("Recent files · Delete forgets".into()); }
+        if n.scope == S::Recent { parts.push("Recent files · F6 forgets".into()); }
         parts.join(" · ")
     }
 
@@ -8762,6 +9157,8 @@ impl Session {
             symbols: if !query.is_empty() && matches!(scope, navigation::Scope::All | navigation::Scope::Symbols) { self.state.index.snapshot() } else { Vec::new() },
             recent,
             actions: if matches!(scope, navigation::Scope::All | navigation::Scope::Actions) { self.actions() } else { Vec::new() },
+            name_letters: self.state.settings.name_letter_search,
+            nearby: self.state.settings.rank_nearby_files,
         };
         // Recent files are bounded to fifty entries; populate immediately for Ctrl-E followed by Enter.
         if scope == navigation::Scope::Recent {
@@ -9076,6 +9473,50 @@ impl Session {
         self.native.issue(&self.state, tab, source);
     }
 
+    /// Save When Leaving a File: the tab another one replaces as the active tab is saved, while its draft is still
+    /// shown, if it is an edited file that can be saved. Its exact text is written (no format on save: a server's
+    /// answer would come for a tab no longer shown). Untitled documents and read-only, busy or blocked files are
+    /// left for the user; closing a tab is the close prompt's, not this.
+    fn save_on_leave(&mut self, tab: TabId) {
+        let saveable = self.state.tabs.iter().any(|t| t.id == tab && t.is_file() && !t.untitled()) && self.state.tab_dirty(tab) && self.save_disabled(tab).is_none();
+        if saveable { self.save(tab); }
+    }
+
+    /// Always Select Opened File: when the active file changes, its folders open (as the explorer's target button
+    /// does) and its row is offered to the adapters to select. A library's row waits for its folder to be read.
+    fn follow_active_file(&mut self) -> bool {
+        if !self.state.settings.always_select_opened_file { return false; }
+        let Some(rel) = self.state.active_in_tree() else { return false };
+        let mut repaint = false;
+        if self.followed.as_ref().is_none_or(|(path, _)| *path != rel) {
+            self.followed = Some((rel.clone(), false));
+            repaint |= self.command(Command::Locate).repaint;
+        }
+        if self.followed.as_ref().is_some_and(|(_, selected)| !selected) && self.state.tree_rows().any(|row| row.path == rel) {
+            let ticket = self.state.tree_follow.as_ref().map_or(1, |(_, t)| t + 1);
+            self.state.tree_follow = Some((rel.clone(), ticket));
+            self.followed = Some((rel, true));
+            repaint = true;
+        }
+        repaint
+    }
+
+    /// A navigation's landing kept clear of the sticky band ([`Session::band_goal`]): done once the tab shows its
+    /// placed caret with its declarations parsed and a laid-out pane; given up when sticky scroll is off. Whether the
+    /// view moved.
+    fn settle_band_goal(&mut self) -> bool {
+        let Some(id) = self.band_goal else { return false };
+        if !self.state.settings.sticky_scroll || !self.is_shown(id) { self.band_goal = None; return false; }
+        let Some(view) = self.state.view(id) else { return false };
+        let pane = view.tab().pane() as usize;
+        if view.tab().restore.is_some() || view.declarations().is_none() || self.state.text_size[pane].1 == 0 { return false; }
+        let Some(line) = view.tab().selection().map(|s| view.snapshot().line_of(s.head)) else { self.band_goal = None; return false };
+        self.band_goal = None;
+        let top = (view.tab().top_line(), view.tab().top_row());
+        self.clear_of_band(id, line, 0);
+        self.state.view(id).is_some_and(|v| (v.tab().top_line(), v.tab().top_row()) != top)
+    }
+
     /// Keep a known exact row below the sticky band. Cold layout resumes through the same bounded lane.
     fn clear_of_band(&mut self, tab: TabId, line: usize, row: usize) {
         use crate::layout::Query;
@@ -9128,6 +9569,12 @@ impl Session {
     /// [`Session::navigate`], optionally to source a language server returned (`retrieved`): its tab holds that
     /// snapshot and never reads the disk.
     fn navigate_to(&mut self, requested: PathBuf, retain: bool, restore: Option<Location>, record: bool, retrieved: Option<(RetrievedContent, semantics::VirtualSource)>) -> Effect {
+        if !is_virtual(&requested) && self.save_as_destination_reserved(&normalized(&requested)) {
+            self.state.messages.push("This destination is reserved by Save As; finish that operation before opening it.".into());
+            return Effect { repaint: true, copy: None, ..Effect::default() };
+        }
+        if !is_virtual(&requested) && lenz_archive::Kind::of(&requested.to_string_lossy()).is_some()
+            && let Ok(location) = crate::archive::Location::new(normalized(&requested), Vec::new()) { return self.browse_archive(location); }
         self.close_saved_comparison();
         self.open_seq += 1; // a result still being checked must not move the view after this
         // A jump to another file that has not landed is given up: it must not fire on that file's next open.
@@ -9139,7 +9586,7 @@ impl Session {
         }
         // Retrieved source is identified by its opaque URI, never a path; once its tab is gone it is not held.
         let virtual_source = is_virtual(&requested);
-        if virtual_source && retrieved.is_none() && !self.state.tabs.iter().any(|t| t.source == requested) {
+        if virtual_source && crate::archive::Location::from_uri(&requested).is_none() && retrieved.is_none() && !self.state.tabs.iter().any(|t| t.source == requested) {
             if requested.to_str().is_some_and(|p| p.starts_with(crate::tabs::UNTITLED)) {
                 self.state.messages.push("That untitled document was closed without a file".into());
                 return Effect { repaint: true, copy: None, ..Effect::default() };
@@ -9213,8 +9660,12 @@ impl Session {
                 Some(snapshot) => t.restore_to(to, &snapshot),
                 None => { t.restore = Some(to.clone()); t.top_line = to.top_line; }
             }
+            // Its line goes below the sticky headers of the declarations around it, once they are known.
+            self.band_goal = Some(id);
         }
-        if record && !same && let Some(to) = self.here() {
+        // A step for another tab, or for another line of this one (a definition in the same file, as Go to Line).
+        let moved = !same || from.as_ref().zip(restore.as_ref()).is_some_and(|(from, to)| from.line != to.line);
+        if record && moved && let Some(to) = self.here() {
             self.visit(from, to);
         }
         self.rewatch();
@@ -9365,6 +9816,7 @@ impl Session {
                 self.state.semantics.cancel();
             }
             if let Some(old) = self.state.active {
+                if self.state.settings.save_on_leave { self.save_on_leave(old); }
                 self.release(old);
             }
             self.state.active = Some(id);
@@ -9415,6 +9867,7 @@ impl Session {
             active: index(self.state.active), other: index(self.state.other), focused: self.state.focused,
             split: self.state.settings.split, layout: self.state.settings.layout, soft_wrap: self.state.settings.soft_wrap,
             expanded: project.expanded(), explorer: self.state.explorer.clone(),
+            archives: self.state.archive_tree.roots().to_vec(),
             tabs: tabs.into_iter().map(|t| crate::workspace::SavedTab { path: t.source.clone(), selection: t.selection(), top_line: t.top_line, top_row: t.top_row(), column: t.column, pane: t.pane, retained: t.retained, markdown_source: t.markdown_source, image_source: t.image_source }).collect(),
             missing: Vec::new(),
         };
@@ -9424,6 +9877,9 @@ impl Session {
 
     fn apply_workspace(&mut self, mut saved: crate::workspace::Workspace) {
         let missing = std::mem::take(&mut saved.missing);
+        let archives = std::mem::take(&mut saved.archives);
+        self.archive_browser = Default::default();
+        self.state.archive_tree = Default::default();
         self.state.settings.split = saved.split; self.state.settings.layout = saved.layout; self.state.settings.soft_wrap = saved.soft_wrap;
         self.state.explorer = saved.explorer; self.state.workspace_revision += 1;
         if let Some(project) = &mut self.state.project { project.restore_expanded(saved.expanded); }
@@ -9442,6 +9898,11 @@ impl Session {
         self.state.active = None;
         if let Some(active) = active { self.activate(active); }
         self.load_other();
+        let explorer = self.state.explorer.clone();
+        for location in archives { self.browse_archive(location); }
+        self.state.explorer = explorer;
+        self.state.tree_reveal = None;
+        self.state.archive_tree.clear_reveal();
         self.rewatch();
         // After activation, which clears messages.
         if !missing.is_empty() {
@@ -9505,6 +9966,13 @@ impl Session {
             let last = !self.state.tabs.iter().any(|tab| tab.id != id && tab.buffer == Some(buffer) && self.is_shown(tab.id));
             let dirty = self.state.sources.buffers.get(&buffer).and_then(|entry| entry.draft.as_ref()).is_some_and(crate::draft::Draft::dirty);
             self.analysis.release_view(buffer, id, last && !dirty);
+            // An edited draft stays analysed, but this tab drops what was derived from it (below): with no other view
+            // holding them, those results must run again when it is shown, or it stays without syntax and semantic
+            // colours (each request would match the one already delivered).
+            if last && dirty { self.analysis.release_derived(buffer); }
+            // The semantic colours and hints go with the content below; with no other view of the file shown, they are
+            // asked again when it is: a version already asked about would otherwise never be asked again.
+            if last && let Some(source) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.source.clone()) { self.state.semantics.forget_path(&source); }
         }
         if let Some(t) = self.state.tabs.iter().find(|t| t.id == id).filter(|t| t.is_file() && !t.before_root) {
             let (source, at) = (t.source.clone(), shows_text(&self.state, t).then(|| self.state.location(t)));
@@ -9936,6 +10404,7 @@ impl Session {
     /// Read and decode tab `id`'s source off the UI thread; a load superseded before it starts reads nothing.
     fn load(&mut self, id: TabId, reload: bool) {
         let Some(path) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.source.clone()) else { return };
+        if let Some(location) = crate::archive::Location::from_uri(&path) { self.load_archive_entry(id, reload, location); return; }
         let request = self.next_request();
         self.pending = Some((id, reload));
         self.reload_source = reload.then(|| self.state.source(id).map(|source| SemanticSource::new(source))).flatten();
@@ -9969,6 +10438,13 @@ impl Session {
     fn show_snapshot(&mut self, id: TabId, snapshot: Arc<crate::text::TextSnapshot>, stamp: Option<Stamp>, reload: bool) {
         let buffer = snapshot.key().buffer;
         let retained = !reload && self.state.sources.buffers.get(&buffer).is_some_and(CurrentSource::pinned);
+        // Another split may still own this version's delivered analysis. The scheduler
+        // deduplicates those requests, so restoring a view must reuse the current result.
+        let peer = self.state.tabs.iter().find(|tab| tab.id != id && tab.loaded && tab.buffer == Some(buffer));
+        let syntax = peer.filter(|tab| tab.parsed_source.as_ref().is_some_and(|source| source.matches(&snapshot)))
+            .map(|tab| (tab.highlights.clone(), tab.parsed_source.clone(), tab.folds.clone(), tab.declarations.clone()));
+        let semantic = peer.filter(|tab| tab.decor_source.as_ref().is_some_and(|source| source.matches(&snapshot)))
+            .map(|tab| (tab.hints.clone(), tab.decor_source.clone(), tab.tokens.clone()));
         if let Some(entry) = self.state.sources.buffers.get_mut(&buffer) { entry.snapshot = Some(snapshot.clone()); }
         let token = self.next_refresh();
         let Some(t) = self.tab_mut(id) else { return };
@@ -9983,6 +10459,12 @@ impl Session {
         }
         t.language = Some(snapshot.language());
         t.new_content();
+        if let Some((highlights, source, folds, declarations)) = syntax {
+            t.highlights = highlights; t.parsed_source = source; t.folds = folds; t.declarations = declarations;
+        }
+        if let Some((hints, source, tokens)) = semantic {
+            t.hints = hints; t.decor_source = source; t.tokens = tokens;
+        }
         let clamped = t.selection().map(|s| Selection { anchor: snapshot.floor_char_boundary(s.anchor), head: snapshot.floor_char_boundary(s.head) });
         t.place_selection(clamped);
         t.top_line = t.top_line.min(snapshot.line_count() - 1);
@@ -10212,7 +10694,9 @@ impl Drop for Session {
         self.projections.cancel_all();
         self.rx.close();
         self.navigation_latest.fetch_add(1, Ordering::Relaxed);
+        self.branches_requests.fetch_add(1, Ordering::Relaxed);
         self.root_generation.fetch_add(1, Ordering::Relaxed);
+        self.git_status_requests.fetch_add(1, Ordering::Relaxed);
         self.query_latest.fetch_add(1, Ordering::Relaxed);
         self.latest.fetch_add(1, Ordering::Relaxed);
         self.search_latest.fetch_add(1, Ordering::Relaxed);
@@ -10304,6 +10788,18 @@ struct Settings {
     /// Long lines wrap at the pane's width.
     soft_wrap: bool,
     relative_line_numbers: bool,
+    /// The explorer selects the active file whenever it changes.
+    always_select_opened_file: bool,
+    /// The caret line's commit shows faintly after the line's end.
+    inline_blame: bool,
+    /// Option+Left/Right move by word (macOS) and word stops cross the spaces between words.
+    mac_word_motion: bool,
+    /// Leaving a file saves its edits as Save does.
+    save_on_leave: bool,
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order.
+    name_letter_search: bool,
+    /// Search Everywhere ranks files near the open and recent ones higher.
+    rank_nearby_files: bool,
     vim_enabled: bool,
     /// The enclosing declarations stay pinned at the top of each pane.
     sticky_scroll: bool,
@@ -10334,7 +10830,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, save_on_leave: false, name_letter_search: false, rank_nearby_files: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
@@ -10457,6 +10953,7 @@ pub fn launch_target(arg: Option<PathBuf>, cwd: Option<PathBuf>, home: Option<Pa
 }
 
 fn normalized(path: &Path) -> PathBuf {
+    if is_virtual(path) { return path.to_path_buf(); }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
     let mut out = PathBuf::new();
     for c in absolute.components() {
@@ -10490,7 +10987,8 @@ fn projection_current(state: &State, request: &crate::projection::Request) -> bo
         && state.projection_view(request).is_some()
 }
 
-fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion) -> usize {
+/// `spaces`: word stops cross the spaces between words (macOS Word Motion).
+fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion, spaces: bool) -> usize {
     let line = doc.line_of(head);
     let range = doc.reader_line_range(line);
     let column = |l: usize| {
@@ -10517,8 +11015,8 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
         Motion::Down => range.end,
         Motion::WordLeft if head <= range.start => if line > 0 { doc.reader_line_range(v.step(line, -1)).end } else { 0 },
         Motion::WordRight if head >= range.end => if v.step(line, 1) > line { doc.reader_line_range(v.step(line, 1)).start } else { head },
-        Motion::WordLeft => word_stop(doc, head, true),
-        Motion::WordRight => word_stop(doc, head, false),
+        Motion::WordLeft => word_stop(doc, head, true, spaces),
+        Motion::WordRight => word_stop(doc, head, false, spaces),
         // Home goes to the line's first non-blank character, and from there to its start, as in IntelliJ.
         Motion::LineStart => {
             let text = skip_on(doc, range.start, range.end, |c| c == ' ' || c == '\t');
@@ -10531,23 +11029,11 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
 }
 
 /// The previous (`backward`) or next word stop within the head's line: the far end of the run of spaces, word
-/// characters or other symbols beside the head. At the line's edge the head stays.
-pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool) -> usize {
-    let range = doc.reader_line_range(doc.line_of(head));
-    if backward {
-        if head <= range.start { return head; }
-        let kind = doc.range(doc.previous_char_boundary(head)..head).and_then(|t| t.chars().next()).map_or(0, word_class);
-        skip_back(doc, head, range.start, |c| word_class(c) == kind)
-    } else {
-        if head >= range.end { return head; }
-        let kind = doc.range(head..doc.next_char_boundary(head)).and_then(|t| t.chars().next()).map_or(0, word_class);
-        skip_on(doc, head, range.end, |c| word_class(c) == kind)
-    }
-}
-
-/// Spaces, word characters (as [`crate::document`]'s word at a position) and other symbols: a word motion crosses one run.
-fn word_class(c: char) -> u8 {
-    if c.is_whitespace() { 0 } else if c.is_alphanumeric() || c == '_' { 1 } else { 2 }
+/// characters or other symbols beside the head. With `spaces` (macOS Word Motion) the spaces between words are crossed
+/// too, as macOS's Option+arrows go: from the end of `width: 80` the stops are `80`, `:` and `width`. At the line's
+/// edge the head stays; spaces running to it end there.
+pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool, spaces: bool) -> usize {
+    doc.word_stop(head, backward, spaces)
 }
 
 /// The first byte at or after `at` (before `end`) whose character fails `keep`, scanning a bounded window at a time.
@@ -10558,16 +11044,6 @@ fn skip_on(doc: &crate::text::TextSnapshot, mut at: usize, end: usize, keep: imp
         match text.char_indices().find(|&(_, c)| !keep(c)) { Some((i, _)) => return at + i, None => at = to }
     }
     end
-}
-
-/// The byte after the last character before `at` (from `start`) that fails `keep`: [`skip_on`] backwards.
-fn skip_back(doc: &crate::text::TextSnapshot, mut at: usize, start: usize, keep: impl Fn(char) -> bool) -> usize {
-    while at > start {
-        let from = doc.floor_char_boundary(at.saturating_sub(4096).max(start));
-        let Some(text) = doc.range(from..at) else { return at };
-        match text.char_indices().rev().find(|&(_, c)| !keep(c)) { Some((i, c)) => return from + i + c.len_utf8(), None => at = from }
-    }
-    start
 }
 
 /// The head moved one visual row up or down, keeping its display column (collapsed lines skipped).

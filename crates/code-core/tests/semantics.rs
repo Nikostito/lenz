@@ -411,8 +411,50 @@ fn messages(log: &Path) -> Vec<Value> {
 }
 
 fn alive(pid: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Use one observation: a zombie can be reaped between kill -0 and a
+        // second /proc read. Missing after that successful kill was reported alive.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let fields = stat.rsplit_once(')').expect("proc stat has a command").1;
+                let state = fields.split_whitespace().next().expect("proc stat has a state");
+                !matches!(state, "Z" | "X")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => false,
+            Err(error) => panic!("cannot inspect owned helper {pid}: {error}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
-        && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.split(' ').nth(2) == Some("Z"))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn liveness_probe_handles_running_zombie_and_reaped_helpers() {
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "printf 'owned helper' > /proc/self/comm && printf ready && read hold"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let pid = u64::from(child.id());
+    let mut ready = [0; 5];
+    std::io::Read::read_exact(&mut child.stdout.take().unwrap(), &mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    let running = alive(pid);
+    child.kill().unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut zombie = false;
+    while Instant::now() < until {
+        zombie = std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|s| s.lines().any(|line| line.starts_with("State:\tZ")));
+        if zombie { break; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let zombie_running = alive(pid);
+    child.wait().unwrap();
+    assert!(running, "the owned helper must start running");
+    assert!(zombie, "the killed direct child remains reserved until wait");
+    assert!(!zombie_running, "zombies must not count as running, including names with spaces");
+    assert!(!alive(pid), "a reaped helper must stay gone");
 }
 
 const LIB: &str = "pub fn helper() {}\npub struct Thing;\n";
@@ -843,7 +885,7 @@ fn large_files_are_never_sent_and_dependencies_show_their_origin() {
     f.definition("from_dep", false);
     f.settle(|s| s.state().current_source().is_some_and(|d| d.source().starts_with(&dep)));
     assert_eq!(f.selected_text(), "from_dep");
-    assert!(f.notice("Read-only source from a Cargo dependency"), "{:?}", f.s.state().notices());
+    assert!(f.notice("Source from a Cargo dependency"), "{:?}", f.s.state().notices());
     f.settle(|s| s.state().tree_rows().any(|r| r.name.as_ref() == "sibling.rs"));
     assert!(f.s.state().tree_rows().any(|r| r.name.as_ref() == "Libraries"));
     assert_eq!(f.s.state().project().unwrap().root(), f.root);
@@ -1282,6 +1324,13 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     f.settle(|s| s.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap().contains("Omega")));
     let log = f.log.clone();
     f.settle_until(move || messages(&log)[start..].iter().any(|m| m["method"] == "textDocument/didChange"));
+    // The refresh waits until Ruby LSP has applied the new text (its sync barrier answered).
+    let log = f.log.clone();
+    f.settle_until(move || {
+        let messages = messages(&log);
+        let tail = &messages[start..];
+        tail.iter().position(|m| m["method"] == "textDocument/didChange").is_some_and(|c| tail[c..].iter().any(|m| m["method"] == "textDocument/documentSymbol"))
+    });
     f.open("b.rb");
     let log = f.log.clone();
     let uri = code_core::semantics::lsp::file_uri(&f.root.join("a.rb"));
@@ -1296,6 +1345,9 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     let changed = tail.iter().position(|m| m["method"] == "textDocument/didChange").unwrap();
     let closed = tail.iter().position(|m| m["method"] == "textDocument/didClose").unwrap();
     assert!(tail[changed + 1..closed].iter().any(|m| m["method"] == "textDocument/documentSymbol"), "refresh must follow the new text");
+    let barrier = tail.iter().position(|m| m["method"] == "rubyLsp/workspace/addons").unwrap();
+    let refresh = changed + tail[changed..].iter().position(|m| m["method"] == "textDocument/documentSymbol").unwrap();
+    assert!(changed < barrier && barrier < refresh, "the refresh is asked once the text is applied");
     assert!(f.s.state().results().is_none(), "the internal reply must not open a symbol panel");
     assert!(f.s.state().asking().is_none());
 }
@@ -1778,7 +1830,11 @@ fn background_lanes_never_cancel_a_pending_definition() {
     f.s.dispatch(Command::HighlightAt);
     f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("lib.rs"))); // the definition still arrived
     let log = messages(&f.log);
-    assert!(!log.iter().any(|m| m["method"] == "$/cancelRequest"), "nothing was cancelled");
+    let definition = log.iter().find(|m| m["method"] == "textDocument/definition").expect("the foreground request reached the server");
+    // Following the definition can cancel highlights of the file we just left.
+    // Protect the foreground request itself, regardless of that background timing.
+    let cancelled: Vec<_> = log.iter().filter(|m| m["method"] == "$/cancelRequest").collect();
+    assert!(!cancelled.iter().any(|m| m["params"]["id"] == definition["id"]), "the pending definition was cancelled: {cancelled:?}");
 }
 
 #[test]
@@ -1791,10 +1847,10 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
     assert_eq!(f.s.context_menu(), vec![
         C(CommandId::Definition), C(CommandId::PeekDefinition), C(CommandId::TypeDefinition),
         C(CommandId::Implementation), C(CommandId::Usages), C(CommandId::CallHierarchy),
-        C(CommandId::TypeHierarchy), C(CommandId::Documentation), Separator,
+        C(CommandId::TypeHierarchy), C(CommandId::Documentation), C(CommandId::RenameSymbol), Separator,
         C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll), Separator,
         C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode),
-        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::LocateFile), Separator,
+        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference), C(CommandId::LocateFile), Separator,
         C(CommandId::AnnotateBlame), Separator, C(CommandId::OpenInEditor), C(CommandId::OpenWithDefaultApp),
         C(CommandId::ResolveExternalChange), C(CommandId::CompareWith), C(CommandId::CompareSaved), C(CommandId::CloseSavedComparison), Separator,
         C(CommandId::SplitRight), C(CommandId::SplitDown),
@@ -1807,6 +1863,7 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
     assert_eq!(f.s.disabled(CommandId::CloseSavedComparison), Some("No saved comparison is open"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: false }).copy.as_deref(), Some("src/main.rs"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: true }).copy.as_deref(), Some("src/main.rs:2"));
+    assert_eq!(f.s.dispatch(Command::CopyReference).copy.as_deref(), Some("crate::main"), "the function holding the caret");
     assert_eq!(CommandId::CopyPathLine.label(), "Copy Path:Line");
     assert!(CommandId::ALL.contains(&CommandId::CopyPath));
     assert_eq!(f.s.disabled(CommandId::CopyPath), None);
@@ -2054,7 +2111,13 @@ fn a_new_version_cancels_the_older_request_and_asks_again() {
     f.settle_until(|| !sent(&log, "textDocument/inlayHint").is_empty());
     write(&f.root, "src/main.rs", &HINTED.replace("add(1)", "add(2)"));
     f.s.dispatch(Command::Reload);
-    f.settle_until(|| sent(&log, "textDocument/inlayHint").len() >= 2);
+    // Earlier background requests can already make the count reach two. Wait for the
+    // actual post-change request before asserting protocol order.
+    f.settle_until(|| {
+        let all = messages(&log);
+        all.iter().position(|m| m["method"] == "textDocument/didChange")
+            .is_some_and(|change| all.iter().skip(change + 1).any(|m| m["method"] == "textDocument/inlayHint"))
+    });
     // The fake answers one request at a time (300 ms each), so the older one is still pending when the text changes.
     f.settle_until(|| !sent(&log, "$/cancelRequest").is_empty());
     let hint_ids: Vec<Value> = sent(&f.log, "textDocument/inlayHint").iter().map(|m| m["id"].clone()).collect();
@@ -3734,6 +3797,137 @@ fn typing_a_tags_closing_bracket_inserts_its_closing_tag_as_its_own_undo_step() 
     assert_eq!(f.auto_inserts().len(), 1, "no question with several carets");
 }
 
+fn ruby_fixture(source: &str) -> Fixture {
+    let config = "root = true\n[*]\nindent_style = space\nindent_size = 2\n";
+    let mut f = fixture_input("ruby-lsp", &[], &[("Gemfile", ""), (".editorconfig", config), ("a.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f
+}
+
+impl Fixture {
+    fn on_types(&self) -> Vec<Value> { messages(&self.log).into_iter().filter_map(|m| m.get("onType").cloned()).collect() }
+    /// Apply what arrives for `ms` milliseconds.
+    fn pump(&mut self, ms: u64) {
+        let rx = self.s.completions();
+        let until = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < until { if let Ok(c) = recv(&rx) { self.s.dispatch(c); } }
+    }
+}
+
+/// Enter after a Ruby block opener indents the body at once, then asks Ruby LSP (the fake answering as it does) for
+/// its on-type edits: the `end` it adds goes in as its own Undo step, with the caret left on the body line. A block
+/// that already has its `end` gets no second one, even when the server (seeing a syntax error elsewhere) offers it.
+#[test]
+fn enter_takes_the_servers_end_as_its_own_undo_step_and_never_adds_a_second_end() {
+    let source = "class A\n  def go\nend\n";
+    let mut f = ruby_fixture(source);
+    let tab = f.s.state().active().unwrap().id();
+    let at = source.find("def go").unwrap() + "def go".len();
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.keys("\n");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the body's indentation comes at once");
+    f.settle(|s| current_text(s.state()).contains("  end\nend"));
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \n  end\nend\n");
+    assert_eq!(f.s.state().selection().map(|s| s.range()), Some(at + 5..at + 5), "the caret stays on the body line");
+    let asked = f.on_types();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0], serde_json::json!({ "ch": "\n", "options": { "tabSize": 2, "insertSpaces": true }, "position": { "line": 2, "character": 4 } }));
+    f.keys("x");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    x\n  end\nend\n");
+    f.s.dispatch(Command::Undo { tab });
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the server's `end` is undone on its own");
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), source);
+    // Closed already: the server answers `end` (the file does not parse elsewhere), and none is added.
+    let closed = "def go\nend\nsyntax_error(\n";
+    let mut g = ruby_fixture(closed);
+    let at = "def go".len();
+    g.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    g.keys("\n");
+    let log = g.log.clone();
+    g.settle_until(move || messages(&log).iter().any(|m| m.get("onType").is_some()));
+    g.pump(400);
+    assert_eq!(current_text(g.s.state()), "def go\n  \nend\nsyntax_error(\n");
+    // A plain line asks the server too, which answers nothing; several carets ask nothing.
+    g.keys("y\n");
+    g.pump(300);
+    assert_eq!(current_text(g.s.state()), "def go\n  y\n  \nend\nsyntax_error(\n");
+    let asked = g.on_types().len();
+    g.s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+    g.s.dispatch(Command::AddCursorBelow);
+    g.keys("\n");
+    g.pump(300);
+    assert_eq!(g.on_types().len(), asked, "no question with several carets");
+    assert_eq!(std::fs::read_to_string(g.root.join("a.rb")).unwrap(), closed, "only the draft changes");
+}
+
+/// Ruby LSP parses a document when a request about it arrives but applies text on another thread, so each text
+/// change is followed by a document-free request (its add-on list) and nothing is asked about the new text (its
+/// problems, completion, symbols, hints or tokens) until that is answered.
+#[test]
+fn questions_about_edited_ruby_wait_behind_a_sync_barrier() {
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_PULL_DIAGNOSTICS", "1")], &[("Gemfile", ""), ("a.rb", "def go\n  1\nend\n")], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f.s.dispatch(Command::Select(Selection { anchor: 9, head: 9 }));
+    f.keys("x");
+    f.keys("y");
+    f.pump(1500);
+    let methods: Vec<String> = messages(&f.log).into_iter().filter_map(|m| m["method"].as_str().map(str::to_owned)).collect();
+    let changes: Vec<usize> = methods.iter().enumerate().filter(|(_, m)| *m == "textDocument/didChange").map(|(i, _)| i).collect();
+    assert!(!changes.is_empty() && methods.iter().any(|m| m == "textDocument/diagnostic"), "{methods:?}");
+    for (i, method) in methods.iter().enumerate() {
+        // Every question about a document: its problems, completion, symbols, hints, tokens.
+        if !method.starts_with("textDocument/") || method.starts_with("textDocument/did") { continue; }
+        // The last text change before this question has a barrier between it and the question.
+        let Some(&change) = changes.iter().rev().find(|&&c| c < i) else { continue };
+        assert!(methods[change..i].iter().any(|m| m == "rubyLsp/workspace/addons"), "a question right behind an edit: {methods:?}");
+    }
+    assert_eq!(current_text(f.s.state()), "def go\n  xy1\nend\n");
+}
+
+/// Go to Definition in Ruby where Ruby LSP's index has nothing (the fake, like Ruby LSP, does not read ActiveSupport's
+/// `cattr_accessor`): the bundle's gems (listed by `rubyLsp/workspace/dependencies`) and the project are searched by
+/// name, so the method a gem declares with the macro opens as a source outside the project; with several, they are
+/// listed as candidates.
+#[test]
+fn ruby_definitions_find_methods_declared_by_macros_in_gems() {
+    let gems = tempfile::tempdir().unwrap();
+    let mailer = gems.path().join("actionmailer-8.1");
+    let mail = gems.path().join("mail-2.9");
+    for (path, text) in [
+        (mailer.join("lib/action_mailer/delivery_methods.rb"), "module DeliveryMethods\n  included do\n    cattr_accessor :perform_deliveries, default: true\n  end\nend\n"),
+        (mail.join("lib/mail/message.rb"), "class Message\n  attr_accessor :delivery_handler\n  delegate :perform_deliveries, to: :config\nend\n"),
+        (mail.join("test/ignored.rb"), "cattr_accessor :perform_deliveries\n"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let list = format!("{}:{}", mailer.display(), mail.display());
+    let source = "class Messenger < ActionMailer::Base\n  def go\n    Messenger.perform_deliveries\n  end\nend\n";
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_GEMS", &list)], &[("Gemfile", ""), ("lib/messenger.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("lib/messenger.rb");
+    let log = f.log.clone();
+    f.settle_until(move || messages(&log).iter().any(|m| m["method"] == "rubyLsp/workspace/dependencies"));
+    f.pump(300);
+    let at = source.find("perform_deliveries").unwrap() + 3;
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().results().is_some());
+    let hits: Vec<(String, usize, String)> = f.s.state().results().unwrap().hits().iter().map(|h| (h.path.to_string(), h.line, h.text.trim().to_owned())).collect();
+    assert_eq!(hits, [
+        (mailer.join("lib/action_mailer/delivery_methods.rb").display().to_string(), 2, "cattr_accessor :perform_deliveries, default: true".into()),
+        (mail.join("lib/mail/message.rb").display().to_string(), 2, "delegate :perform_deliveries, to: :config".into()),
+    ], "both gems' declarations, not a gem's tests");
+    f.s.dispatch(Command::OpenResult(0));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
+    assert!(f.s.state().notices().iter().any(|n| n.contains("outside the project") || n.contains("Read-only")), "{:?}", f.s.state().notices());
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), source);
+}
+
 /// A closing tag answered after more typing is dropped, and one the settings turn off (`autoClosingTags: false`) is
 /// never asked; the typed text stays exactly as typed.
 #[test]
@@ -4372,4 +4566,107 @@ fn erasing_the_last_name_closes_automatic_but_preserves_manual_completion() {
     assert!(f.s.state().completion().is_some(), "an explicit request can keep showing on a blank line");
     assert_eq!(f.s.state().completion().unwrap().trigger, code_core::session::CompletionTrigger::Manual);
     assert_eq!(current_text(f.s.state()), original);
+}
+
+/// Each Go to Definition is a Back step, also within one file: Back returns to every place a definition was asked
+/// from, in turn, and Forward retraces the steps.
+#[test]
+fn back_returns_to_each_place_a_definition_was_asked_from_in_the_same_file() {
+    let main = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let mut f = fixture(&[], &[("src/main.rs", main)]);
+    f.open("src/main.rs");
+    let caret = |f: &Fixture| f.s.state().selection().unwrap().head;
+    let first_call = f.caret("first();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn first").unwrap() + 3));
+    assert_eq!(f.selected_text(), "first");
+    let second_call = f.caret("second();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn second").unwrap() + 3));
+    assert!(f.s.state().can_back());
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), second_call, "back to the second click");
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), first_call, "back to the first click");
+    // Forward retraces the steps: where the second definition was asked from (the place left), then that definition.
+    f.s.dispatch(Command::Forward);
+    assert_eq!(caret(&f), second_call, "forward to the second click");
+    f.s.dispatch(Command::Forward);
+    assert_eq!(f.selected_text(), "second", "forward to the second definition");
+    assert!(!f.s.state().can_forward());
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), main);
+}
+
+/// A definition deep in nested modules lands with its line in view below the sticky headers of the modules around
+/// it, not under them, in the same file and from another one.
+#[test]
+fn a_definition_in_nested_modules_lands_below_the_sticky_headers() {
+    let body = "                    let _ = 1;\n".repeat(12);
+    // The methods before it push `fn deep` far below the headers, as in a long class.
+    let before = "                pub fn filler() {}\n".repeat(30);
+    let nested = format!("pub mod a {{\n    pub mod b {{\n        pub mod c {{\n            pub mod d {{\n{before}                pub fn deep() {{\n{body}                }}\n            }}\n        }}\n    }}\n}}\n");
+    let main = format!("{nested}fn main() {{\n{}    a::b::c::d::deep();\n}}\n", "    let _ = 0;\n".repeat(40));
+    let other = "mod lib;\nfn caller() { lib::a::b::c::d::deeper(); }\n";
+    let mut f = fixture(&[], &[("src/main.rs", &main), ("src/lib.rs", &nested.replace("fn deep", "fn deeper")), ("src/other.rs", other)]);
+    let def_line = 34;
+    for (file, needle, name) in [("src/main.rs", "deep();", "deep"), ("src/other.rs", "deeper();", "deeper")] {
+        f.open(file);
+        f.s.dispatch(Command::SetTextSize { pane: 0, cols: 100, rows: 20 });
+        f.s.dispatch(Command::Scroll(usize::MAX));
+        f.definition(needle, false);
+        f.settle(|s| s.state().asking().is_none() && s.state().current_source().is_some_and(|d| d.line_of(s.state().selection().map_or(0, |sel| sel.head)) == def_line && !d.source().ends_with("other.rs")));
+        // Its sticky headers, once the file's declarations are known.
+        f.settle(|s| s.state().active().is_some_and(|t| s.state().view(t.id()).is_some_and(|v| v.declarations().is_some())));
+        let (top, band) = {
+            let state = f.s.state();
+            let view = state.view(state.active().unwrap().id()).unwrap();
+            let code_core::layout::Query::Ready(sticky) = view.layout_sticky(code_core::tabs::sticky_cap(20), None) else { panic!("sticky layout pending") };
+            (view.tab().top_line(), sticky.len())
+        };
+        assert!(def_line >= top + band, "{file}: `fn deep` (line {def_line}) is under the {band} sticky header(s) from top line {top}");
+        assert_eq!(f.selected_text(), name, "{file}");
+    }
+}
+
+/// Leaving an edited file for another of its language and coming back: its semantic colours and hints come back with
+/// its syntax colours, and the other file has its own.
+#[test]
+fn an_edited_file_shown_again_gets_its_semantic_colours_and_hints_back() {
+    let mut f = fixture(&[], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    f.settle(decorated);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(decorated);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")), "back on the edited file: {:?}", f.s.state().active().map(|t| t.source().to_owned()));
+    f.settle(|s| decorated(s) && active_view(s).is_some_and(|v| v.highlights().is_some()));
+    assert!(f.s.state().tab_dirty(tab), "still unsaved");
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
+}
+
+/// The same with a server that sends no semantic colours: the edited file's syntax colours come back on their own.
+#[test]
+fn an_edited_file_shown_again_is_highlighted_with_a_server_without_decorations() {
+    let mut f = fixture(&[("FAKE_LSP_NO_DECOR", "1")], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    let colored = |s: &Session| active_view(s).is_some_and(|v| v.highlights().is_some_and(|h| h.spans(0..1).iter().any(|l| !l.is_empty())));
+    f.settle(colored);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(colored);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")));
+    f.settle(colored);
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
 }

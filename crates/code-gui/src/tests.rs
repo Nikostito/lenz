@@ -2,6 +2,12 @@
 //! commands, and the file on disk never changes.
 use super::*;
 mod create;
+mod branches;
+mod native_close;
+mod archive;
+mod fields;
+mod native_fields;
+mod open_path;
 mod activity;
 #[cfg(target_os = "linux")]
 mod terminal;
@@ -137,7 +143,17 @@ fn settle(cx: &mut TestAppContext, f: &Fixture, done: impl Fn(&ReaderView) -> bo
     }
     panic!("timed out: {}", f.view.read_with(cx, |v, _| {
         let results = v.session().state().results().map(|r| (r.query().to_owned(), r.done(), r.selected(), r.preview().map(|p| p.index)));
-        format!("modal {} · focus results {} tree {} find {} · results {results:?}\n{}", v.modal.is_some(), v.results_focus, v.tree_focus, v.find_focus.is_some(), v.status())
+        let terminal = v.session().state().terminal();
+        let terminal_debug = if terminal.shown() {
+            let grid = v.terminal_layout().map(|layout| layout.grid);
+            let active = terminal.active().map(|tab| (tab.id(), tab.running(), tab.starting(), tab.status(), tab.error(), tab.cwd()));
+            let frame = terminal.active().and_then(|tab| tab.frame()).map(|frame| {
+                let text = frame.cells.chunks(frame.columns.max(1)).take(12).map(|row| row.iter().map(|cell| cell.text.as_str()).collect::<String>()).collect::<Vec<_>>();
+                (frame.columns, frame.rows, frame.cursor, frame.scrollback, text)
+            });
+            format!("\nTerminal shown={} focused={} shell=/bin/sh -i grid={grid:?} active(id,running,starting,status,error,cwd)={active:?} frame(columns,rows,cursor,scrollback,cells)={frame:?}", terminal.shown(), terminal.focused())
+        } else { String::new() };
+        format!("modal {} · focus results {} tree {} find {} · results {results:?}\n{}{terminal_debug}", v.modal.is_some(), v.results_focus, v.tree_focus, v.find_focus.is_some(), v.status())
     }));
 }
 
@@ -914,11 +930,14 @@ fn server_status_click_shows_setup_and_shared_recovery_actions(cx: &mut TestAppC
     let mut v = visual(cx, &f);
     v.simulate_resize(size(px(800.0), px(400.0)));
     draw(&mut v);
-    assert!(f.view.read_with(&v, |r, _| r.status_segments().0.1).starts_with("LSP unavailable"));
+    assert!(f.view.read_with(&v, |r, _| r.status_segments().0.1).starts_with("Install rust-analyzer"));
     v.simulate_keystrokes("ctrl-a");
     let selected = f.view.read_with(&v, |r, _| r.session().state().selection());
     let server = f.view.read_with(&v, |r, _| r.status_segments().0.0.center());
     v.simulate_click(server, Modifiers::default());
+    assert!(f.view.read_with(&v, |r, _| matches!(r.modal, Some(Modal::StatusDetails { kind: Details::Install, .. }))));
+    assert!(f.view.read_with(&v, |r, _| !r.session().state().server_install().unwrap().running));
+    v.simulate_keystrokes("escape f2 home");
     assert!(f.view.read_with(&v, |r, _| matches!(r.modal, Some(Modal::LanguageServer { .. }))));
     assert!(f.view.read_with(&v, |r, _| r.server_rows().len() == 10 && r.server_rows().iter().all(|(_, id)| id.is_some())));
     let button = f.view.read_with(&v, |r, _| { let l = r.modal_layout().unwrap(); l.bounds.origin + point(px(20.0), px(l.body_top + line_h() / 2.0)) });
@@ -954,7 +973,7 @@ fn server_status_click_shows_setup_and_shared_recovery_actions(cx: &mut TestAppC
         let at = f.view.read_with(v, |r, _| r.server_rows().iter().position(|(_, action)| *action == Some(id)).unwrap());
         for _ in 0..at { v.simulate_keystrokes("down"); }
         v.simulate_keystrokes("enter");
-        assert!(f.view.read_with(v, |r, _| r.modal.is_none()));
+        assert!(f.view.read_with(v, |r, _| r.modal.is_none()), "{id:?}: {:?}", f.view.read_with(v, |r, _| (r.modal.as_ref().map(std::mem::discriminant), r.session().disabled(id))));
     };
     v.simulate_keystrokes("f2");
     activate(&mut v, CommandId::DisableServer);
@@ -965,7 +984,8 @@ fn server_status_click_shows_setup_and_shared_recovery_actions(cx: &mut TestAppC
     v.simulate_keystrokes("f2");
     activate(&mut v, CommandId::EnableServer);
     drop(v);
-    settle(cx, &f, |r| r.session().state().provider().is_some_and(|p| matches!(p.status, code_core::semantics::Status::Missing(_))));
+    settle(cx, &f, |r| r.session().state().provider().is_some_and(|p| matches!(p.status, code_core::semantics::Status::Missing(_)))
+        && r.session().disabled(CommandId::RestartServer).is_none());
     let mut v = visual(cx, &f);
     v.simulate_keystrokes("f2");
     activate(&mut v, CommandId::RestartServer);
@@ -1850,6 +1870,9 @@ fn tabs_open_reuse_keep_and_close_through_real_input(cx: &mut TestAppContext) {
     drop(v);
     settle(cx, &f, active_is("b.rs"));
     let mut v = visual(cx, &f);
+    // Loading/diagnostic badges can resize b's label; use a's position from the current frame.
+    draw(&mut v);
+    let hits = f.view.read_with(&v, |v, _| v.tab_hits.clone());
     v.simulate_event(gpui::MouseDownEvent { button: MouseButton::Left, position: point(px(hits[1].0 + 10.0), px(bar_y)), modifiers: Modifiers::default(), click_count: 2, first_mouse: false });
     assert_eq!(f.view.read_with(&v, |v, _| tab_titles(v)), ["b.rs*", "a.rs"]);
     // Keeping a tab changes the labels' widths: take the × from the bar as it is now drawn.
@@ -2412,6 +2435,98 @@ fn indexing_percentage_is_visible_in_the_footer_and_status_dialog(cx: &mut TestA
         v.simulate_keystrokes("escape");
     }
     assert_eq!(std::fs::read(f.dir.path().join("main.rs")).unwrap(), b"fn main() {}\n");
+}
+
+#[gpui::test]
+fn back_returns_to_each_cmd_click_on_a_definition_in_the_same_file(cx: &mut TestAppContext) {
+    let source = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let f = fixture_with(cx, None, &fake_lsp());
+    let pkg = f.dir.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"pkg\"\n").unwrap();
+    let main = pkg.join("src/main.rs");
+    std::fs::write(&main, source).unwrap();
+    f.view.update(cx, |v, cx| v.dispatch(Command::OpenRoot(pkg.clone()), cx));
+    f.view.update(cx, |v, cx| v.dispatch(Command::Open(main.clone()), cx));
+    settle(cx, &f, |r| r.session().state().current_source().is_some() && r.session().state().provider().is_some_and(|p| p.status == code_core::semantics::Status::Ready));
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(500.0)));
+    draw(&mut v);
+    let text = f.view.read_with(&v, |r, _| r.text_bounds.unwrap());
+    let char_w = f.view.read_with(&v, |r, _| r.char_w);
+    let at = |line: f32, col: f32| point(px(f32::from(text.origin.x) + num_w() + 8.0 + col * char_w), text.origin.y + px((line + 0.5) * line_h()));
+    let caret = |v: &mut VisualTestContext| f.view.read_with(v, |r, _| r.session().state().selection().unwrap().head);
+    let selected = |r: &ReaderView| r.session().state().selection().map(|s| s.range());
+    let cmd = Modifiers { platform: true, ..Default::default() };
+    // Cmd-click `first();` (line 2), then `second();` in first's body (line 5): each lands on its definition.
+    v.simulate_click(at(1.0, 6.5), cmd);
+    let first_click = caret(&mut v);
+    drop(v);
+    let first = source.find("fn first").unwrap() + 3;
+    settle(cx, &f, |r| r.session().state().asking().is_none() && selected(r) == Some(first..first + 5));
+    let mut v = visual(cx, &f);
+    draw(&mut v);
+    v.simulate_click(at(4.0, 6.5), cmd);
+    let second_click = caret(&mut v);
+    drop(v);
+    let second = source.find("fn second").unwrap() + 3;
+    settle(cx, &f, |r| r.session().state().asking().is_none() && selected(r) == Some(second..second + 6));
+    let mut v = visual(cx, &f);
+    // Cmd+[ goes back to each click in turn; Cmd+] forward again.
+    v.simulate_keystrokes("cmd-[");
+    assert_eq!(caret(&mut v), second_click, "back to the second Cmd-click");
+    v.simulate_keystrokes("cmd-[");
+    assert_eq!(caret(&mut v), first_click, "back to the first Cmd-click");
+    v.simulate_keystrokes("cmd-] cmd-]");
+    assert_eq!(f.view.read_with(&v, |r, _| selected(r)), Some(second..second + 6), "forward to the second definition");
+    assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
+}
+
+#[gpui::test]
+fn a_cmd_click_into_nested_modules_shows_the_definition_below_the_sticky_headers(cx: &mut TestAppContext) {
+    let filler = "                pub fn filler() {}\n".repeat(30);
+    let body = "                    let _ = 1;\n".repeat(12);
+    let source = format!("pub mod a {{\n    pub mod b {{\n        pub mod c {{\n            pub mod d {{\n{filler}                pub fn deep() {{\n{body}                }}\n            }}\n        }}\n    }}\n}}\nfn main() {{ a::b::c::d::deep(); }}\n");
+    let f = fixture_with(cx, None, &fake_lsp());
+    let pkg = f.dir.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"pkg\"\n").unwrap();
+    let main = pkg.join("src/main.rs");
+    std::fs::write(&main, &source).unwrap();
+    f.view.update(cx, |v, cx| v.dispatch(Command::OpenRoot(pkg.clone()), cx));
+    f.view.update(cx, |v, cx| v.dispatch(Command::Open(main.clone()), cx));
+    settle(cx, &f, |r| r.session().state().current_source().is_some() && r.session().state().provider().is_some_and(|p| p.status == code_core::semantics::Status::Ready));
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(400.0)));
+    draw(&mut v);
+    // Cmd-click `deep` in `fn main` (the last line, at the bottom of the pane).
+    let last = source.lines().count() - 1;
+    let rows = f.view.read_with(&v, |r, _| r.rows);
+    f.view.update(&mut v, |r, cx| r.dispatch(Command::Scroll(last + 2 - rows), cx));
+    draw(&mut v);
+    let top = f.view.read_with(&v, |r, _| r.session().state().active().unwrap().top_line());
+    assert!(last >= top && last - top < rows, "the call is in view");
+    let text = f.view.read_with(&v, |r, _| r.text_bounds.unwrap());
+    let char_w = f.view.read_with(&v, |r, _| r.char_w);
+    let col = source.lines().nth(last).unwrap().find("deep").unwrap() as f32 + 1.5;
+    let at = point(px(f32::from(text.origin.x) + num_w() + 8.0 + col * char_w), text.origin.y + px(((last - top) as f32 + 0.5) * line_h()));
+    v.simulate_click(at, Modifiers { platform: true, ..Default::default() });
+    drop(v);
+    let def_line = 34;
+    settle(cx, &f, |r| r.session().state().asking().is_none() && r.session().state().current_source().is_some_and(|d| r.session().state().selection().is_some_and(|s| d.line_of(s.head) == def_line)));
+    // The headers come from the file's declarations, parsed in the background.
+    settle(cx, &f, |r| r.session().state().active().is_some_and(|t| r.session().state().view(t.id()).is_some_and(|v| v.declarations().is_some())));
+    let mut v = visual(cx, &f);
+    for _ in 0..3 { draw(&mut v); f.view.update(&mut v, |r, cx| r.poll(cx)); }
+    let (top, band) = f.view.read_with(&v, |r, _| {
+        let state = r.session().state();
+        let view = state.view(state.active().unwrap().id()).unwrap();
+        let code_core::layout::Query::Ready(sticky) = view.layout_sticky(code_core::tabs::sticky_cap(r.rows), None) else { panic!("sticky layout pending") };
+        (view.tab().top_line(), sticky.len())
+    });
+    assert!(band > 0, "the modules around it are pinned");
+    assert!(def_line >= top + band, "`fn deep` (line {def_line}) is under {band} sticky header(s) from top line {top}");
+    assert_eq!(std::fs::read(&main).unwrap(), source.as_bytes());
 }
 
 #[gpui::test]
@@ -3614,6 +3729,12 @@ fn right_click_opens_the_context_menu_at_the_pointer_and_runs_entries(cx: &mut T
     assert!(v.read_from_clipboard().and_then(|c| c.text()).is_some_and(|t| t.ends_with("main.rs:2")), "{:?}", v.read_from_clipboard());
     // A click on an entry runs it; a click outside the menu closes it without running anything.
     right(&mut v, at(6.5, 1.0));
+    // Rename Symbol adds a row: Copy Path can now be below this short window. Reveal it
+    // with real menu navigation before clicking, also exercising a scrolled menu's hit test.
+    let rows = f.view.read_with(&v, |r, _| r.modal_rows());
+    let index = rows.iter().position(|r| r.0 == "Copy Path").unwrap();
+    let downs = index - rows[..index].iter().filter(|r| r.0 == "—").count();
+    for _ in 0..downs { v.simulate_keystrokes("down"); }
     draw(&mut v);
     let (menu, entry_y) = f.view.read_with(&v, |r, _| (r.context_bounds().unwrap(), r.context_row_y("Copy Path").unwrap()));
     v.simulate_click(point(menu.origin.x + px(10.0), px(entry_y + line_h() / 2.0)), Modifiers::default());
@@ -4944,7 +5065,7 @@ fn a_click_in_a_scrolled_finder_opens_the_clicked_file(cx: &mut TestAppContext) 
     drop(v);
     settle(cx, &f, |v| v.session().state().navigation().is_some_and(|f| !f.pending && f.query == "f"));
     let mut v = visual(cx, &f);
-    v.simulate_keystrokes("end");
+    v.simulate_keystrokes("alt-end");
     draw(&mut v);
     // Scrolled: the clicked row is the one drawn there, not the one the unscrolled layout would put there.
     let first = f.view.read_with(&v, |r, _| r.navigation_drawn.unwrap().1);
@@ -5039,6 +5160,34 @@ fn search_dialog_is_centered_and_its_fields_and_toggles_take_clicks(cx: &mut Tes
     v.simulate_click(point(px(4.0), px(590.0)), Modifiers::default());
     assert!(f.view.read_with(&v, |r, _| r.modal.is_none()));
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "0\n1\n2\n3\n4\n5\n");
+}
+
+#[gpui::test]
+fn the_project_search_fields_edit_at_their_caret(cx: &mut TestAppContext) {
+    let (f, mut v, _root) = bookmarks_fixture(cx);
+    let field = |v: &mut VisualTestContext| f.view.read_with(v, |r, _| r.search_fields_for_test()).expect("Search in Project is open");
+    v.simulate_keystrokes("ctrl-shift-f d r a f t space n o t e s");
+    assert_eq!(field(&mut v), ("draft notes".into(), String::new(), 11));
+    v.simulate_keystrokes("left left x");
+    assert_eq!(field(&mut v), ("draft notxes".into(), String::new(), 10), "typing goes in at the caret");
+    v.simulate_keystrokes("alt-left");
+    assert_eq!(field(&mut v).2, 6, "Option+Left to the word's start");
+    v.simulate_keystrokes("cmd-left");
+    assert_eq!(field(&mut v).2, 0, "Cmd+Left to the start");
+    v.simulate_keystrokes("end cmd-backspace");
+    assert_eq!(field(&mut v), ("draft ".into(), String::new(), 6), "Cmd+Backspace takes the word before the caret");
+    v.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("fresh\nsecond line".into())));
+    v.simulate_keystrokes("home ctrl-v");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), String::new(), 5), "a paste: its first line, at the caret");
+    v.simulate_keystrokes("tab * . r s left left x");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), "*.xrs".into(), 3), "Tab: the file pattern, its caret at the end");
+    v.simulate_keystrokes("ctrl-a left y");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), "y*.xrs".into(), 1), "Left leaves a selection at its start");
+    v.simulate_keystrokes("ctrl-a delete");
+    assert_eq!(field(&mut v), ("freshdraft ".into(), String::new(), 0), "Delete clears a selection");
+    draw(&mut v);
+    v.simulate_keystrokes("escape");
+    assert!(f.view.read_with(&v, |r, _| r.modal.is_none()));
 }
 
 #[gpui::test]
@@ -5234,10 +5383,13 @@ fn wait_until(cx: &mut TestAppContext, f: &Fixture, done: impl Fn(&ReaderView) -
 #[gpui::test]
 fn the_lower_panes_close_mark_closes_its_tab(cx: &mut TestAppContext) {
     let f = fixture(cx, None);
-    let root = project(f.dir.path(), &["a.rs", "b.rs", "c.rs"]);
+    // The active lower tab includes its close mark. A wider first upper title keeps the
+    // intended overlap independent of inactive-tab close marks and optional icon widths.
+    let names = ["a_much_longer_first_file.rs", "other_file.rs", "third_file.rs"];
+    let root = project(f.dir.path(), &names);
     f.view.update(cx, |v, cx| v.open_root(root.clone(), cx));
     settle(cx, &f, scanned);
-    for name in ["a.rs", "b.rs", "c.rs"] {
+    for name in names {
         f.view.update(cx, |v, cx| v.dispatch(Command::OpenRetained(root.join(name)), cx));
         settle(cx, &f, active_is(name));
     }
@@ -5258,7 +5410,7 @@ fn the_lower_panes_close_mark_closes_its_tab(cx: &mut TestAppContext) {
     // The lower tab's close mark, where the upper bar's first tab (starting after its buttons) also lies.
     let (upper, char_w) = f.view.read_with(&v, |r, _| (r.tab_hits[0], r.char_w));
     let x = hit.1 - char_w;
-    assert!(x > upper.0 && x < upper.1, "precondition: both bars' tabs span the point");
+    assert!(x > upper.0 && x < upper.1, "precondition: both bars' tabs span the point: lower={hit:?}, upper={upper:?}, x={x}, char_w={char_w}; hits {:?}", f.view.read_with(&v, |r, _| r.tab_hits.clone()));
     v.simulate_click(point(px(x), px(panes[1].bar.2 + line_h() / 2.0)), Modifiers::default());
     let lower: Vec<_> = f.view.read_with(&v, |r, _| r.session().state().pane_tabs(1).map(|t| t.id()).collect());
     assert!(!lower.contains(&id), "the lower tab closed; focused pane {}", f.view.read_with(&v, |r, _| r.session().state().focused_pane()));
@@ -5375,7 +5527,9 @@ fn hovering_a_context_menu_entry_highlights_it(cx: &mut TestAppContext) {
     let f = fixture(cx, Some(("main.rs", b"fn main() {\n    helper();\n}\nfn helper() {}\n")));
     settle(cx, &f, active_is("main.rs"));
     let mut v = visual(cx, &f);
-    v.simulate_resize(size(px(800.0), px(400.0)));
+    // Keep the target row visible as the navigation menu grows. Narrow-menu
+    // scrolling has its own interaction coverage.
+    v.simulate_resize(size(px(800.0), px(700.0)));
     draw(&mut v);
     let text = f.view.read_with(&v, |r, _| r.text_bounds.unwrap());
     let p = point(text.origin.x + px(num_w() + 40.0), text.origin.y + px(line_h() * 1.5));
@@ -5548,7 +5702,7 @@ fn server_runtime_dialog_validates_saves_and_preserves_the_document(cx: &mut Tes
     let original = std::fs::read(&settings).unwrap();
     let mut v = visual(cx, &f);
     v.simulate_resize(size(px(800.0), px(400.0)));
-    v.simulate_keystrokes("ctrl-a f2");
+    v.simulate_keystrokes("ctrl-a f2 home");
     let selected = f.view.read_with(&v, |r, _| r.session().state().selection());
     let at = f.view.read_with(&v, |r, _| r.server_rows().iter().position(|(_, action)| *action == Some(CommandId::ServerRuntime)).unwrap());
     for _ in 0..at { v.simulate_keystrokes("down"); }
@@ -5719,6 +5873,41 @@ fn click_navigation_row(f: &Fixture, v: &mut VisualTestContext, row: usize) {
 }
 
 #[gpui::test]
+fn the_search_everywhere_query_edits_at_its_caret_by_character_word_and_end(cx: &mut TestAppContext) {
+    let f = fixture(cx, Some(("main.rs", b"fn sample() {}\n")));
+    settle(cx, &f, |r| r.session.state().current_source().is_some());
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(500.0)));
+    let field = |v: &mut VisualTestContext| f.view.read_with(v, |r, _| {
+        let caret = match r.modal { Some(Modal::Navigation { caret, .. }) => caret, _ => panic!("the search closed") };
+        let query = r.session.state().navigation().unwrap().query.clone();
+        let caret = caret.unwrap_or(query.len());
+        (query, caret)
+    });
+    v.simulate_keystrokes("ctrl-k s k e t c h space p a d");
+    assert_eq!(field(&mut v), ("sketch pad".into(), 10));
+    v.simulate_keystrokes("left left x");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 9), "typing goes in at the caret");
+    v.simulate_keystrokes("alt-left");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 7), "Option+Left to the word's start");
+    v.simulate_keystrokes("alt-left alt-right");
+    assert_eq!(field(&mut v), ("sketch pxad".into(), 6), "Option+Right to the word's end");
+    v.simulate_keystrokes("cmd-left _");
+    assert_eq!(field(&mut v), ("_sketch pxad".into(), 1), "Cmd+Left to the start");
+    v.simulate_keystrokes("ctrl-right delete");
+    assert_eq!(field(&mut v), ("_sketchpxad".into(), 7), "Ctrl+Right by word, Delete the character after");
+    v.simulate_keystrokes("cmd-right cmd-backspace");
+    assert_eq!(field(&mut v), (String::new(), 0), "Cmd+Backspace takes the word before the caret");
+    v.simulate_keystrokes("a space b c space d alt-backspace");
+    assert_eq!(field(&mut v), ("a bc ".into(), 5));
+    v.simulate_keystrokes("home");
+    assert!(f.view.read_with(&v, |r, _| matches!(r.modal, Some(Modal::Navigation { at: 0, .. }))), "Home still picks the first row");
+    draw(&mut v);
+    v.simulate_keystrokes("escape");
+    assert!(f.view.read_with(&v, |r, _| r.modal.is_none()));
+}
+
+#[gpui::test]
 fn unified_search_switches_categories_preserving_query_and_runs_actions(cx: &mut TestAppContext) {
     use code_core::navigation::Scope;
     let source = b"fn sample() {}\n";
@@ -5853,13 +6042,13 @@ fn unified_search_caret_starts_at_the_shaped_query_end(cx: &mut TestAppContext) 
                 v.simulate_keystrokes("ctrl-v");
                 draw(&mut v);
                 let (bounds, char_w, font, caret) = f.view.read_with(&v, |r, _| (r.navigation_bounds(), r.char_w, r.font.clone(), r.session.state().palette().caret));
-                let shown = format!("› {}", navigation::tail(&query, ((f32::from(bounds.size.width) - 36.0) / char_w).max(1.0) as usize));
+                let shown = code_core::line_edit::visible(&query, query.len(), ((f32::from(bounds.size.width) - 36.0 - 2.0*char_w) / char_w).max(0.0) as usize).prefix.to_owned();
                 let shown = lenz_content::display::show_bidi(&lenz_content::display::cap_marks(&shown)).into_owned();
                 v.update(|window, _| {
                     let run = gpui::TextRun { len: shown.len(), font, color: gpui::Hsla::default(), background_color: None, underline: None, strikethrough: None };
                     let end = window.text_system().shape_line(shown.into(), px(font_size()), &[run], None).width;
                     let scale = window.scale_factor();
-                    let x = (f32::from(bounds.origin.x + end) + 12.0).min(f32::from(bounds.right()) - 14.0) * scale;
+                    let x = (f32::from(bounds.origin.x + end) + 12.0 + 2.0*char_w).min(f32::from(bounds.right()) - 26.0) * scale;
                     let y = (f32::from(bounds.origin.y) + 4.0 + line_h() + 1.0) * scale;
                     assert!(window.painted_quads().iter().any(|q|
                         (q.bounds.origin.x.0 - x).abs() <= 0.5
@@ -5903,7 +6092,7 @@ fn unified_search_empty_constructor_paste_tabs_resize_and_appearances(cx: &mut T
     let b = f.view.read_with(&v, |r, _| r.navigation_bounds());
     v.simulate_click(point(b.origin.x + b.size.width / 8.0, b.origin.y + px(10.0)), Modifiers::default());
     assert_eq!(f.view.read_with(&v, |r, _| { let n = r.session.state().navigation().unwrap(); (n.scope, n.query.clone()) }), (Scope::All, "Soft Wrap".to_string()));
-    v.simulate_keystrokes("ctrl-a");
+    v.simulate_keystrokes("ctrl-a backspace");
     assert!(f.view.read_with(&v, |r, _| r.session.state().navigation().unwrap().query.is_empty()));
     let long_query = format!("{}終端", "Été/".repeat(40));
     v.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(long_query.clone())));
@@ -6077,7 +6266,7 @@ fn recent_files_use_search_presentation_filter_delete_and_keep_query_between_mod
     settle(cx, &f, |r| r.session.state().navigation().is_some_and(|n| !n.pending && n.query == "é"));
     let mut v = visual(cx, &f);
     draw(&mut v);
-    v.simulate_keystrokes("delete");
+    v.simulate_keystrokes("f6");
     drop(v);
     settle(cx, &f, |r| r.session.state().navigation().is_some_and(|n| !n.pending && n.rows.is_empty()));
     assert!(!f.view.read_with(cx, |r, _| r.session.state().places().recent_files().iter().any(|file| file.ends_with("Été.rs"))));
@@ -6199,7 +6388,7 @@ fn chrome_segments_fit_and_details_scroll_copy_and_dismiss_in_both_appearances(c
             v.simulate_resize(size(px(w), px(h)));
             draw(&mut v);
             f.view.read_with(&v, |r, _| {
-                let (a, b, c, sql, markers) = r.status_segments();
+                let (a, b, c, sql, markers, _) = r.status_segments();
                 assert_eq!(c.0.left(), px(STATUS_PAD.min(w / 2.0)));
                 assert!(c.0.right() <= a.0.left() && a.0.right() <= sql.0.left() && sql.0.right() <= markers.0.left() && markers.0.right() <= b.0.left());
                 assert!(b.0.right() <= px(w));
@@ -6336,6 +6525,42 @@ fn blame_fixture(cx: &mut TestAppContext) -> (Fixture, String) {
 fn annotated(v: &ReaderView) -> bool {
     let s = v.session();
     s.state().active().is_some_and(|t| s.annotation(t.id(), 1).is_some())
+}
+
+#[gpui::test]
+fn inline_blame_paints_the_caret_lines_commit_faintly_after_its_end(cx: &mut TestAppContext) {
+    let (f, _) = blame_fixture(cx);
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(400.0)));
+    draw(&mut v);
+    let blamed = |v: &ReaderView| v.session().state().active().and_then(|t| v.session().state().caret_blame(t.id())).is_some();
+    v.simulate_keystrokes("down");
+    draw(&mut v);
+    assert!(f.view.read_with(&v, |r, _| r.inline_problem_labels().is_empty()), "off by default");
+    // Find Action reaches the setting, as the View menu does.
+    v.simulate_keystrokes("ctrl-shift-a i n l i n e space b l a m e");
+    drop(v);
+    settle(cx, &f, |r| r.session().state().navigation().is_some_and(|n| !n.pending && n.rows.first().is_some_and(|row| row.label == "Inline Blame")));
+    let mut v = visual(cx, &f);
+    v.simulate_keystrokes("enter");
+    assert!(f.view.read_with(&v, |r, _| r.session().state().inline_blame()), "on");
+    drop(v);
+    settle(cx, &f, blamed);
+    let mut v = visual(cx, &f);
+    draw(&mut v);
+    let (painted, dim, cols) = f.view.read_with(&v, |r, _| (r.inline_problem_labels(), r.session().state().palette().dim, r.session().state().active().unwrap().annotation_cols()));
+    assert_eq!(painted.len(), 1, "only the caret line: {painted:?}");
+    let (line, text, color) = &painted[0];
+    assert_eq!((*line, color), (1, &dim), "the second line, faint");
+    assert!(text.ends_with(" • First line") && text.starts_with("t, "), "{text}");
+    assert_eq!(cols, 0, "no annotation column");
+    v.simulate_keystrokes("up");
+    draw(&mut v);
+    assert_eq!(f.view.read_with(&v, |r, _| r.inline_problem_labels().into_iter().map(|(line, ..)| line).collect::<Vec<_>>()), [0], "it follows the caret");
+    v.simulate_keystrokes("shift-right");
+    draw(&mut v);
+    assert!(f.view.read_with(&v, |r, _| r.inline_problem_labels().is_empty()), "not over a selection");
+    assert_eq!(std::fs::read(f.dir.path().join("a.txt")).unwrap(), b"one\ntwo\n");
 }
 
 #[gpui::test]
@@ -6594,12 +6819,12 @@ fn gui_a_rows_menu_makes_a_branch_from_it_and_the_revision_prompt_checks_out(cx:
     settle_for(cx, &f, 10, &|r| r.session().state().branches().is_some_and(|b| !b.loading));
     draw(&mut v);
     type_text(&mut v, "v1");
-    v.simulate_keystrokes("right");
+    v.simulate_keystrokes("alt-enter");
     let menu = f.view.read_with(&v, |r, _| r.modal_rows().into_iter().map(|r| r.0).collect::<Vec<_>>());
     assert_eq!(&menu[1..], ["Checkout", "New Branch from Here…", "Compare with Working Tree"]);
     v.simulate_keystrokes("escape");
     assert!(f.view.read_with(&v, |r, _| matches!(&r.modal, Some(Modal::Branches { query, .. }) if query == "v1")), "back to the list");
-    v.simulate_keystrokes("right down enter");
+    v.simulate_keystrokes("alt-enter down enter");
     assert!(f.view.read_with(&v, |r, _| matches!(&r.modal, Some(Modal::NewBranch { from: Some(f), .. }) if f == "refs/tags/v1")));
     type_text(&mut v, "other");
     v.simulate_keystrokes("enter");
@@ -6678,7 +6903,7 @@ fn gui_a_worktree_opens_here_or_in_a_new_window(cx: &mut TestAppContext) {
     settle_for(cx, &f, 10, &|r| r.session().state().branches().is_some_and(|b| !b.loading));
     draw(&mut v);
     type_text(&mut v, "second");
-    v.simulate_keystrokes("right");
+    v.simulate_keystrokes("alt-enter");
     let menu = f.view.read_with(&v, |r, _| r.modal_rows().into_iter().map(|r| r.0).collect::<Vec<_>>());
     assert_eq!(&menu[1..], ["Open", "Open in New Window", "Compare with Working Tree"]);
     v.simulate_keystrokes("down enter");
@@ -6763,7 +6988,7 @@ fn gui_rows_compare_with_the_working_tree_and_since_branching(cx: &mut TestAppCo
     v.simulate_keystrokes("ctrl-shift-`");
     settle_for(cx, &f, 10, &|r| r.session().state().branches().is_some_and(|b| !b.loading));
     type_text(&mut v, "other");
-    v.simulate_keystrokes("right");
+    v.simulate_keystrokes("alt-enter");
     let menu = f.view.read_with(&v, |r, _| r.modal_rows().into_iter().map(|r| r.0).collect::<Vec<_>>());
     assert_eq!(&menu[1..], ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here"]);
     v.simulate_keystrokes("down down enter");
@@ -6772,7 +6997,7 @@ fn gui_rows_compare_with_the_working_tree_and_since_branching(cx: &mut TestAppCo
     v.simulate_keystrokes("ctrl-shift-`");
     settle_for(cx, &f, 10, &|r| r.session().state().branches().is_some_and(|b| !b.loading));
     type_text(&mut v, "other");
-    v.simulate_keystrokes("right down down down enter");
+    v.simulate_keystrokes("alt-enter down down down enter");
     let split = lenz_content::git::testing::git(f.dir.path(), &["rev-parse", "main"]).trim().to_string();
     assert_eq!(launched_args(&mut v, &f)[1], [split]);
     // Compare with Worktree…: only the other worktree; Enter compares the folders.

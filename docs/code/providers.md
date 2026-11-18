@@ -58,7 +58,7 @@ or copying the source selection; terminal copying uses OSC 52. Arrows, Page Up/D
 the report. Reopen it to refresh the snapshot. **Copy Language Server Details** remains in Find Action/F10.
 
 - **Unavailable:** read the specific reason. A missing executable or runtime gets that provider's existing
-  installation guidance. Choose **Install Language Server…** for a command preview and an explicit managed npm install where supported, or install it yourself. Correct `executable`, `args` and `env` in
+  installation guidance. Choose **Install Language Server…** for a command preview and an explicit managed install where supported, or install it yourself. Correct `executable`, `args` and `env` in
   `$XDG_CONFIG_HOME/lenz-code/providers.json`, then choose **Restart Language Server**. No workspace gets
   **Set Workspace Root…** guidance instead. Large files explain why their server is not started.
 - **Stopped:** the full startup or exit error stays in the dialog. Check the named executable and its
@@ -79,42 +79,58 @@ the current state display their reason. Recovery actions never write source file
 
 ## Explicit managed installation
 
-F2 → **Install Language Server…** in either frontend opens a focused preview. **Start Installation** (`S` or
-Enter) starts it; opening the dialog alone does nothing. **Cancel Installation** (`C`) kills the owned installer
-process group, including its children. Escape or Close also cancels. The dialog shows phases and up to 32 KiB of
-sanitized installer output; output may be omitted if the completion queue is busy. **Server Details…** (`D`)
-keeps the complete original diagnosis available, and Ctrl-C copies the preview/output. The editor remains responsive.
+When a server or its runtime is missing, the footer offers **Install ‹server›…**.
+Click it to open setup directly, or press F2 and Enter for the selected install action.
+A missing workspace still opens Status so you can choose its root. Unsupported file
+kinds do not offer installation. The same controls are available in GUI and TUI.
 
-The curated npm recipes install outside projects, below `servers/<provider-id>/` beside `providers.json`.
-The preview shows the resolved Node/npm executable paths, exact argument list, target directory and disabled
-package scripts. npm's cache stays there too. Lenz invokes the npm JavaScript CLI with the provider's selected
-Node explicitly, using its configured PATH (including Pyright's selected runtime); shell startup files are not read.
-Node must be named `node`, as in the runtime chooser. npm shims that are shell wrappers are not supported by this
-launcher: use the installed npm JavaScript CLI on the provider PATH. npm checks package engine requirements strictly.
+The preview explains the destination and exact command. **Start Installation** (`S`
+or Enter) downloads and sets up the server only after you choose it. **Cancel
+Installation** (`C`) and Escape/Close stop its owned process group, including children.
+Progress and up to 32 KiB of sanitized output appear in the dialog. **Server Details…**
+(`D`) retains the original diagnosis; Ctrl-C copies the preview/output. After failure,
+**Install Language Server…** (`S` or Enter) opens a fresh preview for retry.
 
-| Provider | Package selected by Install |
+Node-based installers can use **Choose Language Server Runtime…** (`R` when setup
+needs a runtime). Pick an existing Node installation, including discovered nvm/mise
+versions, or enter its path. The server need not be installed beside Node. Save the
+runtime, close its chooser, and the install preview refreshes with it. This works for
+Python, JavaScript/TypeScript, YAML, Shell, HTML and CSS. No shell startup files are read.
+Node and npm must already be installed; the dialog explains missing prerequisites.
+
+| Provider | Managed package / existing toolchain |
 | --- | --- |
-| Shell | `bash-language-server@5.8.1` |
-| Python | `pyright@1.1.414` |
-| YAML | `yaml-language-server@2.0.0` |
-| TypeScript / JavaScript | `typescript-language-server@6.0.1` and TypeScript 6 |
-| HTML, CSS | `vscode-langservers-extracted@4.10.0` (each provider has its own managed directory) |
+| Shell | `bash-language-server@5.8.1` / Node and npm |
+| Python | `pyright@1.1.414` / Node and npm |
+| YAML | `yaml-language-server@2.0.0` / Node and npm |
+| TypeScript / JavaScript | `typescript-language-server@6.0.1` plus TypeScript 6 / Node and npm |
+| HTML, CSS | `vscode-langservers-extracted@4.10.0` / Node and npm |
+| Ruby | `ruby-lsp` 0.26.11 / Ruby and RubyGems |
+| Go | `golang.org/x/tools/gopls@v0.24.0` / a compatible Go toolchain |
 
-Node.js and npm must already be installed. Missing managers, custom executable overrides, unsupported platforms
-and providers without a recipe show their next setup action and refuse Start. Ruby, Go, Rust, Java, Kotlin and
-TypeScript 7 use the existing manual setup guidance; Lenz does not invoke gem, go, rustup or system package managers.
-ShellCheck and shfmt remain separate optional tools and are not installed by this action. No sudo, global npm
-installation, project manifest edits or dependency lifecycle scripts are used. Top-level server versions are pinned;
-npm resolves their dependencies normally, without a lockfile. Network/registry failures and runtime errors remain visible.
+Each provider installs below `servers/<provider-id>/` beside `providers.json`, outside
+projects. npm runs with the selected Node explicitly, with lifecycle scripts disabled
+and a private cache; npm must be its JavaScript CLI, not a shell-wrapper shim. Ruby
+installs into a private gem home with the selected Ruby on PATH. Go uses private binary,
+module and build-cache directories, with implicit toolchain downloads disabled. Ruby
+and Go dependencies may compile native code. Neither action uses sudo, installs system
+packages or edits a project manifest. Use your project's intended runtime/toolchain.
+ShellCheck, shfmt and the Ruby Rails add-on remain separate optional tools. Rust, Java,
+Kotlin and TypeScript 7 retain manual installation guidance; Lenz does not install
+system runtimes. Top-level server versions are pinned; package managers resolve their
+dependencies normally. Network and runtime failures remain visible.
 
-After npm succeeds, Lenz verifies the package's executable stays inside its managed directory, reads the package
-identity/version and checks the launcher with the selected Node runtime. Only then does it atomically save the
-executable and runtime PATH in `providers.json`, preserving provider arguments, settings, unknown fields and unrelated
-providers. A changed target-provider configuration refuses the save. Only the installed provider is reloaded; switching
-tabs never retargets the operation, and a changed active file before Start requires reopening the preview.
-Cancelling before persistence keeps the previous provider configuration; partial downloads may remain in the managed
-directory. Close/reopen waits for a cancelled worker to finish before another install can start. A filesystem lock also excludes independent windows/processes using the same managed prefix, and remains held through validation and settings persistence. Contention reports that installation is already running before a second subprocess starts; cancellation/failure releases the lock. Validation uses fake
-package managers and real subprocess/cancellation paths; live downloads and native macOS installation are unverified.
+After installation, Lenz verifies the executable stays inside its managed directory
+and validates package identity/version using the selected toolchain. Only then does it
+atomically save the executable and required runtime environment, preserving arguments,
+settings, unknown fields and unrelated providers. A changed target-provider configuration
+refuses that save. Only the installed provider reloads; switching tabs never retargets
+an install, and a changed active file before Start requires reopening the preview.
+Cancellation before persistence keeps the previous configuration; partial downloads
+may remain. Another install waits for a cancelled worker to finish. A filesystem lock
+also excludes independent windows/processes through validation and settings persistence.
+Native macOS installation and live registry behavior are recorded separately from
+fake-manager subprocess, cancellation and GUI/TUI workflow tests.
 
 ## Project language server settings
 
@@ -365,6 +381,9 @@ an explicit rebuild still parse sources; the main cache benefit is reopening unc
 | Limits | Static index: dynamic definitions, `method_missing` and metaprogramming are not followed; method usages are by name; external edits reach it through the reader's changed-file reports (verified: a moved class is found at its new line). |
 | Measured (release, fixture, 100 samples after 5) | Ready 0.2–0.3 s. Warm definition to target shown: median 2.1 ms, p95 3.2 ms (the harness's polling floor is about 2 ms). Memory: 109–117 MiB (three runs; raw samples in the code-reader build evidence, `real-ruby-3x.txt`). |
 | Platforms | Linux verified through the session and GPUI's test platform (Ctrl-click, Back, Shift+F12, the root modal; no Xvfb); macOS unverified. |
+| Declarations by name | Ruby LSP's index does not read ActiveSupport's `cattr_accessor`, `mattr_accessor`, `class_attribute` or `delegate`, and with a known receiver it answers nothing when resolution fails (on a receiver of unknown type it guesses up to ten methods of the name). Lenz asks `rubyLsp/workspace/dependencies` once a session for the bundle's gem folders and adds macro declarations of the method's name from them, and from the project, when Ruby LSP found nothing (with the project's plain `def`s) or only declarations outside the project. The gems' macros are indexed once per session by the first definition that needs them (reading every Ruby file in their `lib` and `app` folders); the project's files are read each time. Verified on Ruby LSP 0.26.11 with actionmailer 8.1.3.1 and mail 2.9.1 (`real_ruby_definitions_list_gem_declarations_its_index_misses`); with the fake, `ruby_definitions_find_methods_declared_by_macros_in_gems`. |
+| Sync barrier | Ruby LSP applies text on its worker thread but parses a document when a request about it arrives, so Lenz asks `rubyLsp/workspace/addons` behind each burst of text and sends no question about that text until it is answered (see the editor follow-ups); without it, problems after an undo right behind a deletion and completion right after a keystroke came from the previous text. Verified with `real_ruby_problems_follow_an_undo_right_behind_a_deletion` and, with the fake, `questions_about_edited_ruby_wait_behind_a_sync_barrier`. |
+| Enter (on-type formatting) | Lenz asks `textDocument/onTypeFormatting` with `\n` after Enter (its own indentation first): Ruby LSP adds `end` below a block opener while the file does not parse, closes a heredoc and continues a `#` comment; one Undo step, the caret kept on the new line; an `end` below a block that already has one is dropped. Verified on Ruby LSP 0.26.11, Ruby 3.3.6, Linux, 2026-11-17: `real_ruby_enter_closes_an_open_block_once` (`crates/code-core/tests/providers.rs`); both adapters with the fake: `enter_takes_the_language_servers_end_once_alike_in_both_adapters`. |
 | Editing (ticket 49) | Verified on Ruby LSP 0.26.11 and RuboCop 1.92.1 (installed for this ticket with `gem install`), Ruby 3.3.6, Linux, 2026-10-26, with `real_ruby_editing` and `real_ruby_without_a_gemfile` in `crates/code-core/tests/providers.rs` and `real_ruby_lsp_fix_and_format_match_in_both_adapters` in `crates/code-tui/src/parity_tests.rs`. A bundled project with RuboCop in its Gemfile: RuboCop's problems for the shown version, its "Autocorrect Lint/UselessAssignment" fix and its formatting through Format Document, each one Undo step, in both adapters; completion of the project's constant `Shapes::Círculo` on a line after a non-BMP character (UTF-16); parameter information (`new()`: Ruby LSP does not show `initialize`'s parameters). Without a Gemfile it starts in a bundle of its own and completes the project's constants, writing nothing into the folder. Lenz now starts it with `formatter: auto` (and its default linters): RuboCop is used when the project's bundle has it, and loads the project's `.rubocop.yml`. Limits: no method completion on a local variable whose type it does not infer (`c.` after `c = Shapes::Círculo.new(2)`); with UTF-16 its parameter information finds nothing on a line that holds an astral character, while UTF-8 would misplace definitions from its index, so Lenz keeps UTF-16. |
 | Rails (ticket 50) | Verified on Ruby LSP 0.26.11 with ruby-lsp-rails 0.4.8, Rails (railties) 8.1.4, sqlite3 2.10.1, RuboCop 1.92.1 and rubocop-rails 2.38.0 (installed with `gem install`), Ruby 3.3.6, Linux, 2026-10-26, on a Rails application each test creates (a model with `has_many` and `validates`, a controller with `before_action`, route helpers and `Time.now`, a helper, `resources :posts`, its schema loaded into a SQLite development database): `real_rails_editing` and `real_rails_that_cannot_boot` in `crates/code-core/tests/providers.rs`, `real_rails_assistance_matches_in_both_adapters` in `crates/code-tui/src/parity_tests.rs`. Lenz adds the add-on to the bundle it composes for an app that locks `railties`; the add-on boots the application (`bundle exec rails runner` from the Rails root) for its context. From the booted application: Quick Documentation of a model lists its columns (`title: string - not null`); `Post.where(ti` suggests `title` ("Filter Post records by title") and inserts `title: `, also on a line typed into the unsaved draft (`Comment.where(te` → `text`), one Undo step; Go to Definition of a route helper (`posts_path`, `post_path(post)` in a helper) opens `config/routes.rb` at its route, of `has_many :comments` the `Comment` model. From the add-on's static analysis: a `before_action :set_post` symbol opens the method; association methods (`comments`, `comments=`) are suggested in the model; `has_many`/`validates` calls are file symbols. Ruby LSP: parameter information from the bundle's Active Record (`find(*ids)`). rubocop-rails' problems (`Rails/TimeZone`) and its "Autocorrect Rails/TimeZone" fix, and RuboCop formatting with the project's `.rubocop.yml`, each one Undo step, in both adapters. An application that cannot boot: the add-on's error is shown in Language Server Status ("Ruby LSP Rails failed to initialize server: …" with the application's own message) and its runtime context is missing, while RuboCop's problems, formatting and constant completion keep working. Limits: suggestions show the add-on's `labelDetails` (file, filter text) as their detail; file symbols show the source text of names (`comments`, not `has_many :comments`); parameter information needs the caret outside a call nested in the parentheses (`find(params[:id])` on `params` answers nothing); answers that need the gem index (parameter information) may be empty for the first seconds of indexing, right after an edit Ruby LSP with the add-on sometimes answers a `where` completion with nothing (reproduced with Ruby LSP alone, outside Lenz; asking again with Ctrl+Space answers); code lenses (route lenses on actions, running tests), the pending-migrations prompt and its **Run Migrations** action are not offered (Lenz does not request code lenses or declare message-action properties); route changes need **Restart Language Server** (the add-on's own limit); the booted application runs project code and writes what it writes when it boots (verified: only SQLite's `-shm`/`-wal` files beside the open development database); ERB views' Rails context (ticket 58; the template route itself: [Templates](#templates-erb-and-haml-ruby-lsp-vs-code-html)), native macOS, Wayland and physical terminals unverified. |
 

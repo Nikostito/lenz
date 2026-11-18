@@ -34,11 +34,20 @@ pub struct Blame {
     pub(crate) extent: Option<(i64, i64)>,
     pub(crate) done: bool,
     pub(crate) error: Option<String>,
+    /// The annotation column shows (Annotate with Git Blame); `false` while only inline blame wants the lines.
+    pub(crate) column: bool,
 }
 
 impl Blame {
     pub(crate) fn new() -> Self {
-        Blame { stamp: None, key: None, metadata: Weak::new(), error: None, request: 0, project: 0, latest: Arc::new(AtomicU64::new(0)), root: None, lines: Vec::new(), extent: None, done: false }
+        Blame { stamp: None, key: None, metadata: Weak::new(), error: None, request: 0, project: 0, latest: Arc::new(AtomicU64::new(0)), root: None, lines: Vec::new(), extent: None, done: false, column: true }
+    }
+
+    /// Attribution for inline blame alone: the same lines, no annotation column.
+    pub(crate) fn inline() -> Self {
+        let mut blame = Self::new();
+        blame.column = false;
+        blame
     }
 
     /// Identity includes draft bytes, path metadata and the saved-file identity used by Git.
@@ -134,6 +143,13 @@ pub(crate) fn annotation(blame: &Blame, line: usize, width: usize) -> Option<Ann
     let author = crate::chrome::ellipsize(&commit.author, width.saturating_sub(11));
     let shade = blame.extent.map(|(old, new)| git_blame::age_shade(commit.author_time, new, old));
     Some(Annotation { label: format!("{} {author}", git_blame::date(commit.author_time)), shade, commit })
+}
+
+/// Inline blame's text for one line: `Author, 2026-01-10 • summary`, or that the line is not committed.
+pub(crate) fn inline_text(blame: &Blame, line: usize) -> Option<String> {
+    let commit = blame.lines.get(line)?.as_ref()?;
+    if !commit.is_committed() { return Some("Not committed yet".into()); }
+    Some(format!("{}, {} • {}", commit.author, git_blame::date(commit.author_time), commit.summary))
 }
 
 /// Batches go out at this many lines, and this often while git is quiet, so a big file fills in as git goes without

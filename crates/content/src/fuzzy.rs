@@ -58,6 +58,14 @@ pub fn word_starts(query: &str, text: &str) -> bool {
     go(&q, &t, 0, false, &start)
 }
 
+/// Whether `query`'s characters (spaces ignored) appear in order in `path`'s file name, case-insensitively: letters
+/// may be left out, so `i_summary` finds `billing/invoice_summary.csv`.
+pub fn name_subsequence(query: &str, path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let mut name = name.chars().flat_map(char::to_lowercase);
+    query.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).all(|q| name.any(|c| c == q))
+}
+
 /// Indices of `paths` matching `query`, best first (ties keep the given order).
 pub fn rank(query: &str, paths: &[&str]) -> Vec<usize> {
     let mut hits: Vec<(i64, usize)> = paths.iter().enumerate().filter_map(|(i, p)| score(query, p).map(|s| (s, i))).collect();
@@ -85,6 +93,16 @@ mod tests {
         }
         for (q, t) in [("nsr", "inspector"), ("sftwrp", "Soft Wrap"), ("ae", "Save")] {
             assert!(!word_starts(q, t), "{q} {t}");
+        }
+    }
+
+    #[test]
+    fn name_subsequence_skips_letters_but_keeps_their_order_within_the_file_name() {
+        for (q, p) in [("i_summary", "billing/invoice_summary.csv"), ("inv sum", "invoice_summary.csv"), ("ISC", "a/Invoice_Summary.csv"), ("", "x")] {
+            assert!(name_subsequence(q, p), "{q} {p}");
+        }
+        for (q, p) in [("summary_i", "invoice_summary.csv"), ("blg", "billing/invoice.csv"), ("iz", "invoice.csv")] {
+            assert!(!name_subsequence(q, p), "{q} {p}");
         }
     }
 

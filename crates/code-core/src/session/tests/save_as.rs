@@ -154,6 +154,7 @@ fn save_as_replaces_an_existing_file_only_after_an_explicit_current_decision() {
     let stale = s.save_as_prompt().unwrap();
     type_text(&mut s, tab, "more\n");
     assert!(s.save_as_prompt().is_none());
+    assert!(!s.save_as_destination_reserved(&existing), "an invalidated Replace decision no longer owns its destination");
     s.dispatch(Command::ChooseReplace { ticket: stale.ticket, choice: ReplaceChoice::Replace });
     assert_eq!(std::fs::read(&existing).unwrap(), b"keep me\n");
     // A different file appearing at the path after the decision is refused.
@@ -229,6 +230,7 @@ fn save_as_failures_keep_the_original_document_and_never_clobber_a_new_entry() {
         assert!(s.state().tab_dirty(tab) && s.state().view(tab).unwrap().can_undo());
         assert_eq!(std::fs::read(&original).unwrap(), b"original\n");
         assert!(s.disabled(CommandId::Save).is_none(), "the original file's Save state is unaffected");
+        assert!(!s.save_as_destination_reserved(&target), "a completed failed write releases its destination");
     }
     // A file created between validation and the write is never replaced.
     let raced = d.path().join("raced.txt");
@@ -245,6 +247,72 @@ fn save_as_failures_keep_the_original_document_and_never_clobber_a_new_entry() {
     assert_eq!(std::fs::read(&raced).unwrap(), b"theirs\n");
     assert_eq!(s.state().active().unwrap().source(), original);
     assert!(s.state().tab_dirty(tab));
+}
+
+#[test]
+fn save_as_reserves_its_destination_and_alias_until_the_write_is_accounted() {
+    use crate::save::ReplaceChoice;
+    for exists in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("destination.txt");
+        let alias = d.path().join("alias.txt");
+        if exists {
+            std::fs::write(&target, b"old destination\n").unwrap();
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+        }
+        let mut s = session(d.path());
+        let tab = new_document(&mut s);
+        type_text(&mut s, tab, "source draft\n");
+        let buffer = s.state().current_source().unwrap().key().buffer;
+        let (started, entered) = std::sync::mpsc::channel();
+        let gates: Vec<_> = (0..crate::jobs::MAX_JOBS).map(|_| {
+            let (release, wait) = std::sync::mpsc::channel();
+            let started = started.clone();
+            s.jobs.submit(Priority::Visible, move || {
+                started.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            });
+            release
+        }).collect();
+        for _ in &gates { entered.recv_timeout(Duration::from_secs(5)).unwrap(); }
+        s.dispatch(Command::SaveAs { tab, path: target.clone() });
+        if exists {
+            let prompt = s.save_as_prompt().unwrap();
+            s.dispatch(Command::OpenRetained(alias.clone()));
+            assert_eq!(s.state().active().unwrap().id(), tab);
+            assert_eq!(s.state().tabs().len(), 1);
+            assert_eq!(s.save_as_prompt().unwrap().ticket, prompt.ticket);
+            s.dispatch(Command::ChooseReplace { ticket: prompt.ticket, choice: ReplaceChoice::Replace });
+        }
+        assert!(s.state().view(tab).unwrap().save_status().busy());
+        for spelling in std::iter::once(&target).chain(exists.then_some(&alias)) {
+            s.dispatch(Command::OpenRetained(spelling.clone()));
+            assert_eq!(s.state().active().unwrap().id(), tab);
+            assert_eq!(s.state().tabs().len(), 1, "the pending write must not admit another independent destination buffer");
+            assert!(messages(&s).contains("reserved by Save As"));
+        }
+        let other = new_document(&mut s);
+        type_text(&mut s, other, "another draft\n");
+        s.dispatch(Command::SaveAs { tab: other, path: if exists { alias.clone() } else { target.clone() } });
+        assert!(s.save_as_prompt().is_none());
+        assert!(messages(&s).contains("already reserved by Save As"));
+        assert!(s.state().tab_dirty(other));
+        s.dispatch(Command::ActivateTab(tab));
+        for gate in gates { gate.send(()).unwrap(); }
+        settle(&mut s, |s| !s.state().view(tab).unwrap().save_status().busy());
+        assert_eq!(std::fs::read(&target).unwrap(), b"source draft\n");
+        assert_eq!(s.state().active().unwrap().source(), target);
+        assert!(!s.state().tab_dirty(tab));
+        let spelling = if exists { alias } else { target };
+        s.dispatch(Command::OpenRetained(spelling.clone()));
+        settle(&mut s, opened);
+        assert_eq!(s.state().active().unwrap().id(), tab, "the canonical destination reuses its saved tab");
+        assert_eq!(s.state().tabs().len(), 2, "only the saved tab and unrelated untitled draft remain");
+        assert_eq!(s.state().tabs().iter().filter(|tab| tab.buffer == Some(buffer)).count(), 1);
+        assert_eq!(s.state().current_source().unwrap().key().buffer, buffer, "opening the destination after completion shares the confirmed document");
+        assert_eq!(source_text(s.state().current_source().unwrap()), "source draft\n");
+        assert!(s.state().tab_dirty(other), "unrelated drafts survive destination reservation and completion");
+    }
 }
 
 #[test]
@@ -510,4 +578,148 @@ fn scratch_directory_may_live_below_a_symlinked_state_parent() {
     settle(&mut s, |s| s.state().current_source().is_some());
     assert!(s.scratch_files().unwrap().iter().any(|p| p.ends_with("personal.txt")));
     assert!(!std::fs::symlink_metadata(s.scratch_directory()).unwrap().file_type().is_symlink());
+}
+
+#[test]
+fn a_scratch_of_a_kind_is_the_next_numbered_scratch_file_in_its_language() {
+    use crate::scratch::KINDS;
+    let d = tempfile::tempdir().unwrap();
+    let mut s = session(&d.path().join("personal-state"));
+    let kind = |label: &str| KINDS.iter().position(|k| k.label == label).unwrap();
+    let name = |s: &Session| s.state().active().unwrap().source().file_name().unwrap().to_string_lossy().into_owned();
+    s.dispatch(Command::NewScratchFile(kind("Ruby")));
+    settle(&mut s, |s| s.state().current_source().is_some());
+    assert_eq!(name(&s), "scratch_1.rb");
+    assert_eq!(s.state().current_source().unwrap().language(), Some(lenz_content::highlight::Language::Ruby));
+    let first = s.state().active().unwrap().source().to_owned();
+    std::fs::write(&first, "puts 1\n").unwrap();
+    s.dispatch(Command::NewScratchFile(kind("PostgreSQL")));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with("scratch_2.sql")));
+    assert_eq!(s.state().sql_dialect().and_then(|d| d.dialect), Some(crate::sql_dialect::Dialect::PostgreSql), "its dialect");
+    s.dispatch(Command::NewScratchFile(kind("Plain text")));
+    settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with("scratch_3.txt")));
+    assert_eq!(std::fs::read(&first).unwrap(), b"puts 1\n", "an earlier scratch is kept as it is");
+    assert_eq!(s.scratch_files().unwrap().len(), 3);
+    assert!(s.state().tabs().iter().all(|t| t.retained()), "kept open, as a file the user made");
+}
+
+#[test]
+fn editable_scratch_and_external_sources_do_not_claim_to_be_read_only() {
+    let d = tempfile::tempdir().unwrap();
+    let project = d.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let external = write(d.path(), "outside.txt", b"outside\n");
+    let dependency_dir = d.path().join(".cargo/registry/src/fixture");
+    std::fs::create_dir_all(&dependency_dir).unwrap();
+    let dependency = write(&dependency_dir, "lib.rs", b"fn dependency() {}\n");
+    let mut s = session(&d.path().join("personal-state"));
+    s.dispatch(Command::OpenRoot(project));
+    s.enable_text_input_for_test();
+    let plain = crate::scratch::KINDS.iter().position(|k| k.label == "Plain text").unwrap();
+    s.dispatch(Command::NewScratchFile(plain));
+    settle(&mut s, |s| s.state().current_source().is_some());
+    let scratch = s.state().active().unwrap().source().to_owned();
+    for path in [scratch, external, dependency] {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        open(&mut s, Command::OpenRetained(path.clone()), &name);
+        let tab = s.state().active().unwrap().id();
+        assert_eq!(active_view(&s).edit_disabled(), None);
+        assert!(s.state().notices().iter().any(|n| n.starts_with("Source from ")), "{}", s.state().notices().join("; "));
+        assert!(!s.state().notices().iter().any(|n| n.starts_with("Read-only source from ")));
+        type_text(&mut s, tab, "editable λ\r\n");
+        let expected = source_text(s.state().current_source().unwrap());
+        s.dispatch(Command::Save { tab });
+        settle(&mut s, |s| !s.state().tab_dirty(tab));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+        s.dispatch(Command::SetReadOnly(true));
+        assert_eq!(active_view(&s).edit_disabled(), Some("Read-only mode is on"));
+        assert!(s.state().notices().iter().any(|n| n == "Read-only mode is on"));
+        type_text(&mut s, tab, "blocked");
+        assert_eq!(source_text(s.state().current_source().unwrap()), expected, "read-only still refuses edits");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        s.dispatch(Command::SetReadOnly(false));
+    }
+}
+
+/// Leaving an edited file (with a syntax error, or not) and coming back: it is highlighted again, and so is another file
+/// of its language opened meanwhile. Each file is parsed on its own.
+#[test]
+fn an_edited_file_left_and_shown_again_is_highlighted_as_is_another_file_of_its_language() {
+    for (a, b, edit) in [("a.rb", "b.rb", "def broken(\n  if x\n"), ("a.rb", "b.rb", "def fine\nend\n"), ("a.rs", "b.rs", "fn broken( {\n"), ("a.json", "b.json", "{ \"x\": [\n")] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let good = match a { "a.rb" => "class Thing\n  def call\n    1\n  end\nend\n", "a.rs" => "fn main() { let x = 1; }\n", _ => "{ \"x\": 1 }\n" };
+        std::fs::write(root.join(a), good).unwrap();
+        std::fs::write(root.join(b), good).unwrap();
+        let mut s = session(&d.path().join("state"));
+        s.dispatch(Command::OpenRoot(root.clone()));
+        s.dispatch(Command::OpenRetained(root.join(a)));
+        let highlighted = |s: &Session| s.state().active().and_then(|t| s.state().view(t.id())).is_some_and(|v| v.highlights().is_some_and(|h| h.spans(0..1).iter().any(|l| !l.is_empty())));
+        settle(&mut s, highlighted);
+        s.enable_text_input_for_test();
+        let tab = s.state().active().unwrap().id();
+        type_text(&mut s, tab, edit);
+        settle(&mut s, |s| s.state().view(tab).is_some_and(|v| v.highlights().is_some()));
+        s.dispatch(Command::Open(root.join(b)));
+        settle(&mut s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with(b)));
+        settle(&mut s, highlighted);
+        s.dispatch(Command::ActivateTab(tab));
+        settle(&mut s, highlighted);
+        assert!(s.state().tab_dirty(tab), "{a}: the edit is still unsaved");
+        assert_eq!(std::fs::read_to_string(root.join(a)).unwrap(), good, "{a}: nothing was saved");
+    }
+}
+
+#[test]
+fn save_when_leaving_a_file_writes_its_edits_when_another_becomes_active() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] { std::fs::write(root.join(name), "start\n").unwrap(); }
+    let mut s = session(&d.path().join("state"));
+    s.dispatch(Command::OpenRoot(root.clone()));
+    s.enable_text_input_for_test();
+    let open = |s: &mut Session, name: &str| {
+        s.dispatch(Command::OpenRetained(root.join(name)));
+        settle(s, |s| s.state().current_source().is_some_and(|d| d.source().ends_with(name)));
+        s.state().active().unwrap().id()
+    };
+    let disk = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+    // Off (the default): leaving an edited file keeps its edits unsaved.
+    assert_eq!(s.on(CommandId::SaveOnLeave), Some(false));
+    let a = open(&mut s, "a.txt");
+    type_text(&mut s, a, "one\n");
+    let b = open(&mut s, "b.txt");
+    assert!(s.state().tab_dirty(a) && disk("a.txt") == "start\n");
+    // On: switching tabs saves the one left, its exact text.
+    s.dispatch(Command::SetSaveOnLeave(true));
+    type_text(&mut s, b, "two\n");
+    s.dispatch(Command::ActivateTab(a));
+    settle(&mut s, |s| !s.state().tab_dirty(b));
+    assert_eq!(disk("b.txt"), "start\ntwo\n");
+    assert!(s.state().tab_dirty(a), "the file shown keeps its edits");
+    // Opening another file saves too; a saved file is not written again.
+    open(&mut s, "c.txt");
+    settle(&mut s, |s| !s.state().tab_dirty(a));
+    assert_eq!(disk("a.txt"), "start\none\n");
+    // An untitled document has no file to save: left as it is, without a Save As prompt.
+    s.dispatch(Command::NewDocument);
+    let untitled = s.state().active().unwrap().id();
+    type_text(&mut s, untitled, "draft\n");
+    s.dispatch(Command::ActivateTab(a));
+    assert!(s.state().tab_dirty(untitled) && s.save_as_prompt().is_none());
+    // Closing an edited file asks, as without the setting: Discard leaves the file as it was on disk.
+    let c = s.state().tabs().iter().find(|t| t.source().ends_with("c.txt")).unwrap().id();
+    s.dispatch(Command::ActivateTab(c));
+    settle(&mut s, |s| s.state().view(c).is_some());
+    type_text(&mut s, c, "dropped\n");
+    s.dispatch(Command::CloseTab(c));
+    let prompt = s.close_prompt().expect("the close prompt asks");
+    assert_eq!(disk("c.txt"), "start\n", "not saved by closing");
+    s.dispatch(Command::ChooseClose { ticket: prompt.ticket, buffer: prompt.buffer, choice: crate::close::Choice::Discard });
+    settle(&mut s, |s| s.state().tabs().iter().all(|t| t.id() != c));
+    assert_eq!(disk("c.txt"), "start\n", "discarded, not saved");
+    assert!(saved(&d.path().join("state"), |s| s.state().save_on_leave()), "remembered");
 }
