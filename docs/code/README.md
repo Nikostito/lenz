@@ -235,7 +235,8 @@ bracket last; Python's `:`; Ruby's `def`, `class`, `module`, `if`, `else`, `when
 and shell's `then` and `do`), one step out after Python's `return`, `pass`, `break`, `continue` and `raise`, and between
 a bracket and its closer (`{|}`) the closer moves to its own line at the opener's indentation with the caret on an
 indented line between. On an empty line the nearest line with text above stands in, so a blank line inside a body
-continues the body. The step is the file's (EditorConfig, the project's choice, the language default), written as
+continues the body. The step is the file's (EditorConfig, the project's choice, the language default: two spaces for
+Ruby, YAML, Haml and SQL, a tab for Go and Makefiles, four spaces otherwise), written as
 spaces after spaces and a tab after tabs. Other files keep the line's leading tabs and spaces. Comments and quoted
 brackets open nothing; `end` and closing brackets are not outdented as they are typed. YAML, XML, Markdown and Haml
 retain their structural indentation rules; pasted text keeps its own whitespace.
