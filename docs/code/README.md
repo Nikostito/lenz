@@ -529,7 +529,8 @@ Escape cancels without writing.
 projects. New Scratch File lists the kinds of file, as IntelliJ does: Plain text, JSON, Ruby and PostgreSQL first, then
 every language Lenz reads by name (Bash to Zig, ERB and HAML templates, CSV, Dockerfile, environment files); typing
 filters by name or extension and Enter creates the next free `scratch_N.<extension>` (`scratch_1.rb`, `scratch_2.sql`…),
-opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. On macOS Cmd+Shift+N opens it, as in
+opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. Each kind shows its file-type icon, as the
+explorer and the tabs do, while **File Icons** is on (a Nerd Font glyph in the terminal editor). On macOS Cmd+Shift+N opens it, as in
 IntelliJ's macOS keymap. They use ordinary Save and draft recovery, remain available
 across projects and restarts, and live in `$XDG_STATE_HOME/lenz-code/scratch-files` (default
 `~/.local/state/lenz-code/scratch-files`). Closing a tab keeps its file; there are no scratch run/debug controls.

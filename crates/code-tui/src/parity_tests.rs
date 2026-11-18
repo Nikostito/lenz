@@ -555,6 +555,61 @@ fn project_name_navigation_reads_shifted_drafts_and_refuses_stale_disk_symbols_i
     replay_draft_project_query(cx, DraftQuery::Names);
 }
 
+/// New Scratch File's kinds show their file-type icons in both adapters while File Icons is on: the GUI paints one per
+/// row, the terminal puts the Nerd Font glyph before each label; typing filters the icons with their rows, and Enter
+/// still creates the next `scratch_N.EXT`.
+#[gpui::test]
+fn new_scratch_file_kinds_show_their_icons_in_both_adapters(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let gui = cx.new(|cx| ReaderView::new(Session::new(config(&dir.path().join("gui"))), None, cx));
+    let window = cx.update(|cx| cx.open_window(Default::default(), |_, _| gui.clone())).unwrap();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(700.0)));
+    let focus = gui.read_with(&visual, |view, _| view.focus_handle());
+    visual.update(|window, cx| focus.focus(window, cx));
+    let mut tui = App::new(config(&dir.path().join("tui")), None);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 44)).unwrap();
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetFileIcons(true), cx));
+    tui.dispatch(Command::SetFileIcons(true));
+    tui.icons_override = Some(true);
+    let draw = |visual: &mut VisualTestContext, tui: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+        visual.update(|window, cx| { let _ = window.draw(cx); });
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    };
+    visual.update(|window, cx| gui.update(cx, |view, cx| view.run(CommandId::NewScratch, window, cx)));
+    tui.run(CommandId::NewScratch);
+    draw(&mut visual, &mut tui, &mut terminal);
+    let glyph = |ext: &str| lenz_content::file_icons::file(&format!("scratch.{ext}")).glyph;
+    let expected: Vec<char> = code_core::scratch::matching("").into_iter().map(|i| glyph(code_core::scratch::KINDS[i].extension)).collect();
+    assert_eq!(gui.read_with(&visual, |view, _| view.painted_modal_icons.clone()), expected, "one icon per GUI row");
+    let labels: Vec<String> = tui.choices().into_iter().map(|c| c.label).collect();
+    for (label, icon) in labels.iter().zip(&expected) { assert!(label.starts_with(*icon), "{label}"); }
+    let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+    assert!(screen.contains(glyph("rb")) && screen.contains(glyph("json")), "{screen}");
+    // Typing filters the icons with their rows.
+    visual.simulate_keystrokes("r u b y");
+    tui.handle(Event::Paste("ruby".into()));
+    draw(&mut visual, &mut tui, &mut terminal);
+    assert_eq!(gui.read_with(&visual, |view, _| view.painted_modal_icons.clone()), [glyph("rb")]);
+    assert!(tui.choices().first().is_some_and(|c| c.label.starts_with(glyph("rb")) && c.label.ends_with("Ruby")));
+    visual.simulate_keystrokes("enter");
+    tui.handle(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let made = |state: &State| state.current_source().is_some_and(|d| d.source().file_name().is_some_and(|n| n == "scratch_1.rb"));
+    while !(gui.read_with(&visual, |view, _| made(view.session().state())) && made(tui.session.state())) {
+        gui.update(&mut visual, |view, cx| view.poll(cx));
+        while let Ok(c) = tui.session.completions().try_recv() { tui.apply(c); }
+        draw(&mut visual, &mut tui, &mut terminal);
+        assert!(Instant::now() < deadline, "scratch_1.rb did not open in both");
+        std::thread::yield_now();
+    }
+    // With File Icons off, neither shows them.
+    gui.update(&mut visual, |view, cx| view.dispatch_for_test(Command::SetFileIcons(false), cx));
+    visual.update(|window, cx| gui.update(cx, |view, cx| view.run(CommandId::NewScratch, window, cx)));
+    draw(&mut visual, &mut tui, &mut terminal);
+    assert!(gui.read_with(&visual, |view, _| view.painted_modal_icons.is_empty()));
+}
+
 /// Delete Line (Cmd+Backspace where Cmd is reported, and the IntelliJ preset's Ctrl+Y), Enter's block indentation
 /// and Copy Reference replayed through both adapters' real keys and menus: the same text, carets and clipboard.
 #[gpui::test]

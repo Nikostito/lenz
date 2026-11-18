@@ -3890,7 +3890,8 @@ fn questions_about_edited_ruby_wait_behind_a_sync_barrier() {
 
 /// Go to Definition in Ruby where Ruby LSP's index has nothing (the fake, like Ruby LSP, does not read ActiveSupport's
 /// `cattr_accessor`): the bundle's gems (listed by `rubyLsp/workspace/dependencies`) and the project are searched by
-/// name, so the method a gem declares with the macro opens, read-only; with several, they are listed as candidates.
+/// name, so the method a gem declares with the macro opens as a source outside the project; with several, they are
+/// listed as candidates.
 #[test]
 fn ruby_definitions_find_methods_declared_by_macros_in_gems() {
     let gems = tempfile::tempdir().unwrap();
@@ -3923,7 +3924,7 @@ fn ruby_definitions_find_methods_declared_by_macros_in_gems() {
     ], "both gems' declarations, not a gem's tests");
     f.s.dispatch(Command::OpenResult(0));
     f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
-    assert!(f.s.state().notices().iter().any(|n| n.contains("Read-only")), "{:?}", f.s.state().notices());
+    assert!(f.s.state().notices().iter().any(|n| n.contains("outside the project") || n.contains("Read-only")), "{:?}", f.s.state().notices());
     assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), source);
 }
 

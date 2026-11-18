@@ -293,6 +293,9 @@ pub struct ReaderView {
     painted_markers: Vec<(char, u32)>,
     #[cfg(feature = "test-support")]
     painted_inline: Vec<(u8, inline_diagnostics::Annotation)>,
+    /// The file-type icons of the open list dialog's rows as last painted (New Scratch File's kinds).
+    #[cfg(feature = "test-support")]
+    pub painted_modal_icons: Vec<char>,
     /// Each pane's scrollbar as last painted: its thumb (start, size) and the kinds of its marks, top to bottom.
     #[cfg(feature = "test-support")]
     pub painted_scrollbars: Vec<PaintedScrollbar>,
@@ -802,7 +805,7 @@ impl ReaderView {
 
     pub fn new(session: Session, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let (font, notice) = lenz_gpui::pick_mono(cx, fonts().font_family.as_deref());
-        let mut view = Self { field_native: Default::default(), field_native_target: None, field_native_stale: false, field_native_suppress: None, field_native_notify: 0, popup_fields: Default::default(), find_fields: Default::default(), open_path_request: 0, session, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), mac_keys: cfg!(target_os = "macos"), follow_seen: 0, navigation_drawn: None, branch_hits_valid: false, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
+        let mut view = Self { field_native: Default::default(), field_native_target: None, field_native_stale: false, field_native_suppress: None, field_native_notify: 0, popup_fields: Default::default(), find_fields: Default::default(), open_path_request: 0, session, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), mac_keys: cfg!(target_os = "macos"), follow_seen: 0, navigation_drawn: None, branch_hits_valid: false, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_modal_icons: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
         view.layout = view.session.state().layout();
         cx.on_app_quit(|view, cx| {
             view.remember_explorer();
@@ -6023,7 +6026,15 @@ impl Render for ReaderView {
             self.logos.clear();
             self.logo_px = logo_px;
         }
-        let shown = tree.iter().map(|l| l.icon).chain(bars.iter().flatten().map(|t| icons::file(&t.0))).chain(list.iter().filter_map(|r| r.node.map(|n| n.0)));
+        // New Scratch File's rows show their kinds' file-type icons, as the tree and the tabs do.
+        let scratch_icons: Option<Vec<icons::Icon>> = match &self.modal {
+            Some(Modal::NewScratch { query, .. }) if self.session.state().file_icons() => Some(code_core::scratch::matching(query).into_iter()
+                .map(|i| icons::file(&format!("scratch.{}", code_core::scratch::KINDS[i].extension))).collect()),
+            _ => None,
+        };
+        #[cfg(feature = "test-support")]
+        { self.painted_modal_icons = scratch_icons.iter().flatten().map(|i| i.glyph).collect(); }
+        let shown = tree.iter().map(|l| l.icon).chain(bars.iter().flatten().map(|t| icons::file(&t.0))).chain(list.iter().filter_map(|r| r.node.map(|n| n.0))).chain(scratch_icons.iter().flatten().copied());
         for logo in shown.filter_map(|i| i.logo) {
             if !self.logos.contains_key(logo.name)
                 && let Some(pixels) = logo.rasterize(logo_px)
@@ -6833,6 +6844,13 @@ impl Render for ReaderView {
                                     }
                                     let section = branch_chooser && *row == usize::MAX || details_modal && line.split_once(':').is_some_and(|(label, _)| label.len() <= 40 && !label.contains('/') && !label.contains('`'));
                                     let heading = Font { weight: gpui::FontWeight::BOLD, ..m.font.clone() };
+                                    // A row with a file-type icon (New Scratch File's kinds): the icon, then its text.
+                                    let icon = scratch_icons.as_ref().zip(row.checked_sub(FINDER_HEADER_ROWS)).and_then(|(icons, i)| icons.get(i).copied());
+                                    let first_line = n == 0 || l.lines[n - 1].0 != *row;
+                                    if let Some(icon) = icon.filter(|_| first_line) {
+                                        paint_icon(window, cx, icon_font.as_ref(), &logos, Bounds { origin: gpui::point(px(mx), px(my)), size: gpui::size(px(mw), px(mh)) }, &palette, icon, mx + 12.0, y);
+                                    }
+                                    let mx = if icon.is_some() { mx + icons::SIZE + ICON_GAP } else { mx };
                                     lenz_gpui::text(window, cx, if section { Metrics { font: &heading, ..m } } else { m }, mx + 12.0, y, line, if *row == usize::MAX { palette.readable_on(palette.dim, bg) } else if *disabled { palette.dim } else if theme_chooser && *row < THEME_HEADER_ROWS { palette.accent } else { palette.fg });
                                 }
                                 if !l.footer.is_empty() {

@@ -1348,7 +1348,9 @@ impl App {
                 .into_iter()
                 .map(|i| {
                     let kind = &code_core::scratch::KINDS[i];
-                    Choice { label: kind.label.to_string(), detail: Some(format!(".{}", kind.extension)), section: None, disabled: None, target: ChoiceTarget::ScratchKind(i) }
+                    // Its kind's file-type icon, as the explorer shows it (when Nerd Font icons are on).
+                    let label = lenz_content::file_icons::file(&format!("scratch.{}", kind.extension)).label(self.nerd_icons(), kind.label).into_owned();
+                    Choice { label, detail: Some(format!(".{}", kind.extension)), section: None, disabled: None, target: ChoiceTarget::ScratchKind(i) }
                 })
                 .collect(),
             Prompt::Places(list) => self

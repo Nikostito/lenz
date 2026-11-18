@@ -129,8 +129,8 @@ nothing. An already requested Save can still finish after Cancel. External
 comparison actions explicitly use saved disk inputs. See the
 [handoff behavior and verification](../research/code-external-open-decisions.md).
 
-**New Scratch File…** (F10 → File) creates a named personal file; include an extension such as `.rs` or `.md`
-to choose its language. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
+**New Scratch File…** (F10 → File) lists the kinds of personal file, each with its Nerd Font file-type icon while
+File Icons is on; typing filters and Enter creates the next `scratch_N.<extension>`. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
 They live in `$XDG_STATE_HOME/lenz-code/scratch-files` (by default `~/.local/state/lenz-code/scratch-files`),
 independently of the project, and remain available after switching projects or restarting. Save writes edits and
 ordinary draft recovery protects unsaved changes; closing a tab does not delete the file. Scratches have no run
