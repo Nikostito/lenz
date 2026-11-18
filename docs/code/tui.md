@@ -129,8 +129,8 @@ nothing. An already requested Save can still finish after Cancel. External
 comparison actions explicitly use saved disk inputs. See the
 [handoff behavior and verification](../research/code-external-open-decisions.md).
 
-**New Scratch File…** (F10 → File) creates a named personal file; include an extension such as `.rs` or `.md`
-to choose its language. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
+**New Scratch File…** (F10 → File) lists the kinds of personal file, each with its Nerd Font file-type icon while
+File Icons is on; typing filters and Enter creates the next `scratch_N.<extension>`. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
 They live in `$XDG_STATE_HOME/lenz-code/scratch-files` (by default `~/.local/state/lenz-code/scratch-files`),
 independently of the project, and remain available after switching projects or restarting. Save writes edits and
 ordinary draft recovery protects unsaved changes; closing a tab does not delete the file. Scratches have no run
@@ -261,6 +261,15 @@ each (**Edit → Lines and Indentation** menu, F10 and the palette in both adapt
   (a duplicate leaves the original selected). Each line keeps the newline written at its position—CRLF, LF, mixed
   endings and a missing final newline are preserved byte for byte—so the last line of a file has no line below it
   and the commands say "Already on the last line" / "Already on the first line" there.
+- **Ctrl+Y** (IntelliJ preset), or **Cmd+Backspace** where the terminal reports Cmd (the kitty keyboard protocol in
+  kitty, WezTerm, Ghostty), deletes the lines the selections touch in one Undo step, as **Delete Line** in the GUI;
+  each caret keeps its column on the line below. Most macOS terminals send Cmd+Backspace as Ctrl+U (iTerm2's Natural
+  Text Editing preset, Ghostty), so on macOS Ctrl+U in the text deletes the line too; elsewhere Ctrl+U is not bound
+  in the text.
+- **Enter** in code indents the new line as its block calls for, as in the GUI (see
+  [Lenz Code](README.md)): one step deeper after `def`, `do |x|`, `{` or Python's `:`, the closer
+  of `{|}` on its own line, and a blank line inside a body continues it. With Ruby LSP running, its `end` follows as
+  its own Undo step, never below a block that already has one.
 - Typing an opening delimiter wraps a selection (`(` around `x` gives `(x)` with `x` still selected) or opens a pair
   with the caret between (`{}`, `[]`, `""`, `''` or a backtick pair); the closing delimiter already in front of the caret is
   stepped over rather than doubled, a quote after a word stays an apostrophe, and no pair is opened in front of a
@@ -451,6 +460,9 @@ the Last saved pane remains read-only.
 | Comment / uncomment | Ctrl-/ or Alt-/ (F10 → Edit when the terminal swallows it) |
 | Move lines down / up | Ctrl-Shift-Down / Ctrl-Shift-Up (VS Code keymap: Alt-Down / Alt-Up) |
 | Duplicate lines below / above | Alt-Shift-Down / Alt-Shift-Up |
+| Delete line | Ctrl-Y; Cmd-Backspace (sent as Ctrl-U by macOS terminals, which macOS builds take) |
+| Go to test or subject | Ctrl-Shift-T where the terminal reports it (kitty protocol); the F10 menu |
+| Copy reference (`Foo::Bar::Baz#foo_method`) | Ctrl-Alt-Shift-C where the terminal reports it (kitty protocol); the F10 menu or the right-click menu |
 | Next / previous tab | Ctrl-Tab / Ctrl-Shift-Tab |
 | Split right / down; focus pane | Ctrl-\ / Ctrl-Shift-\; Ctrl-1 / Ctrl-2 |
 | Back / forward | Alt-Left / Alt-Right |

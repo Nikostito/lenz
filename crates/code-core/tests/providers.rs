@@ -3980,3 +3980,121 @@ fn builtin_shell_syntax_errors_remain_visible_when_shellcheck_is_missing_and_con
         assert_eq!(std::fs::read(f.root.join("broken.sh")).unwrap(), text.as_bytes());
     }
 }
+
+/// Enter in Ruby with the installed Ruby LSP (`textDocument/onTypeFormatting`): after `def` the body is indented at
+/// once and the server's `end` follows as its own Undo step with the caret left on the body line; a block that already
+/// has its `end` gets no second one even while the file does not parse (when Ruby LSP offers it); Enter after a `#`
+/// comment continues it, as Ruby LSP does in VS Code.
+#[test]
+#[ignore = "needs an installed Ruby LSP; run alone"]
+fn real_ruby_enter_closes_an_open_block_once() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let source = "# note\nclass Shapes\n  def area\nend\n\ndef done\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\n"), (".editorconfig", "root = true\n[*]\nindent_style = space\nindent_size = 2\n"), ("lib/shapes.rb", source)]);
+    f.open_ready("lib/shapes.rb");
+    let tab = f.tab();
+    f.caret("def area", "def area".len());
+    let at = source.find("def area").unwrap() + "def area".len();
+    f.type_at_caret("\n");
+    f.settle("end", Duration::from_secs(10), |s| current_text(s.state()).contains("    \n  end\nend"));
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \n  end\nend\n\ndef done\nend\n");
+    assert_eq!(f.s.state().selection().map(|s| s.range()), Some(at + 5..at + 5));
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \nend\n\ndef done\nend\n", "its `end` is one Undo step");
+    // The file does not parse (`class` lacks its `end`): Ruby LSP offers `end` after `def done`, which has one.
+    f.caret("def done", "def done".len());
+    f.type_at_caret("\n");
+    let rx = f.s.completions();
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until { if let Some(c) = recv(&rx) { f.s.dispatch(c); } }
+    assert_eq!(current_text(f.s.state()), "# note\nclass Shapes\n  def area\n    \nend\n\ndef done\n  \nend\n");
+    f.caret("# note", "# note".len());
+    f.type_at_caret("\n");
+    f.settle("comment", Duration::from_secs(10), |s| current_text(s.state()).starts_with("# note\n# \n"));
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/shapes.rb")).unwrap(), source, "only the draft changes");
+}
+
+/// Ruby LSP applies text changes on its worker thread but parses a document on its reader thread when a request
+/// about it arrives, so a request sent right behind an edit was answered from the text before it, and that answer
+/// cached under the edited text: a deletion undone within a fraction of a second left the deleted text's syntax errors
+/// shown at the restored text's offsets until the file was reopened. Lenz now waits for an answer from the worker
+/// (a sync barrier) before asking about edited text. Undone at once and after 10 to 300 ms, the problems are those of
+/// the restored text every time.
+#[test]
+#[ignore = "needs an installed Ruby LSP; run alone"]
+fn real_ruby_problems_follow_an_undo_right_behind_a_deletion() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let source = "class Scope\n  def scoped_department_ids(extra: nil)\n    return nil if has_permission?(\"account:view_hr_reports\")\n    @ids ||= begin\n      direct = scope.pluck(:department_id)\n      descendant = member.departments\n        .where(\"ARRAY[?]::integer[] && ancestor_ids\", direct)\n        .pluck(:id)\n      (direct + descendant).uniq\n    end\n  end\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\n"), ("lib/scope.rb", source)]);
+    f.open_ready("lib/scope.rb");
+    let tab = f.tab();
+    let pump = |f: &mut Real, ms: u64| { let rx = f.s.completions(); let until = Instant::now() + Duration::from_millis(ms); while Instant::now() < until { if let Some(c) = recv(&rx) { f.s.dispatch(c); } } };
+    pump(&mut f, 2000);
+    assert!(f.problems().is_empty(), "{:?}", f.problems());
+    let quote = source.find("\"account").unwrap() + 1;
+    // The deleted quote's errors are shown once settled.
+    f.s.dispatch(Command::Select(Selection { anchor: quote, head: quote }));
+    f.s.dispatch(Command::Delete { backward: true, word: false });
+    f.settle("errors", Duration::from_secs(10), |s| s.state().active().and_then(|t| s.state().diagnostics(t.id())).is_some_and(|d| !d.items.is_empty()));
+    f.s.dispatch(Command::Undo { tab });
+    pump(&mut f, 1500);
+    assert!(f.problems().is_empty(), "{:?}", f.problems());
+    for gap in [0u64, 10, 20, 50, 100, 200, 300] {
+        f.s.dispatch(Command::Select(Selection { anchor: quote, head: quote }));
+        f.s.dispatch(Command::Delete { backward: true, word: false });
+        if gap > 0 { pump(&mut f, gap); }
+        f.s.dispatch(Command::Undo { tab });
+        assert_eq!(current_text(f.s.state()), source);
+        pump(&mut f, 1500);
+        assert!(f.problems().is_empty(), "undone {gap} ms after the deletion: {:?}", f.problems());
+    }
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/scope.rb")).unwrap(), source);
+}
+
+/// Go to Definition into gems with the installed Ruby LSP and ActionMailer: `perform_deliveries` is ActionMailer's
+/// `cattr_accessor` (which Ruby LSP's index does not read) and Mail's `attr_accessor`. On a local of unknown type
+/// Ruby LSP names only Mail's, and on the mailer class or `self` nothing; Lenz lists both declarations each time, as
+/// RubyMine does, and opens the chosen one read-only.
+#[test]
+#[ignore = "needs an installed Ruby LSP and the actionmailer gem; run alone"]
+fn real_ruby_definitions_list_gem_declarations_its_index_misses() {
+    let Some((exe, path)) = installed("ruby-lsp", "RUBY_LSP") else {
+        println!("SKIPPED: Ruby LSP is not installed (set READER_RUBY_LSP / READER_RUBY_LSP_PATH)");
+        return;
+    };
+    let app = "class Messenger < ActionMailer::Base\n  def new_mail_from_candidate\n    message = mail(to: \"a@b.c\")\n    message.perform_deliveries = false\n    Messenger.perform_deliveries\n    perform_deliveries\n  end\nend\n";
+    let mut f = real("ruby-lsp", &exe, path.as_deref(), &[("Gemfile", "source \"https://rubygems.org\"\ngem \"actionmailer\"\n"), ("lib/messenger.rb", app)]);
+    let lock = std::process::Command::new("bundle").args(["lock", "--local"]).current_dir(&f.root).output().unwrap();
+    if !lock.status.success() {
+        println!("SKIPPED: actionmailer is not installed ({})", String::from_utf8_lossy(&lock.stderr));
+        return;
+    }
+    f.open_ready("lib/messenger.rb");
+    for needle in ["message.perform_deliveries", "Messenger.perform_deliveries", "    perform_deliveries\n"] {
+        let skip = needle.find("perform").unwrap() + 2;
+        f.show("lib/messenger.rb");
+        // Answers right after startup may come before indexing finished: asked until both are listed.
+        let asked = Instant::now();
+        loop {
+            f.definition(needle, skip);
+            let files: Vec<String> = f.s.state().results().map(|r| r.hits().iter().map(|h| h.path.to_string()).collect()).unwrap_or_default();
+            if files.iter().any(|p| p.ends_with("action_mailer/delivery_methods.rb")) && files.iter().any(|p| p.ends_with("mail/message.rb")) { break; }
+            assert!(asked.elapsed() < Duration::from_secs(30), "{needle}: {files:?}; {:?}", f.notices());
+            f.s.dispatch(Command::CloseResults);
+            f.show("lib/messenger.rb");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let at = f.s.state().results().unwrap().hits().iter().position(|h| h.path.ends_with("action_mailer/delivery_methods.rb")).unwrap();
+        f.s.dispatch(Command::OpenResult(at));
+        f.settle("open", Duration::from_secs(10), |s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
+        assert!(current_text(f.s.state()).lines().nth(f.s.state().results().unwrap().hits()[at].line).unwrap().contains("cattr_accessor :perform_deliveries"));
+        f.s.dispatch(Command::CloseResults);
+    }
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), app);
+}

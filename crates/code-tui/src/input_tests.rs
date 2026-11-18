@@ -4824,3 +4824,19 @@ fn popup_fields_edit_ranges_and_preserve_document_and_both_carets() {
 
 #[path = "input_tests/workspace_edit.rs"]
 mod workspace_edit;
+
+/// Cmd+Backspace as terminals send it: with Cmd reported (kitty protocol) it deletes the line everywhere; as Ctrl+U
+/// (macOS terminals) only on macOS, where Ctrl+U in the text means it. Elsewhere Ctrl+U leaves the text alone.
+#[test]
+fn cmd_backspace_deletes_the_line_as_the_terminal_sends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rb");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let mut a = app(dir.path()); a.dispatch(Command::OpenRetained(path.clone())); settle(&mut a, |a| a.session.state().current_source().is_some()); a.enable_draft_input_for_test(); draw(&mut a, 80, 16);
+    let text = |a: &App| { let s = a.session.state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    key(&mut a, KeyCode::Backspace, KeyModifiers::SUPER);
+    assert_eq!(text(&a), "two\nthree\n");
+    key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    assert_eq!(text(&a), if crate::app::CMD_BACKSPACE_IS_CTRL_U { "three\n" } else { "two\nthree\n" });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+}

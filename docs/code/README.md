@@ -120,7 +120,23 @@ because VS Code's Ctrl+D (select the next occurrence) is Compare Selected here. 
 keys, like Delete, and the structural edits take chords: Ctrl+/ and Alt+/ for Toggle Comment, Ctrl+Shift+Down / Up for
 Move Lines (Alt+Down / Up in the VS Code preset, which is VS Code's own chord), and Alt+Shift+Down / Up for Duplicate
 Lines in both presets—IntelliJ's own Alt+Shift+arrows move a line and its Ctrl+D duplicates one, so Move Lines takes
-IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it.
+IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it. **Delete Line** removes every line
+the selections touch (one Undo step; each caret keeps its column on the line below): Ctrl+Y in the IntelliJ preset,
+and Cmd+Backspace on macOS in both presets, in the GUI and in terminals that report Cmd (the kitty keyboard protocol);
+it has no VS Code chord because Ctrl+Shift+K is Keep Tab Open here. **Copy Reference** (Ctrl+Alt+Shift+C in the
+IntelliJ preset, Cmd+Option+Shift+C on macOS; also in the text's right-click menu) copies the qualified name of the
+declaration holding the caret: `Foo::Bar::Baz#foo_method` and `Foo::Baz.make` in Ruby (`#` for instance methods, `.`
+for `def self.` and `class << self` ones), `pkg.module.Class.method` in Python, `com.acme.Box#open` in Java,
+`crate::module::Type::method` in Rust; outside a declaration (and in Markdown, HTML and CSS) it copies `path:line`. It
+names the declaration the caret is in, not a name the caret is on: a call is not resolved to what it calls.
+**Go to Test or Subject** (Ctrl+Shift+T in the IntelliJ preset, Cmd+Shift+T on macOS; also in Navigate) opens the
+active file's test, or from a test the file it tests, found by name in the project: `user.rb` ↔ `user_spec.rb` or
+`user_test.rb`, `mod.py` ↔ `test_mod.py` or `mod_test.py`, `Box.java` ↔ `BoxTest.java` (Kotlin, Scala, PHP, C#, Swift,
+Groovy alike, also `Tests` and `Spec`), `a.ts` ↔ `a.test.ts` or `a.spec.ts` (any of the JavaScript and TypeScript
+extensions), `x.go` ↔ `x_test.go`, `lib.ex` ↔ `lib_test.exs`. Among several, the one whose folders match best wins, with
+`app`, `lib`, `src`, `spec`, `test`, `tests`, `__tests__`, `main` and `java` left out of the comparison
+(`app/models/user.rb` ↔ `spec/models/user_spec.rb`, not `spec/requests/user_spec.rb`); without one it says what it
+looked for. It needs the file's project folder open; files the project's ignore rules leave out are not found.
 
 **Keymap…** lists each command with its chords, the preset origin of each override and any binding an override
 displaced. Enter takes the next key as the selected command's shortcut, Delete restores the preset's chord, Esc
@@ -213,8 +229,26 @@ actions give the same reason in both adapters. The one copy outside the project 
 record (the draft and the last saved text, as for any file), kept in Lenz Code's recovery folder (0700) as a 0600 file
 until it is saved or discarded. Project text search and Find read the file within the session like any other.
 
-Enter carries the current line's leading tabs and spaces onto the new line. YAML, Markdown and Haml retain
-their structural indentation rules; pasted text keeps its own whitespace.
+Enter in code (Rust, C, C++, Go, Zig, Java, Kotlin, C#, Python, Ruby, PHP, Lua, shell, JavaScript, TypeScript, CSS,
+JSON and SQL) indents the new line as its block calls for: one step deeper after a line that opens a block (an opening
+bracket last; Python's `:`; Ruby's `def`, `class`, `module`, `if`, `else`, `when`, `rescue`, `do |x|`, `{ |x|`; Lua's
+and shell's `then` and `do`), one step out after Python's `return`, `pass`, `break`, `continue` and `raise`, and between
+a bracket and its closer (`{|}`) the closer moves to its own line at the opener's indentation with the caret on an
+indented line between. On an empty line the nearest line with text above stands in, so a blank line inside a body
+continues the body. The step is the file's (EditorConfig, the project's choice, the language default: two spaces for
+Ruby, YAML, Haml and SQL, a tab for Go and Makefiles, four spaces otherwise), written as
+spaces after spaces and a tab after tabs. Other files keep the line's leading tabs and spaces. Comments and quoted
+brackets open nothing; `end` and closing brackets are not outdented as they are typed. YAML, XML, Markdown and Haml
+retain their structural indentation rules; pasted text keeps its own whitespace.
+
+After that indentation, a language server that formats on Enter (`textDocument/onTypeFormatting` with `\n`) is asked
+for its edits, which go in as their own Undo step with the caret left on the new line; Ctrl+Z takes them back and keeps
+the line break. Only Ruby LSP is asked (servers opt in per provider: VS Code leaves format-on-type off, and some servers
+reformat the previous line on Enter). Ruby LSP closes the block just opened with `end` (after `def`, `class`, `module`,
+`if`, `unless`, `while`, `until`, `for`, `case` and `do`), closes a heredoc and continues a `#` comment line. It adds
+`end` only while the file does not parse; because an unrelated error elsewhere also makes it offer one, Lenz drops an
+`end` when the block already has its own (the first line below at the opener's indentation or less is `end` at the
+opener's indentation). An answer that arrives after more typing, a caret move or for several carets is dropped.
 
 The GUI source caret blinks every half second, starts visible after typing or movement, and stays steady
 while a dialog or another control/window has focus. The terminal source caret stays steady.
@@ -343,6 +377,16 @@ usual. This also works when reading a single file without an open project. Libra
 visit them; only expanded folders are listed, in background jobs. Adding a library does not add files to the
 local project declaration index. The browsing root stays unchanged.
 
+In Ruby, Go to Definition (Ctrl/Cmd+click, F12) also lists declarations Ruby LSP's index misses, as RubyMine's
+Choose Declaration does: methods a gem or the project declares with ActiveSupport's `cattr_accessor`,
+`mattr_accessor`, `class_attribute` or `delegate`, or with `alias_method`, `define_method` and the `attr_*` macros
+(`perform_deliveries`, ActionMailer's `cattr_accessor` and Mail's `attr_accessor`). They are found by name in the
+bundle's gems (their `lib` and `app` folders, as Ruby LSP lists them) and the project's Ruby files, and added when
+Ruby LSP found nothing (then project `def`s too) or only declarations outside the project. Several are listed in the
+results panel by gem and version; one opens read-only. This is a match by name, not a resolution: every macro
+declaring the name is a candidate, including ones the receiver does not have, and a macro whose names continue on
+the next line is not read past its first line.
+
 Collapse and expand a library folder to refresh its listing after a dependency update or branch checkout.
 Listings are limited to 2,000 entries per directory and 20,000 overall, with a status message when truncated;
 the definition you followed remains visible. At the overall limit, following another definition releases old
@@ -354,7 +398,7 @@ sources are listed, since the protocol does not provide a directory listing. Reo
 server session for the text; after that session ends, follow the definition again.
 
 Holding Ctrl over a name underlines it and shows a hand pointer: a click there follows it. A right-click in the text
-opens a menu with every navigation action, Copy Path / Copy Path:Line, Open in Editor, Open with Default App,
+opens a menu with every navigation action, Copy Path / Copy Path:Line / Copy Reference, Open in Editor, Open with Default App,
 Compare With… and Split Right / Split Down (Close Split once split). The call hierarchy lists callers (Tab:
 callees) in the results panel, a level loading as it unfolds (Right/Left). Type Hierarchy (Ctrl+H) lists the subtypes of the type at
 the caret the same way (Tab: supertypes). It comes from the server's own type hierarchy where it has one (JDT LS,
@@ -468,6 +512,10 @@ a hidden explorer stays hidden and shows that file selected when it opens. Openi
 before files; the command menu's "Explorer: All by Name" switches to plain name order ("Explorer: Folders First" back) (bytewise:
 capitals first), saved in `$XDG_CONFIG_HOME/lenz-code/settings.json`. Explorer rows and tabs show the Git status
 letter (M, A, D, R, U, C) apart from the `●` unsaved mark, as in the [terminal editor](tui.md).
+The explorer, the file finder (Shift Shift) and Find in Files share one inventory of the project's files. Folders the
+ignore rules exclude (`target/`, `node_modules/`, `.venv/`; `.gitignore`, `.ignore` and `.git/info/exclude`, also outside
+Git) are not entered, but every file in a folder that is entered is listed, ignored or not: `.env`, `.env.local` and
+other hidden or ignored files show beside `.env.example`.
 
 A single click selects a directory. Click its arrow or double-click its name to expand or collapse it;
 keyboard Left/Right and Enter remain available in both frontends.
@@ -481,7 +529,8 @@ Escape cancels without writing.
 projects. New Scratch File lists the kinds of file, as IntelliJ does: Plain text, JSON, Ruby and PostgreSQL first, then
 every language Lenz reads by name (Bash to Zig, ERB and HAML templates, CSV, Dockerfile, environment files); typing
 filters by name or extension and Enter creates the next free `scratch_N.<extension>` (`scratch_1.rb`, `scratch_2.sql`…),
-opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. On macOS Cmd+Shift+N opens it, as in
+opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. Each kind shows its file-type icon, as the
+explorer and the tabs do, while **File Icons** is on (a Nerd Font glyph in the terminal editor). On macOS Cmd+Shift+N opens it, as in
 IntelliJ's macOS keymap. They use ordinary Save and draft recovery, remain available
 across projects and restarts, and live in `$XDG_STATE_HOME/lenz-code/scratch-files` (default
 `~/.local/state/lenz-code/scratch-files`). Closing a tab keeps its file; there are no scratch run/debug controls.

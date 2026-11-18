@@ -75,6 +75,16 @@ pub struct Provider {
     pub sections: &'static [(&'static str, bool)],
     /// Text its server inserts after a typed character, asked through a request of its own.
     pub auto_insert: Option<AutoInsert>,
+    /// Whether Enter asks its server for `textDocument/onTypeFormatting` edits (when it offers them for `\n`).
+    /// Opt-in per provider: VS Code leaves format-on-type off, and servers that reformat the previous line on Enter
+    /// (typescript-language-server, clangd) would rewrite text the user did not ask to format.
+    pub formats_on_enter: bool,
+    /// A request whose answer means the server has applied every text sent before it, for a server that applies
+    /// text on another thread than it parses requests on (see `Server::pump_text`): questions wait for it.
+    pub sync_barrier: Option<&'static str>,
+    /// A request listing the bundle's gems and their folders (`[{ name, version, path }]`), asked once a session:
+    /// Go to Definition then also finds declarations its index misses there by name (see `ruby_declarations`).
+    pub dependencies: Option<&'static str>,
     /// The project environment its server analyses with, for workspace root, its settings (its configuration
     /// section) and the `PATH` it runs with: one line for Server Details, else why it must not start (the configured
     /// environment is missing, and the server would silently use another). Checked off the UI thread at launch.
@@ -148,6 +158,9 @@ const DEFAULT: Provider = Provider {
     blind_to: &[],
     sections: &[],
     auto_insert: None,
+    formats_on_enter: false,
+    sync_barrier: None,
+    dependencies: None,
     environment: None,
     registrations: |_| Vec::new(),
     computed: |_, _| None,
@@ -326,6 +339,12 @@ Provider {
 },
 Provider {
     id: "ruby-lsp",
+    // Its Enter edits close the block just opened with `end` (only while the file does not parse), continue a `#`
+    // comment and close a heredoc.
+    formats_on_enter: true,
+    // It answers this from its worker, in order behind text changes, without reading any document.
+    sync_barrier: Some("rubyLsp/workspace/addons"),
+    dependencies: Some("rubyLsp/workspace/dependencies"),
     name: "Ruby LSP",
     languages: &[Language::Ruby],
     language_id: |_, _| "ruby",

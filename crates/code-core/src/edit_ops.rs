@@ -262,6 +262,186 @@ pub(crate) fn yaml_line_indent(before: &str, step: impl FnOnce() -> usize) -> St
     indent
 }
 
+/// Languages whose Enter follows the code's structure ([`enter_plan`]); every other file keeps the line's own
+/// indentation (Markdown, YAML, XML and HAML have Enter rules of their own).
+pub(crate) fn structured_enter(language: Option<Language>) -> bool {
+    matches!(language, Some(Language::Rust | Language::C | Language::Cpp | Language::Go | Language::Zig | Language::Java | Language::Kotlin
+        | Language::CSharp | Language::Python | Language::Ruby | Language::Php | Language::Lua | Language::Bash | Language::JavaScript
+        | Language::TypeScript | Language::Tsx | Language::Css | Language::Json | Language::Sql))
+}
+
+/// What Enter at a caret inserts in a [`structured_enter`] language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EnterPlan {
+    /// The new line's indentation, where the caret goes.
+    pub(crate) indent: String,
+    /// Between an opening bracket and its closer: the indentation of a further line that takes the closer.
+    pub(crate) closer: Option<String>,
+}
+
+/// Enter's indentation from the caret's line, `before` the caret and `after` it, in `language`:
+/// - a line that opens a block (an opening bracket last; Python's `:`; Ruby's `def`, `class`, `if`, `do |x|`…;
+///   Lua's and shell's `then`, `do`…) indents the new line one `unit` deeper than itself, and Enter between a
+///   bracket and its closer puts the closer on a line of its own at the opener's indentation;
+/// - after Python's `return`, `pass`, `break`, `continue` or `raise` the new line steps one level out;
+/// - on an empty line, `previous` (the nearest line above with text) stands in for it, so a blank line inside a body
+///   continues the body rather than dropping to the margin;
+/// - otherwise the line's own indentation is kept, as before.
+///
+/// `unit` is asked for only when a level is added or removed.
+pub(crate) fn enter_plan(before: &str, after: &str, previous: impl FnOnce() -> Option<String>, language: Language, unit: impl FnOnce() -> IndentUnit) -> EnterPlan {
+    let line_indent = |text: &str| text.get(..text.len() - text.trim_start_matches([' ', '\t']).len()).unwrap_or_default().to_owned();
+    let (reference, code) = if before.trim().is_empty() {
+        // A caret in the line's indentation keeps it; only an entirely empty line looks further up.
+        if !before.is_empty() || !after.trim().is_empty() { return EnterPlan { indent: before.to_owned(), closer: None }; }
+        match previous() {
+            Some(line) => (line_indent(&line), line),
+            None => return EnterPlan { indent: String::new(), closer: None },
+        }
+    } else {
+        (line_indent(before), before.to_owned())
+    };
+    let code = without_line_comment(&code, language);
+    let code = code.trim();
+    if language == Language::Python && python_ends_block(code) {
+        let unit = unit();
+        let keep = reference.len() - removable_in(&reference, &unit);
+        return EnterPlan { indent: reference.get(..keep).unwrap_or_default().to_owned(), closer: None };
+    }
+    let bracket = code.chars().last().filter(|c| matches!(c, '{' | '(' | '['));
+    if bracket.is_none() && !opens_block(code, language) { return EnterPlan { indent: reference, closer: None }; }
+    let unit = unit();
+    // A step matches the line's own indentation: spaces after spaces, a tab after tabs, whatever the unit's style.
+    let step = match reference.chars().last() {
+        Some(' ') if unit.text == "\t" => " ".repeat(unit.size),
+        Some('\t') if unit.text != "\t" => "\t".into(),
+        _ => unit.text,
+    };
+    let closer = bracket.and_then(|open| pair_of(&open.to_string())).filter(|close| after.trim_start().starts_with(*close)).map(|_| reference.clone());
+    EnterPlan { indent: format!("{reference}{step}"), closer }
+}
+
+/// A server's edits in transaction order: inserts at one position joined in the order it sent them (as LSP applies
+/// them), a `$0` cursor marker (a VS Code snippet anchor) dropped. `None` when they overlap.
+pub(crate) fn ordered_server_edits(mut edits: Vec<TextEdit>) -> Option<Vec<TextEdit>> {
+    edits.retain(|e| &*e.text != "$0");
+    // Stable: same-position inserts keep the server's order.
+    edits.sort_by_key(|e| (e.range.start, e.range.end));
+    let mut out: Vec<TextEdit> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if let Some(last) = out.last_mut() {
+            if last.range.is_empty() && last.range == edit.range {
+                last.text = format!("{}{}", last.text, edit.text).into();
+                continue;
+            }
+            if last.range.end > edit.range.start || last.range == edit.range { return None; }
+        }
+        out.push(edit);
+    }
+    Some(out)
+}
+
+/// Whether the edits write a line that is only `end`.
+pub(crate) fn inserts_end(edits: &[TextEdit]) -> bool {
+    edits.iter().any(|e| e.text.split(['\r', '\n']).any(|line| line.trim() == "end"))
+}
+
+/// Whether the block opened by the nearest line with text above `line` is already closed: below it, the first line
+/// with text that is not indented deeper than the opener is `end` (or a closing bracket) at the opener's indentation.
+/// Reads at most a few thousand lines.
+pub(crate) fn block_closed_below(doc: &TextSnapshot, line: usize) -> bool {
+    const LINES: usize = 5000;
+    let text_of = |line: usize| doc.line_range(line).and_then(|r| doc.copy_range(r.start..r.end.min(r.start + 4096)));
+    let depth = |text: &str| text.len() - text.trim_start_matches([' ', '\t']).len();
+    let Some(opener) = (line.saturating_sub(200)..line).rev().find_map(|l| text_of(l).filter(|t| !t.trim().is_empty())) else { return false };
+    let indent = depth(&opener);
+    for l in line..doc.line_count().min(line + LINES) {
+        let Some(text) = text_of(l) else { break };
+        let body = text.trim_start_matches([' ', '\t']);
+        if body.trim().is_empty() || depth(&text) > indent { continue; }
+        let word = body.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+        return depth(&text) == indent && (word == "end" || body.starts_with(['}', ']', ')']));
+    }
+    false
+}
+
+/// Where a caret at `caret` stands after `edits` (ascending, disjoint): text inserted right at it goes after it.
+pub(crate) fn caret_after(edits: &[TextEdit], caret: usize) -> usize {
+    let mut moved = caret as isize;
+    for edit in edits {
+        if edit.range.start >= caret && !(edit.range.start == caret && !edit.range.is_empty()) { break; }
+        if edit.range.end <= caret {
+            moved += edit.text.len() as isize - edit.range.len() as isize;
+        } else {
+            // The caret was inside replaced text: it goes to the replacement's end.
+            moved += (edit.range.start + edit.text.len()) as isize - caret as isize;
+        }
+    }
+    moved.max(0) as usize
+}
+
+/// How many bytes at the end of `indent` one step takes away: a tab, or up to `unit.width` spaces.
+fn removable_in(indent: &str, unit: &IndentUnit) -> usize {
+    if indent.ends_with('\t') { return 1; }
+    indent.bytes().rev().take(unit.width).take_while(|b| *b == b' ').count()
+}
+
+/// `code` without a trailing line comment of `language` (`#`, `//` or `--` outside quotes). A whole-line comment
+/// leaves nothing, so it opens nothing.
+fn without_line_comment(code: &str, language: Language) -> String {
+    let marker = match comments(Some(language)) { Comments::Line(marker) => marker, _ => return code.to_owned() };
+    let mut quote = None;
+    let mut escaped = false;
+    for (at, c) in code.char_indices() {
+        match quote {
+            Some(q) => {
+                if escaped { escaped = false; } else if c == '\\' { escaped = true; } else if c == q { quote = None; }
+            }
+            None if matches!(c, '"' | '\'' | '`') => quote = Some(c),
+            None if code.get(at..).is_some_and(|rest| rest.starts_with(marker)) => return code.get(..at).unwrap_or(code).to_owned(),
+            None => {}
+        }
+    }
+    code.to_owned()
+}
+
+/// Python statements after which the block is over.
+fn python_ends_block(code: &str) -> bool {
+    let first = code.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+    matches!(first, "return" | "pass" | "break" | "continue" | "raise")
+}
+
+/// Whether a line (its comment removed, trimmed) opens a block by its keywords rather than a bracket.
+fn opens_block(code: &str, language: Language) -> bool {
+    let words: Vec<&str> = code.split_whitespace().collect();
+    let (Some(first), Some(last)) = (words.first().copied(), words.last().copied()) else { return false };
+    // The first word as a keyword: `def`, but not `define` or `if_x`.
+    let first = first.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default();
+    match language {
+        Language::Python => code.ends_with(':'),
+        Language::Ruby => {
+            // `do`, `do |x|`, `{ |x|` open a block wherever they are.
+            if last == "do" || (code.ends_with('|') && (code.contains(" do |") || code.contains("{ |") || code.contains("{|"))) { return true; }
+            if last == "end" || code.ends_with(";end") { return false; }
+            let opener = |word: &str| matches!(word, "if" | "unless" | "while" | "until" | "case" | "begin");
+            // `x = if cond`, `y ||= begin`.
+            if words.windows(2).any(|pair| pair[0].ends_with('=') && opener(pair[1])) { return true; }
+            match first {
+                "class" | "module" => !code.contains(';'),
+                // An endless method (`def name = value`, `def name(a) = a`) has no body.
+                "def" => !code.contains(';') && !words.iter().skip(2).any(|w| *w == "=") && !code.contains(") ="),
+                "if" | "unless" | "while" | "until" | "case" | "begin" | "for" | "else" | "elsif" | "when" | "in" | "rescue" | "ensure" => !code.contains(';'),
+                _ => false,
+            }
+        }
+        Language::Lua => {
+            matches!(last, "then" | "do" | "else" | "repeat") || (matches!(first, "function" | "local") && code.contains("function") && code.ends_with(')'))
+        }
+        Language::Bash => matches!(last, "then" | "do" | "else" | "in") || code.ends_with("then") || code.ends_with("do"),
+        _ => false,
+    }
+}
+
 /// A YAML line's text before its comment: a `#` at its start or after a space, outside quoted scalars.
 fn yaml_without_comment(line: &str) -> &str {
     let mut quote = None;
@@ -537,6 +717,52 @@ pub(crate) fn duplicate_lines(doc: &TextSnapshot, selections: &[Selection], down
     (!edits.is_empty()).then_some(edits)
 }
 
+/// Delete every block of touched lines, endings included, as one transaction, with one caret per block at the
+/// column (in characters) its first selection's head had, on the line that now stands where the block was. A block
+/// that ends the file without a newline takes the previous line's terminator instead, so no blank last line is left
+/// behind and every other ending stays as it was. `None` for an empty document.
+pub(crate) fn delete_lines(doc: &TextSnapshot, selections: &[Selection]) -> Option<(Vec<TextEdit>, Vec<Selection>)> {
+    if doc.len_bytes() == 0 { return None; }
+    let blocks = touched_lines(doc, selections);
+    let column = |head: usize| {
+        let start = doc.reader_line_range(doc.line_of(head)).start;
+        doc.copy_range(start..head).map_or(0, |text| text.chars().count())
+    };
+    let mut edits = Vec::with_capacity(blocks.len());
+    let mut carets = Vec::with_capacity(blocks.len());
+    let mut removed = 0usize;
+    for block in blocks {
+        let wanted = selections.iter().find(|s| lines_of(doc, **s).start >= block.start && lines_of(doc, **s).start < block.end).map_or(0, |s| column(s.head));
+        let first = doc.line_with_ending(block.start)?.start;
+        let last = block.end - 1;
+        let end = doc.line_with_ending(last)?.end.max(line_parts(doc, last).0.end);
+        let unterminated = line_parts(doc, last).1.is_empty();
+        // The caret's line after the edit: the one after the block, else (the file's last lines went) the one before.
+        let (start, landing) = if unterminated && block.start > 0 {
+            (line_parts(doc, block.start - 1).1.start, block.start - 1)
+        } else {
+            (first, block.end)
+        };
+        // Where that line starts once this block is gone (earlier blocks' removals are taken off below).
+        let (content, line_start) = if landing < block.start {
+            let content = line_parts(doc, landing).0;
+            (content.clone(), content.start)
+        } else if landing < doc.line_count() {
+            let content = line_parts(doc, landing).0;
+            (content.clone(), content.start - (end - start))
+        } else {
+            (start..start, start)
+        };
+        let text = doc.copy_range(content).unwrap_or_default();
+        let into: usize = text.chars().take(wanted).map(char::len_utf8).sum();
+        let caret = line_start + into - removed;
+        removed += end - start;
+        edits.push(TextEdit { range: start..end, text: "".into() });
+        carets.push(Selection { anchor: caret, head: caret });
+    }
+    Some((edits, carets))
+}
+
 /// A line's content (without its terminator) and its terminator (`""` for the last line of a file that has none).
 fn line_parts(doc: &TextSnapshot, line: usize) -> (Range<usize>, Range<usize>) {
     let content = doc.line_range(line).unwrap_or(0..0);
@@ -575,6 +801,95 @@ mod tests {
             assert_eq!(indent(before), expected, "{before:?}");
         }
         assert_eq!(super::yaml_line_indent("a: 1", || panic!("asked without a block")), "");
+    }
+
+    #[test]
+    fn enter_follows_the_code_structure() {
+        use lenz_content::highlight::Language::{self, *};
+        let unit = || super::IndentUnit::new(crate::preferences::Style::Space, 2, 4);
+        let plan = |language: Language, before: &str, after: &str| { let p = super::enter_plan(before, after, || None, language, unit); (p.indent, p.closer) };
+        let deeper = |indent: &str| (indent.to_owned(), None);
+        // Brackets, with the closer on its own line when the caret is right before it.
+        assert_eq!(plan(Rust, "    fn a() {", "}"), ("      ".into(), Some("    ".into())));
+        assert_eq!(plan(JavaScript, "  call(", "  )"), ("    ".into(), Some("  ".into())));
+        assert_eq!(plan(Json, "\t[", ""), deeper("\t\t"), "a tab after tabs");
+        assert_eq!(super::enter_plan("    {", "", || None, Rust, || super::IndentUnit::new(crate::preferences::Style::Tab, 4, 4)).indent, "        ", "spaces after spaces");
+        assert_eq!(plan(Rust, "    let a = 1; // {", ""), deeper("    "), "a comment opens nothing");
+        assert_eq!(plan(JavaScript, "  s = \"{\"", ""), deeper("  "), "a quoted bracket opens nothing");
+        assert_eq!(plan(Rust, "    a();", ""), deeper("    "), "a plain line keeps its indentation");
+        // Ruby keywords and blocks.
+        for opens in ["def foo_method(a)", "class Baz < Base", "module Foo::Bar", "if ready?", "else", "items.each do |item|", "x = if a", "list.map { |v|", "rescue StandardError => e", "begin"] {
+            assert_eq!(plan(Ruby, &format!("  {opens}"), ""), deeper("    "), "{opens}");
+        }
+        for plain in ["def a; end", "def value = 1", "def sum(a, b) = a + b", "return if done", "puts 'class'", "# def note", "define_method(:x)", "end"] {
+            assert_eq!(plan(Ruby, &format!("  {plain}"), ""), deeper("  "), "{plain}");
+        }
+        // Python: `:` opens, `return` and its kind close; tabs step back one tab.
+        assert_eq!(plan(Python, "    def area(self):  # note", ""), deeper("      "));
+        assert_eq!(plan(Python, "    s = 'a:'", ""), deeper("    "));
+        assert_eq!(plan(Python, "        return 1", ""), deeper("      "));
+        assert_eq!(plan(Python, "\t\tpass", ""), deeper("\t"));
+        assert_eq!(plan(Lua, "if x then", ""), deeper("  "));
+        assert_eq!(plan(Bash, "for f in *; do", ""), deeper("  "));
+        // An empty line continues the nearest line with text above; a caret in the indentation keeps it.
+        let blank = |previous: &str| super::enter_plan("", "", || Some(previous.to_owned()), Ruby, unit).indent;
+        assert_eq!(blank("    bar"), "    ");
+        assert_eq!(blank("  def foo"), "    ");
+        assert_eq!(super::enter_plan("", "", || None, Ruby, unit).indent, "");
+        assert_eq!(super::enter_plan("  ", "", || panic!("not asked"), Ruby, unit).indent, "  ");
+        assert_eq!(super::enter_plan("", "  foo", || panic!("not asked"), Ruby, unit).indent, "");
+        assert!(super::structured_enter(Some(Ruby)) && !super::structured_enter(Some(Markdown)) && !super::structured_enter(None));
+    }
+
+    #[test]
+    fn server_edits_after_enter_are_ordered_guarded_and_keep_the_caret() {
+        let edit = |range: std::ops::Range<usize>, text: &str| crate::text::TextEdit { range, text: text.into() };
+        // Ruby LSP: "\n" then "  end" at the caret, and a VS Code cursor marker.
+        let ordered = super::ordered_server_edits(vec![edit(5..5, "\n"), edit(9..9, "$0"), edit(5..5, "  end")]).unwrap();
+        assert_eq!(ordered.iter().map(|e| (e.range.clone(), e.text.to_string())).collect::<Vec<_>>(), [(5..5, "\n  end".to_string())]);
+        assert!(super::ordered_server_edits(vec![edit(0..4, "a"), edit(2..6, "b")]).is_none(), "overlapping");
+        assert!(super::inserts_end(&ordered) && !super::inserts_end(&[edit(0..0, "# ")]) && !super::inserts_end(&[edit(0..0, "endless")]));
+        assert_eq!(super::caret_after(&ordered, 5), 5, "text inserted at the caret goes after it");
+        assert_eq!(super::caret_after(&[edit(0..0, "ab"), edit(9..9, "x")], 5), 7);
+        assert_eq!(super::caret_after(&[edit(2..4, "")], 5), 3);
+        assert_eq!(super::caret_after(&[edit(3..8, "xy")], 5), 5, "inside a replacement: its end");
+        let closed = |text: &str, line: usize| {
+            let document = crate::document::Document::decode(std::path::PathBuf::from("/p/a.rb"), 1, text.as_bytes());
+            super::block_closed_below(&crate::text::TextSnapshot::from_document(crate::text::BufferId(1), &document), line)
+        };
+        assert!(closed("  def a\n    \n  end\n", 1));
+        assert!(closed("  def a\n    \n\n    b\n  end\n", 1), "past the body");
+        assert!(!closed("  def a\n    \nend\n", 1), "a less indented end closes an outer block");
+        assert!(!closed("  def a\n    \n  def b\n  end\n", 1), "a sibling at the opener's indentation");
+        assert!(!closed("  def a\n    \n", 1), "the file ends");
+        assert!(closed("  x = {\n    \n  }\n", 1));
+    }
+
+    #[test]
+    fn deleting_lines_keeps_the_other_endings_and_each_carets_column() {
+        use crate::session::Selection;
+        let delete = |text: &str, carets: &[(usize, usize)]| {
+            let document = crate::document::Document::decode(std::path::PathBuf::from("/p/a.txt"), 1, text.as_bytes());
+            let doc = crate::text::TextSnapshot::from_document(crate::text::BufferId(1), &document);
+            let selections: Vec<Selection> = carets.iter().map(|&(anchor, head)| Selection { anchor, head }).collect();
+            let (edits, after) = super::delete_lines(&doc, &selections)?;
+            let mut out = text.to_owned();
+            for edit in edits.iter().rev() { out.replace_range(edit.range.clone(), &edit.text); }
+            Some((out, after.iter().map(|s| s.head).collect::<Vec<_>>()))
+        };
+        let c = |at: usize| (at, at);
+        // A caret's line goes; the caret keeps its column on the next line (clamped to it).
+        assert_eq!(delete("one\r\ntwo\nlast", &[c(6)]), Some(("one\r\nlast".into(), vec![6])));
+        assert_eq!(delete("abcdef\nxy\n", &[c(5)]), Some(("xy\n".into(), vec![2])));
+        // The last line without a newline takes the previous terminator; the caret goes up.
+        assert_eq!(delete("one\r\ntwo", &[c(7)]), Some(("one".into(), vec![2])));
+        assert_eq!(delete("only", &[c(2)]), Some(("".into(), vec![0])));
+        // A selection takes every line it touches (not the line it ends at the start of); carets on one line once.
+        assert_eq!(delete("a\nb\nc\nd\n", &[(0, 4)]), Some(("c\nd\n".into(), vec![0])));
+        assert_eq!(delete("a\nb\nc\nd\n", &[c(0), c(1), c(4)]), Some(("b\nd\n".into(), vec![0, 2])));
+        // Characters, not bytes, make the column.
+        assert_eq!(delete("é𝄞x\n𝄞é\n", &[c(6)]), Some(("𝄞é\n".into(), vec![6])));
+        assert_eq!(delete("", &[c(0)]), None);
     }
 
     #[test]

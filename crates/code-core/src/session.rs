@@ -195,6 +195,9 @@ pub enum Command {
     MoveLines { down: bool },
     /// Copy the lines the selections touch directly below (or above) themselves.
     DuplicateLines { down: bool },
+    /// Delete every line the selections touch, endings included, as one transaction; each caret keeps its column on
+    /// the line that takes the deleted lines' place.
+    DeleteLines,
     SetReadOnly(bool),
     CompareSaved,
     CloseSavedComparison,
@@ -538,6 +541,10 @@ pub enum Command {
     SetFileIcons(bool),
     /// Copy the active file's path (relative to the open folder), with `:line` of the caret when `line`.
     CopyPath { line: bool },
+    /// Copy the qualified name of the declaration at the caret (`Foo::Bar::Baz#foo_method`), else `path:line`.
+    CopyReference,
+    /// Open the active file's test, or the file the active test tests (see [`crate::relevant`]).
+    GoToTest,
     /// A message from the adapter (a launch it could not start), shown with the core's own.
     Notice(String),
     /// Mark the occurrences of the name at the caret (asked in the background; never cancels another request).
@@ -795,6 +802,8 @@ pub enum CommandId {
     DuplicateLinesUp,
     /// Copy the lines the selections touch directly below themselves.
     DuplicateLinesDown,
+    /// Delete the lines the selections touch (IntelliJ's Delete Line).
+    DeleteLine,
     ChooseTheme,
     /// The application's name, version, platform, licence and project page (the adapter shows it).
     About,
@@ -852,6 +861,10 @@ pub enum CommandId {
     /// The active file's path (relative to the open folder), and with the caret's line.
     CopyPath,
     CopyPathLine,
+    /// The qualified name of the declaration at the caret (IntelliJ's Copy Reference), else the path and line.
+    CopyReference,
+    /// Switch between the active file and its test (RubyMine's Navigate › Test).
+    GoToTest,
     /// The active file in the user's editor at the caret, or with the system's default app.
     OpenInEditor,
     OpenWithDefaultApp,
@@ -991,7 +1004,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 260] = [
+    pub const ALL: [CommandId; 263] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1083,6 +1096,8 @@ impl CommandId {
         Self::ResolveExternalChange,
         Self::CopyPath,
         Self::CopyPathLine,
+        Self::CopyReference,
+        Self::GoToTest,
         Self::OpenInEditor,
         Self::OpenWithDefaultApp,
         Self::CompareWith,
@@ -1107,6 +1122,7 @@ impl CommandId {
         Self::MoveLinesDown,
         Self::DuplicateLinesUp,
         Self::DuplicateLinesDown,
+        Self::DeleteLine,
         Self::ChooseTheme,
         Self::About,
         Self::NewWindow,
@@ -1370,6 +1386,7 @@ impl CommandId {
             Self::MoveLinesDown => "Move Lines Down",
             Self::DuplicateLinesUp => "Duplicate Lines Up",
             Self::DuplicateLinesDown => "Duplicate Lines Down",
+            Self::DeleteLine => "Delete Line",
             Self::ChooseTheme => "Change theme",
             Self::About => crate::chrome::ABOUT_TITLE,
             Self::NewWindow => "New Window",
@@ -1441,6 +1458,8 @@ impl CommandId {
             Self::SemanticHighlighting => "Semantic Highlighting",
             Self::CopyPath => "Copy Path",
             Self::CopyPathLine => "Copy Path:Line",
+            Self::CopyReference => "Copy Reference",
+            Self::GoToTest => "Go to Test or Subject",
             Self::OpenInEditor => "Open in Editor",
             Self::OpenWithDefaultApp => "Open with Default App",
             Self::CompareWith => "Compare Saved Disk Inputs…",
@@ -1984,6 +2003,42 @@ struct Asking {
     retrieving: Option<semantics::VirtualTarget>,
     /// A call hierarchy's root, while its place is read.
     root: Option<Call>,
+}
+
+/// A Ruby definition's by-name search: declarations Ruby LSP's index misses (methods made by ActiveSupport's
+/// `cattr_accessor`, `class_attribute`, `delegate` and the like, in the project and its gems), added as candidates
+/// when the server found nothing (plain `def`s too) or only declarations outside the project (macros only), as
+/// RubyMine lists them. Run off the UI thread with the server's own targets. The project's files are read each time
+/// (they change); the gems' macro declarations are indexed once per server session.
+struct ByName { name: String, gems: Arc<Vec<PathBuf>>, index: crate::ruby_declarations::SharedIndex, files: Vec<PathBuf>, root: Option<PathBuf> }
+
+impl ByName {
+    fn add(&self, targets: &mut semantics::Targets, limit: usize, read: semantics::ReadFile, wanted: &dyn Fn() -> bool) {
+        let in_project = |p: &Path| self.root.as_ref().is_some_and(|r| p.starts_with(r));
+        if !targets.unavailable.is_empty() || targets.found.len() >= limit || targets.found.iter().any(|t| in_project(&t.path)) { return; }
+        let defs = targets.found.is_empty();
+        let mut paths = crate::ruby_declarations::search(&self.name, &self.files, defs, limit - targets.found.len(), wanted);
+        let gems = self.index.get_or_init(|| crate::ruby_declarations::GemIndex::build(&self.gems)).files_declaring(&self.name);
+        let first_gem = paths.len();
+        paths.extend(gems);
+        for (i, path) in paths.into_iter().enumerate() {
+            if !wanted() { return; }
+            // Only macros in gems: their plain `def`s are in the server's index.
+            let defs = defs && i < first_gem;
+            let Ok((stamp, doc)) = read(&path) else { continue };
+            let mut offset = 0;
+            for line in doc.text().split_inclusive('\n') {
+                if let Some(range) = crate::ruby_declarations::declares(line.trim_end_matches(['\n', '\r']), &self.name, defs) {
+                    let (start, end) = (offset + range.start, offset + range.end);
+                    let known = targets.found.iter().any(|t| t.path == path && t.doc.line_of(t.at) == doc.line_of(start));
+                    if !known && targets.found.len() < limit {
+                        targets.found.push(semantics::Target { path: path.clone(), stamp: Some(stamp), doc: doc.clone(), hit: semantics::hit_at(&path, &doc, start, end), at: start, decoded_digest: None });
+                    }
+                }
+                offset += line.len();
+            }
+        }
+    }
 }
 
 /// What the user asked a language server.
@@ -3118,7 +3173,7 @@ pub struct Session {
     /// What the server inserts after the character just typed (a closing tag), on its way.
     pending_auto_insert: Option<auto_insert::AutoInsertRequest>,
     /// The tab whose typed character its server inserts after: asked once the command is over.
-    auto_insert_due: Option<TabId>,
+    auto_insert_due: Option<(TabId, char)>,
     pending_code_action: Option<code_action::CodeActionRequest>,
     /// The server command running for the user's pick.
     pending_command: Option<server_command::CommandWait>,
@@ -3530,7 +3585,7 @@ impl Session {
             return Some("This action requires a file on disk; the current document is an archive entry");
         }
         if self.state.active().is_some_and(|tab| tab.csv.is_some()) && matches!(id,
-            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
+            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
         if self.csv_pending() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
         if (self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || self.install_running.is_some()) && matches!(id,
             CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
@@ -3698,7 +3753,13 @@ impl Session {
             CommandId::CloseSavedComparison => self.state.comparison.is_none().then_some("No saved comparison is open"),
             CommandId::CompareWith => (self.state.active().is_none() && self.state.project.is_none()).then_some("No file or folder is open"),
             CommandId::CompareSelected => (self.state.tree_marks.len() < 2).then_some(MARK_TWO),
-            CommandId::CopyPathLine => match self.state.active() {
+            CommandId::GoToTest => match self.state.active() {
+                None => Some("No file is open"),
+                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
+                Some(t) if self.state.project.as_ref().and_then(|p| p.relative(&t.source)).is_none() => Some("Open the file's project folder first"),
+                Some(_) => None,
+            },
+            CommandId::CopyPathLine | CommandId::CopyReference => match self.state.active() {
                 None => Some("No file is open"),
                 Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
                 Some(t) if !t.loaded => Some("No text to point at"),
@@ -3741,7 +3802,7 @@ impl Session {
             },
             CommandId::Cut | CommandId::Paste | CommandId::Delete => self.text_action_disabled(id),
             CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment
-            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown => self.structural_action_disabled(id),
+            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine => self.structural_action_disabled(id),
             CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections => self.selection_action_disabled(id),
             CommandId::ReadOnlyMode => self.state.active().and_then(|t| self.state.view(t.id)).map_or(Some("No loaded file is open"), |view| view.intrinsic_edit_disabled()),
             CommandId::Copy if self.state.active().and_then(|tab| tab.csv.as_ref()).is_some() => {
@@ -4193,7 +4254,7 @@ impl Session {
         if text {
             entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation, CommandId::RenameSymbol].map(C));
             entries.extend([Separator, C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll)]);
-            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine)]);
+            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference)]);
         } else {
             if matches!(self.state.rendering(), Some(Rendering::Preview(_))) {
                 entries.extend([C(CommandId::Copy), Separator, C(CommandId::ShowInSource), C(CommandId::FollowLink), Separator]);
@@ -4538,7 +4599,7 @@ impl Session {
             Input::Command(_) | Input::Completion(_) => None,
         };
         let edit_reveal = matches!(&input, Input::Command(Command::Cut | Command::Paste(_) | Command::Delete { .. } | Command::InsertText { .. } | Command::AddCursorBelow | Command::AddCursorAbove
-            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
+            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::DeleteLines | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
         let reveal_selection = (edit_reveal || matches!(&input, Input::Command(Command::VimKey(_) | Command::MoveCaret(_) | Command::Extend(_) | Command::ExtendSelection | Command::ShrinkSelection)) || expansion_completion.is_some())
             && !expansion_completion.is_some_and(|request| self.expanding.is_some_and(|e| e.3 == request && !e.4));
         let markers_due = matches!(input, Input::Completion(Completion::MarkersDue));
@@ -4569,7 +4630,7 @@ impl Session {
         }
         if arranged { self.checkpoint_workspace(); }
         if std::mem::take(&mut self.signature_due) { effect.repaint |= self.signature_at_caret(false).repaint; }
-        if let Some(tab) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab).repaint; }
+        if let Some((tab, typed)) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab, typed).repaint; }
         if self.pending_auto_insert.as_ref().is_some_and(|p| !p.current(&self.state)) { self.cancel_auto_insert(); }
         if self.pending_doc.as_ref().is_some_and(|p| !self.is_shown(p.tab) || !self.state.view(p.tab).is_some_and(|v| p.source.matches(v.snapshot()))) { self.cancel_documentation(); }
         // A popup or request whose tab, version, caret or server is no longer current is gone, not hidden.
@@ -5746,6 +5807,46 @@ impl Session {
                 let at = self.state.view(t.id).map_or(0, |view| t.selection().map_or(0, |s| view.snapshot().line_of(s.head)) + 1);
                 Effect { repaint: false, copy: Some(if line { format!("{path}:{at}") } else { path }), ..Effect::default() }
             }
+            Command::CopyReference => {
+                let Some(t) = self.state.active().filter(|t| !t.untitled()) else { return Effect::default() };
+                let relative = self.state.project.as_ref().and_then(|p| t.source.strip_prefix(p.root()).ok())
+                    .map(|relative| relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                let reference = self.state.view(t.id).and_then(|view| {
+                    let doc = view.snapshot();
+                    let at = t.selection().map_or_else(|| doc.reader_line_range(t.top_line).start, |s| s.head);
+                    match view.declarations() {
+                        Some(declarations) => crate::reference::qualified_name(doc, declarations, at, relative.as_deref()),
+                        // Right after an edit the declarations are still being extracted: this explicit action
+                        // extracts them once itself rather than copy a path where a name was asked for.
+                        None if !doc.is_large() => {
+                            let text: Arc<str> = doc.copy_range(0..doc.len_bytes())?.into();
+                            let declarations = lenz_content::highlight::declarations_while(doc.language()?, text, || true)?;
+                            crate::reference::qualified_name(doc, &declarations, at, relative.as_deref())
+                        }
+                        None => None,
+                    }
+                });
+                match reference {
+                    Some(name) => Effect { repaint: false, copy: Some(name), ..Effect::default() },
+                    None => self.command(Command::CopyPath { line: true }),
+                }
+            }
+            Command::GoToTest => {
+                let Some((root, rel, found)) = self.state.active().filter(|t| !t.untitled()).and_then(|t| {
+                    let project = self.state.project.as_ref()?;
+                    let rel = project.relative(&t.source)?;
+                    let paths = project.paths();
+                    Some((project.root().to_owned(), rel.clone(), crate::relevant::counterpart(&rel, paths.iter().map(|p| &**p))))
+                }) else { return Effect::default() };
+                match found {
+                    Ok(other) => self.command(Command::Open(root.join(other))),
+                    Err(why) => {
+                        let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
+                        self.state.messages.push(format!("Go to Test: {why}: {name}"));
+                        Effect { repaint: true, ..Effect::default() }
+                    }
+                }
+            }
             Command::CopyText(text) => Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() },
             Command::Notice(text) => {
                 self.state.messages.push(text);
@@ -5756,6 +5857,7 @@ impl Session {
             Command::ToggleComment => self.toggle_comment(),
             Command::MoveLines { down } => self.move_lines(down),
             Command::DuplicateLines { down } => self.duplicate_lines(down),
+            Command::DeleteLines => self.delete_lines(),
             Command::InsertText { text, kind } => self.insert_text(text, kind),
             Command::AddCursorBelow => self.add_cursor(true),
             Command::AddCursorAbove => self.add_cursor(false),
@@ -6825,6 +6927,7 @@ impl Session {
         let origin = self.state.semantics.origin(session).unwrap_or_else(|| provider.to_string());
         let limit = if ask.question() == semantics::Question::Definition { semantics::TARGET_LIMIT } else { semantics::USAGE_LIMIT };
         let asked_path = asking.at.as_ref().filter(|_| ask == Ask::FileSymbols).map(|(path, _, _)| path.clone());
+        let by_name = matches!(ask, Ask::Definition | Ask::Peek).then(|| self.ruby_by_name(session, asking.at.as_ref())).flatten();
         let fence = crate::analysis::ResultFence { slot: crate::analysis::ResultSlot::Semantic { server: session, lane: reply.lane }, project, request, stage: crate::analysis::ResultStage::Targets, result_set: None, node: None, source: asking.source.clone() };
         let semantics = &self.state.semantics;
         if self.analysis.request_result(fence.clone(), Priority::Visible, || {
@@ -6850,11 +6953,27 @@ impl Session {
                     (Ask::FileSymbols, None) => semantics::Targets { failed: vec!["the file is no longer open in the language server; ask again".into()], ..Default::default() },
                     _ => semantics::targets_while(&value, limit, encoding, provider, session, &open, &read, &|| lease.wanted()),
                 };
+                if let Some(by_name) = &by_name { by_name.add(&mut targets, limit, &read, &|| lease.wanted()); }
                 semantics::capture_target_digests(targets.found.iter_mut());
                 lease.send(Completion::Targets { request, session, provider, origin, indexing, targets });
             }
         }).is_err() { return self.result_failed(&fence, "semantic analysis capacity is full".into()); }
         Effect::default()
+    }
+
+    /// For a Ruby definition: the method name at the asked place, the project's Ruby files and the gem folders of the
+    /// bundle `session` serves (once it has listed them), for declarations its index misses (see [`ByName`]).
+    fn ruby_by_name(&self, session: u64, at: Option<&(PathBuf, usize, u64)>) -> Option<ByName> {
+        let (gems, index) = self.state.semantics.gem_roots(session)?;
+        let (path, offset, _) = at?;
+        let doc = self.state.current_source().filter(|d| d.source() == path.as_path() && d.language() == Some(lenz_content::highlight::Language::Ruby))?;
+        let line = doc.reader_line_range(doc.line_of(*offset));
+        let word = doc.word_at(*offset);
+        let text = doc.copy_range(line.start..line.end.min(line.start + 4096))?;
+        let name = crate::ruby_declarations::method_name(&text, word.start.checked_sub(line.start)?..word.end.checked_sub(line.start)?)?;
+        let project = self.state.project.as_ref().filter(|p| path.starts_with(p.root()));
+        let files = project.map(|p| p.paths().iter().filter(|r| r.ends_with(".rb")).map(|r| p.root().join(&**r)).collect()).unwrap_or_default();
+        Some(ByName { name, gems, index, files, root: project.map(|p| p.root().to_owned()) })
     }
 
     /// One server's answer to the current request arrived (or failed): the request ends with the last one.

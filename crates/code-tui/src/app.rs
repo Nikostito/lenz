@@ -1348,7 +1348,9 @@ impl App {
                 .into_iter()
                 .map(|i| {
                     let kind = &code_core::scratch::KINDS[i];
-                    Choice { label: kind.label.to_string(), detail: Some(format!(".{}", kind.extension)), section: None, disabled: None, target: ChoiceTarget::ScratchKind(i) }
+                    // Its kind's file-type icon, as the explorer shows it (when Nerd Font icons are on).
+                    let label = lenz_content::file_icons::file(&format!("scratch.{}", kind.extension)).label(self.nerd_icons(), kind.label).into_owned();
+                    Choice { label, detail: Some(format!(".{}", kind.extension)), section: None, disabled: None, target: ChoiceTarget::ScratchKind(i) }
                 })
                 .collect(),
             Prompt::Places(list) => self
@@ -2428,6 +2430,17 @@ impl App {
             KeyCode::Char('x' | 'v') if control && !other && !(key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SHIFT)) => {
                 if !self.session.text_input_enabled() { return false; }
                 self.run(if key.code == KeyCode::Char('x') { CommandId::Cut } else { CommandId::Paste }); true
+            }
+            // Cmd+Backspace, where the terminal reports Cmd (the kitty keyboard protocol), deletes the lines the
+            // selections touch, as in the GUI and IntelliJ's macOS keymap. Most macOS terminals send it as Ctrl+U
+            // instead (iTerm2's Natural Text Editing, Ghostty), so on macOS Ctrl+U in the text does the same.
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) && !control && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SHIFT) => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
+            }
+            KeyCode::Char('u') if control && !other && !key.modifiers.contains(KeyModifiers::SHIFT) && CMD_BACKSPACE_IS_CTRL_U => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
             }
             // Ctrl (where the terminal reports it with Backspace) or Alt deletes to the word stop, as IntelliJ's
             // Ctrl+Backspace / Ctrl+Delete; a Ctrl+Backspace sent as Ctrl+H or Ctrl+W stays that key's command.
@@ -3965,6 +3978,9 @@ impl App {
         }
     }
 }
+/// macOS terminals send Cmd+Backspace as Ctrl+U: there Ctrl+U in the text deletes the line, as Cmd+Backspace does.
+pub(crate) const CMD_BACKSPACE_IS_CTRL_U: bool = cfg!(target_os = "macos");
+
 /// A terminal key as the session keymap names it: its key and the modifiers that ran the binding. Terminals report
 /// shifted symbols for Shift+- = `_`, Shift+\\ = `|`, Shift+. = `>`; the keymap normalizes those itself.
 pub(crate) fn key_press(key: KeyEvent) -> Option<code_core::keymap::KeyPress> {

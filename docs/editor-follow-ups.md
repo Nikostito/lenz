@@ -1436,3 +1436,78 @@ and physical terminal behavior remain unverified.
 
 Historical ticket-67 limit, repaired during the Linux review: plain Home/End now moves the caret
 to line bounds in both adapters; document bounds and Shift selection share core motions.
+
+## Delete Line, block-aware Enter and Copy Reference (2026-11-16)
+
+- **Enter resolves the step when it adds or removes a level:** after a block opener (or Python's `return`) Enter
+  resolves `.editorconfig` to the filesystem root, as YAML's Enter after a key already did; a plain Enter does not.
+  It reads the caret's line and, on an empty line, at most 200 lines above (64 KiB of each); it never materializes
+  the document. Release timings of one Enter through the Session seam (200 samples each, 20,000-line Ruby file, this
+  Linux container, same build otherwise): a plain line 36–39 µs median before and after (47 µs in the baseline run),
+  an empty line 30–40 µs (35 µs before), after `def` 110–150 µs (19 µs before, when Enter only copied the
+  indentation); p90 after `def` 230–260 µs. A per-file cache of the resolved step would remove the difference, at the
+  cost of a changed `.editorconfig` no longer applying at once.
+- **Enter's rules are line rules, not a parse:** a block opener is recognized from its line's text (its last bracket,
+  Python's `:`, Ruby's and Lua's and shell's keywords) with the line comment and quoted brackets set aside. A string
+  that spans lines, a heredoc or a `then` on the next line is not understood; `end`, `else` and closing brackets are
+  not outdented as they are typed. Tree-sitter indentation queries would cover more but parse on every Enter.
+- **Enter's on-type formatting is Ruby LSP's only:** other servers offering `\n` (typescript-language-server, clangd,
+  rust-analyzer for doc comments) are not asked, because some reformat the line above. Lenz asks only for `\n`, not
+  Ruby LSP's `{`, `|` and `d` triggers (closing `#{` in a string, block parameters' `|`, re-indenting when `end` is
+  typed). The `end` guard reads indentation, so a block whose lines are not indented is judged by the first line
+  below at the opener's column. Verified with Ruby LSP 0.26.11 (`real_ruby_enter_closes_an_open_block_once`): without
+  the guard it adds a second `end` below a closed `def` while another block lacks its own.
+- **Copy Reference names the declaration holding the caret:** it reads the tab's extracted declarations and their
+  header text (`module Foo::Bar`, `def self.make`), so a name the caret is on but does not declare (a call) is not
+  resolved to its target; that would need a language server's definition. Ruby's `class << self` is recognized from
+  indentation (the first less-indented line above the method); Python module and Rust module paths come from the
+  project-relative path; Java and PHP prefixes from the file's `package` / `namespace` line. Right after an edit,
+  while the declarations are being re-extracted, the command copies the text once and extracts them itself (not
+  for large files, which have none).
+- **Cmd+Backspace in terminals:** only terminals that report Cmd (the kitty keyboard protocol) deliver it; macOS
+  Terminal and iTerm2's defaults turn it into Ctrl+U, which stays unbound. Ctrl+Y and the menus reach Delete Line
+  everywhere. Native macOS GUI keys were exercised on the GPUI test platform only.
+
+## Ruby LSP sync barrier, Go to Test and Ctrl+U (2026-11-17)
+
+- **Ruby LSP answered from text before an edit:** Ruby LSP 0.26.11 queues `didChange` to its worker thread but parses
+  a document on its reader thread as soon as a request about it arrives, then caches the answer under the document.
+  A request sent right behind an edit was parsed on the previous text and its answer cached under the edited one: a
+  deletion undone within a fraction of a second left the deleted text's syntax errors at the restored text's
+  offsets until the file was reopened (reported with a screenshot); completion right after a keystroke came back
+  empty. Lenz now sends a document-free request (`rubyLsp/workspace/addons`) behind each burst of text and asks
+  nothing about that text (problems, completion, symbols, hints, tokens) until it is answered, since the worker
+  answers in order. A barrier unanswered for two ticks (about 10 s) is given up on. Evidence (release, this Linux
+  container, Ruby 3.3.6, Ruby LSP 0.26.11): an undo 0–300 ms after a deletion left stale errors in several of 7 tries
+  per run before, none in 22 tries after (`real_ruby_problems_follow_an_undo_right_behind_a_deletion`); completion
+  right after a keystroke had no suggestions 16–18 times in 25 without the barrier and 0 with it, at a median of
+  7.2 ms instead of 5.9–6.2 ms (p90 35–41 ms against 26–50 ms; 20 warm samples each, two runs each). Only Ruby LSP
+  declares a barrier (`Provider::sync_barrier`); other servers were not checked for the same threading.
+- **An attempted fix that was not enough:** cancelling a pending problems request and holding newer text until it was
+  answered removed some failures but not the reader-thread race; it was replaced by the barrier.
+- **Go to Test is by name only:** the counterpart is found among inventoried files by naming convention and folder
+  similarity; RubyMine's own index also knows test-to-class links that differ in name (a controller and its request
+  spec), which this does not. Ruby LSP offers `experimental/goToRelevantFile` for that; it is not used. With several
+  equally good candidates the first by path is opened, without a chooser.
+- **Ctrl+U on macOS:** the terminal app treats Ctrl+U in the text as Cmd+Backspace on macOS only, because macOS
+  terminals send that; a user who types Ctrl+U there gets Delete Line, not readline's delete-to-line-start. Native
+  macOS terminals were not available to verify which byte each sends.
+
+## Ruby definitions by name in gems (2026-11-18)
+
+- **What Ruby LSP misses:** `perform_deliveries` is ActionMailer's `cattr_accessor` and Mail's `attr_accessor`.
+  Ruby LSP 0.26.11 answered `message.perform_deliveries` (an unknown receiver) with Mail's only, and
+  `Messenger.perform_deliveries` or a bare `perform_deliveries` in the mailer with nothing; RubyMine lists both
+  (reported with a screenshot). Lenz now adds macro declarations of the name from the bundle's gems and the project.
+- **Cost (release, this container, Ruby LSP 0.26.11, actionmailer 8.1.3.1 and its 20 dependencies, 817 gem Ruby
+  files; 7 definitions each, medians):** without the search 13.3, 2.4, 2.4 and 10.8 ms for the three
+  `perform_deliveries` calls and `message.deliver`; scanning the gems on every definition 34–36, 31–37, 25 and 33 ms;
+  with the gems' macros indexed once per session 8–10, 2.4–2.5, 2.3–2.5 and 7–9 ms, the first definition paying the
+  index (65–75 ms here). A large Rails bundle (tens of thousands of files) was not measured: its first definition will
+  read all of them once, off the UI thread. The index keeps macro-declared names only (plain `def`s are in Ruby
+  LSP's), so its memory follows the number of macro lines, not of methods; it was not measured.
+- **Limits:** by name, so every macro of the name is a candidate (RubyMine resolves the receiver); a macro whose
+  symbols continue on the next line is read on its first line only; plain gem `def`s that Ruby LSP cannot resolve
+  for a known receiver (methods mixed in through `included do`) are not added; the project's Ruby files are read on
+  each definition that needs it (a large project pays that each time). RubyMine also lists the same gem under each
+  installed Ruby; Lenz lists the bundle's only.
