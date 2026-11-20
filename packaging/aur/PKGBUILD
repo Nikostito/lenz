@@ -1,6 +1,6 @@
 # AUR package `lenz-bin`: the prebuilt release tarball. packaging/bump.sh fills in pkgver and the checksums.
 pkgname=lenz-bin
-pkgver=0.0.18
+pkgver=0.0.19
 pkgrel=1
 pkgdesc="Code editor, diff viewer, Git client and merge tool with GUI and terminal frontends"
 arch=('x86_64' 'aarch64')
@@ -14,8 +14,8 @@ conflicts=('lenz')
 options=('!debug' '!strip')
 source_x86_64=("$url/releases/download/v$pkgver/lenz-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/lenz-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
-sha256sums_x86_64=('d0bbb72f9a0b407467f3d05a46b28620955ee7b1ec68b9500158b337bc161f18')
-sha256sums_aarch64=('383cc5b981db8fd2f94b602eef2f003393ab4788d737b0220ae7764380a4877c')
+sha256sums_x86_64=('b06d66fbf373d19b7c677a3f005109decf3abeedc49e44da48f599fea4f71379')
+sha256sums_aarch64=('83278283e3d258814976f1f9f31215927440de027d63f7eec252598cf7ec30cd')
 
 package() {
   cd "lenz-$pkgver-$CARCH-unknown-linux-gnu"
