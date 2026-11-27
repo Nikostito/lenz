@@ -13,6 +13,8 @@ mod preferences;
 mod keymap;
 mod json;
 mod projects;
+mod yaml_erb;
+mod line_clipboard;
 mod vim;
 mod vim_perf;
 mod git_status;

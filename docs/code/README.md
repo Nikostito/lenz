@@ -53,7 +53,8 @@ The desktop's Open Folder… uses the system's folder chooser.
 
 Keys (the default IntelliJ keymap; see [Keymaps](#keymaps); in the macOS desktop app every Ctrl chord is pressed and
 shown with Cmd, and Alt with Option, as IntelliJ's macOS keymap does, so Format Document is ⌘⌥L): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
-all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
+all, Ctrl+C copy (with only a caret: its whole line), Ctrl+X cut (with only a caret: its whole line; a line copied or
+cut this way pastes back as a whole line above the caret's line), Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
 Ctrl+Shift+Home/End select to the file's start/end, Home goes to the first non-blank character and then the line start
 while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's;
 no word motion there yet, since Option+Left/Right is Back/Forward), Ctrl+Backspace / Ctrl+Delete delete to the word
@@ -185,6 +186,22 @@ For table and column suggestions, open **SQL dialect** from the status label, th
 Choose **Configure SQL Metadata…**: the GUI offers a file chooser for an existing DuckDB database; the terminal
 asks for its absolute path. PostgreSQL asks for an existing libpq service name. Then choose **Connect SQL Metadata**
 from the SQL menu. Choosing a source alone never connects or executes your SQL.
+
+### YAML read through ERB
+
+Rails reads several YAML files through ERB first (`config/database.yml`, `cable.yml`, `storage.yml` and others), so
+they hold tags such as `<% if ENV["CI"] %>`, `<%= ENV.fetch("DB_HOST") %>` and `<% end %>` that are not YAML. In any
+`.yml`/`.yaml` file holding ERB tags, Lenz reads the YAML around them and paints the tags as ERB: their delimiters as
+tags and their code as Ruby (all of a file's tags read together, so an `if` and the `end` in a later tag are one
+statement). The tags are not reported as YAML errors, and the structure, highlighting and folds after them stay.
+
+For that, the YAML grammar and yaml-language-server read a masked copy of the file: a tag alone on its line becomes a
+comment, a tag inside a line (`pool: <%= … %>`) a plain value of the same length, and every other character stays
+where it is, so problems, completion and hover land on the right lines and columns. A language-server edit that
+would change a tag (formatting, a quick fix, a completion) is refused whole, with the reason. Format on Save leaves
+such files as typed; Format Document still formats them where no tag is touched. `<%%` stays ERB's literal `<%`,
+and an unclosed `<%` is left as text, so its YAML error shows. Files named `*.yml.erb` are ERB templates (see Ruby
+and Rails assistance) and are not affected.
 
 ### Environment files
 

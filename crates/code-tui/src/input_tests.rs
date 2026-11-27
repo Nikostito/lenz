@@ -4792,3 +4792,24 @@ fn open_recent_project_shows_each_path_and_git_branch() {
     a.handle(Event::Paste("2.4".into()));
     assert_eq!(a.choices().len(), 1, "the branch's name finds its project");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_caret_cuts_its_line_and_a_terminal_paste_puts_it_back_as_a_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lines.txt");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let mut a = App::new(config(dir.path()), Some(path.clone()));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    draw(&mut a, 80, 16);
+    a.dispatch(Command::Select(code_core::session::Selection { anchor: 5, head: 5 }));
+    key(&mut a, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    let text = |a: &App| { let s = a.session.state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    assert_eq!(text(&a), "one\nthree\n");
+    assert_eq!(a.copy.as_deref(), Some("two\n"), "the line goes to the terminal clipboard");
+    // The terminal pastes it back (bracketed, its line break as CR) with the caret in "three".
+    a.dispatch(Command::Select(code_core::session::Selection { anchor: 6, head: 6 }));
+    a.handle(Event::Paste("two\r".into()));
+    assert_eq!(text(&a), "one\ntwo\nthree\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+}

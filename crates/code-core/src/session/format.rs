@@ -86,6 +86,10 @@ impl Session {
     fn format_on_save(&self, tab: TabId) -> bool {
         let Some(view) = self.state.view(tab) else { return false };
         if view.snapshot().language() == Some(Language::Env) { return false; }
+        // YAML that Rails reads through ERB: its server formats the masked copy, and an edit reaching a tag would be
+        // refused, leaving the file unsaved; Save writes it as typed (Format Document still offers to format it).
+        if view.snapshot().language() == Some(Language::Yaml) && !view.snapshot().is_large()
+            && view.snapshot().copy_range(0..view.snapshot().len_bytes()).is_some_and(|text| !lenz_content::highlight::yaml_erb_tags(&text).is_empty()) { return false; }
         let in_project = self.state.project.as_ref().is_some_and(|p| view.snapshot().source().starts_with(p.root()));
         in_project && self.state.project_preferences().is_some_and(|p| p.format_on_save)
     }

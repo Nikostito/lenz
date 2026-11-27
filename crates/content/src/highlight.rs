@@ -51,6 +51,17 @@ mod env;
 mod markdown;
 mod json;
 mod xml;
+mod yaml_erb;
+
+/// YAML holding ERB tags (Rails' `config/*.yml`) as a YAML language server should read it: the same text with each
+/// tag masked so it parses as YAML, every offset and character position unchanged; `None` without tags.
+pub fn yaml_erb_masked(text: &str) -> Option<String> { yaml_erb::masked(text) }
+
+/// The byte ranges of the ERB tags in YAML text (see [`yaml_erb_masked`]).
+pub fn yaml_erb_tags(text: &str) -> Vec<Range<usize>> {
+    if !text.contains("<%") { return Vec::new(); }
+    yaml_erb::tags(text).into_iter().map(|t| t.range).collect()
+}
 
 const HIGHLIGHT_CHUNK: usize = 256;
 
@@ -468,6 +479,16 @@ fn release_freed_memory() {
 }
 
 fn parse_now(lang: Language, text: &str, current: &dyn Fn() -> bool, want: Want) -> Option<Syntax> {
+    if !current() { return None; }
+    // YAML that Rails reads through ERB: its tags masked for the grammar, their Ruby highlighted as Ruby.
+    if lang == Language::Yaml && let Some(found) = yaml_erb::parse(text, current, want, |l, t, w| parse_grammar(l, t, current, w)) {
+        return found;
+    }
+    parse_grammar(lang, text, current, want)
+}
+
+/// [`parse_now`] for the text as it is.
+fn parse_grammar(lang: Language, text: &str, current: &dyn Fn() -> bool, want: Want) -> Option<Syntax> {
     if !current() { return None; }
     if lang == Language::Xml { return xml::parse(text, current, want); }
     // Environment files have no grammar, no tree and no declarations: their lexer gives the spans and folds.

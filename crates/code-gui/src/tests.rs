@@ -8241,3 +8241,25 @@ fn open_recent_project_rows_show_the_path_and_git_branch_under_the_name(cx: &mut
     let layout = f.view.read_with(&v, |v, _| v.modal_layout()).unwrap();
     assert_eq!(layout.lines.iter().filter(|(row, ..)| *row == layout.at).count(), 3);
 }
+
+/// Ctrl+X (Cmd+X on macOS) with only a caret cuts its whole line into the clipboard; Ctrl+V pastes it back as a line
+/// above the caret's line; Ctrl+C with a caret copies the line.
+#[gpui::test]
+fn a_caret_cuts_copies_and_pastes_whole_lines_through_the_keys(cx: &mut TestAppContext) {
+    let f = fixture(cx, Some(("lines.txt", b"one\ntwo\nthree\n")));
+    settle(cx, &f, |view| view.session().state().current_source().is_some());
+    f.view.update(cx, |view, cx| { view.enable_draft_input_for_test(); view.dispatch(Command::Select(code_core::session::Selection { anchor: 5, head: 5 }), cx); });
+    let text = |view: &ReaderView| { let s = view.session().state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    let mut v = visual(cx, &f);
+    draw(&mut v);
+    v.simulate_keystrokes("ctrl-x");
+    assert_eq!(f.view.read_with(&v, |view, _| text(view)), "one\nthree\n");
+    assert_eq!(v.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("two\n"));
+    f.view.update(&mut v, |view, cx| view.dispatch(Command::Select(code_core::session::Selection { anchor: 6, head: 6 }), cx));
+    v.simulate_keystrokes("ctrl-v");
+    assert_eq!(f.view.read_with(&v, |view, _| text(view)), "one\ntwo\nthree\n", "pasted above the caret's line");
+    f.view.update(&mut v, |view, cx| view.dispatch(Command::Select(code_core::session::Selection { anchor: 1, head: 1 }), cx));
+    v.simulate_keystrokes("ctrl-c");
+    assert_eq!(v.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("one\n"));
+    assert_eq!(std::fs::read(f.dir.path().join("lines.txt")).unwrap(), b"one\ntwo\nthree\n", "only the draft changed");
+}

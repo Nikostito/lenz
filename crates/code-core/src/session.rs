@@ -2903,6 +2903,8 @@ pub struct Session {
     last_close: Option<crate::close::Committed>,
     /// The window's project tabs as its host last reported them.
     pub(crate) projects_info: crate::projects::Info,
+    /// What the last caret-only Copy or Cut took: whole lines, pasted above the caret's line when pasted back.
+    pub(crate) line_clipboard: Option<String>,
     /// Shortcut labels spelled as on macOS (see [`Session::set_mac_shortcuts`]).
     mac_shortcuts: bool,
     state: State,
@@ -3164,7 +3166,7 @@ impl Session {
             text_input_enabled,
             vim_group_edit: false,
             comparison_seq: 0,
-            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs }, mac_shortcuts: false,
+            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs }, mac_shortcuts: false, line_clipboard: None,
             state: State {
                 start_selected: 0,
                 recent_branches: Default::default(),
@@ -5589,15 +5591,23 @@ impl Session {
                 let Some(view) = self.state.active().and_then(|t| self.state.view(t.id)) else { return Effect::default() };
                 let doc = view.snapshot();
                 let selections: Vec<_> = view.tab().selections().collect();
+                // Carets alone copy their whole lines (each once, with its ending), which paste back as lines.
+                if !selections.is_empty() && selections.iter().all(|s| s.range().is_empty()) {
+                    let mut lines: Vec<usize> = selections.iter().map(|s| doc.line_of(s.head)).collect();
+                    lines.sort_unstable();
+                    lines.dedup();
+                    let text: String = lines.into_iter().filter_map(|l| doc.line_with_ending(l)).filter_map(|r| doc.copy_range(r)).collect();
+                    self.line_clipboard = (!text.is_empty()).then(|| text.clone());
+                    return Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() };
+                }
+                self.line_clipboard = None;
                 // Several selections copy one per line, as Cut does; an empty one contributes nothing.
                 if selections.len() > 1 {
                     let text = selections.iter().filter(|s| !s.range().is_empty()).filter_map(|s| doc.copy_range(s.range())).collect::<Vec<_>>().join("\n");
                     return Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() };
                 }
                 let Some(s) = selections.first().copied() else { return Effect::default() };
-                // No selection: the caret's visible line with its original ending.
-                let range = if s.range().is_empty() { doc.line_with_ending(doc.line_of(s.head)).unwrap_or(0..0) } else { s.range() };
-                Effect { repaint: false, copy: (!range.is_empty()).then(|| doc.copy_range(range)).flatten(), ..Effect::default() }
+                Effect { repaint: false, copy: doc.copy_range(s.range()), ..Effect::default() }
             }
             Command::Scroll(top) => {
                 let Some(view) = self.state.active().and_then(|tab| self.state.view(tab.id())) else { return Effect::default() };
