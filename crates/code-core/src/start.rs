@@ -7,10 +7,17 @@ use crate::session::{CommandId, StartItem};
 
 /// The welcome screen's line under the application's name.
 pub const TAGLINE: &str = "Open a project folder to start, or pick up where you left off.";
-/// The welcome screen's closing tip.
-pub const TIP: &str = "Tip: open more folders as project tabs and switch with Ctrl+Alt+] / [; F10 opens the menus.";
-/// What the recent-projects dialog says it can do.
-pub const RECENT_HINT: &str = "↑↓ choose · Enter open · Ctrl+Enter open in a new project tab · type to filter · Esc close";
+/// The welcome screen's closing tip, with the project-tab keys as this keymap and platform spell them.
+pub fn tip(next: Option<&str>, previous: Option<&str>) -> String {
+    match (next, previous) {
+        (Some(next), Some(previous)) => format!("Tip: open more folders as project tabs and switch with {next} / {previous}; F10 opens the menus."),
+        _ => "Tip: open more folders as project tabs (File → Project Tabs); F10 opens the menus.".into(),
+    }
+}
+/// What the recent-projects dialog says it can do; `modifier` is the platform's primary modifier (`Ctrl`, `Cmd`).
+pub fn recent_hint(modifier: &str) -> String {
+    format!("↑↓ choose · Enter open · {modifier}+Enter open in a new project tab · type to filter · Esc close")
+}
 /// The most folders an Open Folder prompt suggests, and the most directory entries it reads to find them.
 pub const SUGGESTIONS: usize = 40;
 const READ_LIMIT: usize = 4096;
@@ -66,15 +73,34 @@ pub struct RecentProject {
     pub name: String,
     /// Where it lives, `~` for the home folder.
     pub location: String,
+    /// The git branch checked out there (`detached a1b2c3d` without one), when it is a repository and was read.
+    pub branch: Option<String>,
 }
 
-/// The recent projects whose name or path contains `query` (case-insensitive), most recent first.
-pub fn recent_projects(recent: &[PathBuf], query: &str, home: Option<&Path>) -> Vec<RecentProject> {
+/// The recent projects whose name, path or branch contains `query` (case-insensitive), most recent first.
+pub fn recent_projects(recent: &[PathBuf], query: &str, home: Option<&Path>, branch: impl Fn(&Path) -> Option<String>) -> Vec<RecentProject> {
     let query = query.trim().to_lowercase();
     recent.iter()
-        .filter(|path| query.is_empty() || tilde(path, home).to_lowercase().contains(&query))
-        .map(|path| { let (name, location) = place(path, home); RecentProject { path: path.clone(), name, location } })
+        .map(|path| { let (name, location) = place(path, home); RecentProject { path: path.clone(), name, location, branch: branch(path) } })
+        .filter(|r| query.is_empty() || tilde(&r.path, home).to_lowercase().contains(&query) || r.branch.as_ref().is_some_and(|b| b.to_lowercase().contains(&query)))
         .collect()
+}
+
+/// The git branch checked out in the repository holding `root` (or `detached` and a short commit), read from its
+/// `HEAD` file without running git: the nearest `.git` folder, or a worktree's `.git` file naming its folder.
+pub fn git_branch(root: &Path) -> Option<String> {
+    let dot = root.ancestors().take(64).map(|dir| dir.join(".git")).find(|dot| dot.exists())?;
+    let git_dir = if dot.is_file() {
+        let text = std::fs::read_to_string(&dot).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() { target } else { dot.parent()?.join(target) }
+    } else { dot };
+    let head = lenz_content::branches::head_of(&git_dir)?;
+    match (head.branch, head.sha) {
+        (Some(branch), _) => Some(branch),
+        (None, Some(sha)) => Some(format!("detached {}", sha.chars().take(7).collect::<String>())),
+        (None, None) => None,
+    }
 }
 
 /// A badge's letters for a name: the first letters of its first two words (`lenz-api` → `LA`), else its first two.
@@ -144,10 +170,34 @@ mod tests {
         assert_eq!((initials("lenz-api"), initials("notes"), initials("web_dashboard_v2"), initials("--")), ("LA".into(), "NO".into(), "WD".into(), "·".into()));
         assert_eq!(tint("lenz-api"), tint("lenz-api"), "a name keeps its colour");
         let recent = [PathBuf::from("/home/ada/code/lenz-api"), PathBuf::from("/home/ada/work/portal")];
-        let names = |q: &str| recent_projects(&recent, q, Some(home)).into_iter().map(|r| (r.name, r.location)).collect::<Vec<_>>();
+        let branch = |p: &Path| p.ends_with("portal").then(|| "feature/login".to_string());
+        let names = |q: &str| recent_projects(&recent, q, Some(home), branch).into_iter().map(|r| (r.name, r.location)).collect::<Vec<_>>();
+        assert_eq!(names("LOGIN"), [("portal".to_string(), "~/work".to_string())], "the branch matches too");
         assert_eq!(names(""), [("lenz-api".into(), "~/code".into()), ("portal".into(), "~/work".into())]);
         assert_eq!(names("WORK"), [("portal".to_string(), "~/work".to_string())], "the location matches too");
         assert!(names("nothing").is_empty());
+    }
+
+    #[test]
+    fn git_branches_come_from_head_files_of_repositories_worktrees_and_detached_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("sub/deeper")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/login\n").unwrap();
+        assert_eq!(git_branch(&repo).as_deref(), Some("feature/login"));
+        assert_eq!(git_branch(&repo.join("sub/deeper")).as_deref(), Some("feature/login"), "a folder inside a repository");
+        // A linked worktree: a `.git` file naming its folder, relative to the worktree.
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(repo.join(".git/worktrees/wt/HEAD"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+        assert_eq!(git_branch(&worktree).as_deref(), Some("detached 0123456"));
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(dir.path().ancestors().all(|a| !a.join(".git").exists()), "the fixture sits outside any repository");
+        assert_eq!(git_branch(&plain), None);
     }
 
     #[test]

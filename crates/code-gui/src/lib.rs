@@ -762,6 +762,8 @@ impl ReaderView {
         let (font, notice) = lenz_gpui::pick_mono(cx, fonts().font_family.as_deref());
         let mut view = Self { session, frame: None, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), start_hover: None, #[cfg(all(test, feature = "test-support"))] start_drawn: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
         view.layout = view.session.state().layout();
+        // macOS: Command is the primary modifier, so labels read Cmd+Opt+L where they read Ctrl+Alt+L elsewhere.
+        view.session.set_mac_shortcuts(cfg!(target_os = "macos"));
         cx.on_app_quit(|view, cx| {
             view.remember_explorer();
             view.session.dispatch(Command::SaveWorkspace);
@@ -1416,6 +1418,8 @@ impl ReaderView {
                 }
                 InterfaceAction::OpenRecent => {
                     self.modal = Some(Modal::Recent { query: String::new(), at: 0 });
+                    // The branches may have moved since they were read.
+                    self.dispatch(Command::RefreshRecentBranches, cx);
                     cx.notify();
                 }
                 InterfaceAction::FindFile => self.open_navigation(code_core::navigation::Scope::Files, cx),
@@ -4212,7 +4216,7 @@ impl ReaderView {
 
     /// The recent projects Open Recent Project lists for `query`.
     fn recent_projects(&self, query: &str) -> Vec<code_core::start::RecentProject> {
-        code_core::start::recent_projects(self.session.state().recent(), query, code_core::start::home().as_deref())
+        self.session.recent_projects(query)
     }
 
     /// Run welcome-screen row `i`: its command, or its recent project or file opened.
@@ -5288,7 +5292,6 @@ impl ReaderView {
                 self.session.menu(group).into_iter().enumerate().filter_map(|(row, r)| match r.target { MenuTarget::Run(id) => Some((row, id)), _ => None }).collect()
             }
             // Open Recent Project: each project's location, where a menu shows a shortcut.
-            Some(Modal::Recent { query, .. }) => return self.recent_projects(query).into_iter().enumerate().map(|(i, r)| (i + FINDER_HEADER_ROWS, r.location)).collect(),
             _ => Vec::new(),
         };
         ids.into_iter().filter_map(|(row, id)| self.key_hint(id).map(|key| (row, key))).collect()
@@ -5384,10 +5387,10 @@ impl ReaderView {
             return Some(ModalLayout { bounds, lines, first, visible, at, footer, heading: Some(heading), query: Some(query.clone()), body_top, shortcuts: Vec::new() });
         }
         if let Some(Modal::Recent { query, .. }) = &self.modal {
-            let footer = wrap(code_core::start::RECENT_HINT, self.columns(mw - 24.0));
+            let footer = wrap(&code_core::start::recent_hint(self.session.primary_modifier()), self.columns(mw - 24.0));
             lines.retain(|(row, ..)| *row >= FINDER_HEADER_ROWS);
             let body_top = 2.0 * line_h() + 40.0;
-            let cap = (self.height - 16.0).clamp(0.0, 480.0);
+            let cap = (self.height - 16.0).clamp(0.0, 600.0);
             let visible = (((cap - body_top - (footer.len() as f32 * line_h() + 20.0)).max(0.0) / line_h()).floor() as usize).min(lines.len());
             let start = lines.iter().position(|(i, _, _)| *i == at).unwrap_or(0);
             let end = lines.iter().rposition(|(i, _, _)| *i == at).map_or(0, |i| i + 1);
@@ -5474,10 +5477,16 @@ impl ReaderView {
                 rows
             },
             Some(Modal::Recent { query, .. }) => {
-                let mut rows = vec![(format!("› {query}"), None), (code_core::start::RECENT_HINT.to_string(), None)];
+                let mut rows = vec![(format!("› {query}"), None), (code_core::start::recent_hint(self.session.primary_modifier()), None)];
                 let found = self.recent_projects(query);
                 if found.is_empty() { rows.push((if self.session.state().recent().is_empty() { "No recent projects yet: Open Folder… adds one" } else { "No recent project matches" }.to_string(), Some("No match"))); }
-                rows.extend(found.into_iter().map(|r| (r.name, None)));
+                // Each project on three lines: its name, then (marked for their icons) its path and its git branch.
+                let home = code_core::start::home();
+                rows.extend(found.into_iter().map(|r| {
+                    let path = code_core::start::tilde(&r.path, home.as_deref());
+                    let branch = r.branch.map(|b| format!("\n{RECENT_BRANCH}{b}")).unwrap_or_default();
+                    (format!("{}\n{RECENT_PATH}{path}{branch}", r.name), None)
+                }));
                 rows
             }
             Some(Modal::Keymap { capture, .. }) => {
@@ -5973,7 +5982,7 @@ impl Render for ReaderView {
                     y += row_h;
                 }
                 y += line_h();
-                for line in wrap(code_core::start::TIP, ((w / self.char_w).floor() as usize).max(1)) {
+                for line in wrap(&self.session.welcome_tip(), ((w / self.char_w).floor() as usize).max(1)) {
                     if y + line_h() > ph { break; }
                     start.push(StartRow { kind: StartKind::Text, x, y, w, label: line, detail: String::new() });
                     y += line_h();
@@ -6087,6 +6096,7 @@ impl Render for ReaderView {
         let modal = self.modal_layout();
         let theme_chooser = matches!(self.modal, Some(Modal::Themes { .. }));
         let menu_modal = matches!(self.modal, Some(Modal::AppMenu { .. } | Modal::CommandGroup { .. }));
+        let recent_modal = matches!(self.modal, Some(Modal::Recent { .. }));
         // The context menu: its box, and per row its top, label, key, whether it can run and is highlighted.
         let doc_frame = self.doc_frame(window);
         let completion_frame = self.completion_frame(window, cx);
@@ -6686,6 +6696,20 @@ impl Render for ReaderView {
                                         let kx = mx + mw - 12.0 - lenz_content::wrap::width(key) as f32 * char_w;
                                         if lenz_content::wrap::width(key) + 3 < ((mw - 24.0) / char_w).max(0.0) as usize / 2 { lenz_gpui::text(window, cx, m, kx, y, key, palette.dim); }
                                     }
+                                    // Open Recent Project: a project's name in bold, its path and branch dim after their icons.
+                                    if recent_modal && *row != usize::MAX && !*disabled {
+                                        let first = n == 0 || l.lines[n - 1].0 != *row;
+                                        if let Some((icon, rest)) = line.strip_prefix(RECENT_PATH).map(|r| (true, r)).or_else(|| line.strip_prefix(RECENT_BRANCH).map(|r| (false, r))) {
+                                            if icon { paint_folder_icon(window, mx + 14.0, y, palette.dim); } else { paint_branch_icon(window, mx + 14.0, y, palette.dim); }
+                                            lenz_gpui::text(window, cx, m, mx + 34.0, y, rest, palette.dim);
+                                            continue;
+                                        }
+                                        if first {
+                                            let bold = Font { weight: gpui::FontWeight::BOLD, ..m.font.clone() };
+                                            lenz_gpui::text(window, cx, Metrics { font: &bold, ..m }, mx + 12.0, y, line, palette.fg);
+                                            continue;
+                                        }
+                                    }
                                     let section = details_modal && line.split_once(':').is_some_and(|(label, _)| label.len() <= 40 && !label.contains('/') && !label.contains('`'));
                                     let heading = Font { weight: gpui::FontWeight::BOLD, ..m.font.clone() };
                                     lenz_gpui::text(window, cx, if section { Metrics { font: &heading, ..m } } else { m }, mx + 12.0, y, line, if *row == usize::MAX { palette.readable_on(palette.dim, bg) } else if *disabled { palette.dim } else if theme_chooser && *row < THEME_HEADER_ROWS { palette.accent } else { palette.fg });
@@ -6910,6 +6934,29 @@ fn native_x(window: &Window, metrics: Metrics<'_>, row: &TextRow, parts: &[(std:
     debug_assert!(text.len() <= 6144);
     let run = gpui::TextRun { len: text.len(), font: metrics.font.clone(), color: gpui::Hsla::default(), background_color: None, underline: None, strikethrough: None };
     origin + f32::from(window.text_system().shape_line(text.to_owned().into(), px(metrics.font_size), &[run], None).x_for_index(at - range.start))
+}
+
+/// Open Recent Project's line markers: a project's path line and its git branch line, painted after their icons.
+const RECENT_PATH: char = '\u{E000}';
+const RECENT_BRANCH: char = '\u{E001}';
+
+/// A small folder outline in a text line at (`x`, `y`): a tab over a rounded body.
+fn paint_folder_icon(window: &mut Window, x: f32, y: f32, color: u32) {
+    let top = y + (line_h() - 11.0) / 2.0;
+    window.paint_quad(gpui::fill(Bounds { origin: gpui::point(px(x), px(top)), size: gpui::size(px(6.0), px(3.0)) }, rgb(color)).corner_radii(px(1.0)));
+    window.paint_quad(gpui::outline(Bounds { origin: gpui::point(px(x), px(top + 2.0)), size: gpui::size(px(14.0), px(9.0)) }, rgb(color), gpui::BorderStyle::Solid).corner_radii(px(2.0)));
+}
+
+/// A small git-branch mark in a text line at (`x`, `y`): a trunk between two commits, and a branch joining it.
+fn paint_branch_icon(window: &mut Window, x: f32, y: f32, color: u32) {
+    let top = y + (line_h() - 13.0) / 2.0;
+    let dot = |window: &mut Window, cx: f32, cy: f32| window.paint_quad(gpui::fill(Bounds { origin: gpui::point(px(cx - 2.0), px(cy - 2.0)), size: gpui::size(px(4.0), px(4.0)) }, rgb(color)).corner_radii(px(2.0)));
+    dot(window, x + 3.0, top + 2.0);
+    dot(window, x + 3.0, top + 11.0);
+    dot(window, x + 11.0, top + 3.0);
+    lenz_gpui::fill(window, x + 2.5, top + 2.0, 1.0, 9.0, color);
+    lenz_gpui::fill(window, x + 10.5, top + 3.0, 1.0, 4.0, color);
+    lenz_gpui::fill(window, x + 3.0, top + 7.0, 8.0, 1.0, color);
 }
 
 /// What a welcome-screen row is.

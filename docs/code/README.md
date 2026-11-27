@@ -40,14 +40,19 @@ projects** and **Recent files**, each with a coloured badge of its initials, its
 your home folder, shortened from the left when narrow), and a tip. A click, or ↑/↓ and Enter, runs the command or
 opens the project or file ([terminal](tui.md)).
 
-**Open Recent Folder…** shows **Open Recent Project**: each project's name with its location, filtered as you type (by
-name or location). Enter opens it in this project tab; **Ctrl+Enter** opens it in a new [project tab](#project-tabs).
+**Open Recent Folder…** shows **Open Recent Project**: each project's name, then its path after a folder icon and,
+for a git repository, its checked-out branch after a branch icon (`detached` and the commit when no branch is checked
+out). The branches are read from each repository's `HEAD` file off the UI thread when the window opens, when the recent
+list changes and each time the dialog opens; git itself is not run. Typing filters by name, path or branch. Enter opens
+the project in this project tab; **Ctrl+Enter** (Cmd+Enter on macOS) opens it in a new [project tab](#project-tabs).
+The terminal shows the same on one line per project (`name  ⌂ ~/code/app  ⎇ main`, or Nerd Font folder and branch icons with File Icons on).
 In the terminal, **Open Folder…** and **Open Folder in New Project Tab…** list the recent projects until you type, then
 the folders the typed path names (`~/` and relative paths work; hidden folders once a `.` is typed): ↑/↓ choose, Tab
 completes the chosen folder into the path, Enter opens the chosen folder, and Ctrl+Enter opens it in a new project tab.
 The desktop's Open Folder… uses the system's folder chooser.
 
-Keys (the default IntelliJ keymap; see [Keymaps](#keymaps)): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
+Keys (the default IntelliJ keymap; see [Keymaps](#keymaps); in the macOS desktop app every Ctrl chord is pressed and
+shown with Cmd, and Alt with Option, as IntelliJ's macOS keymap does, so Format Document is ⌘⌥L): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
 all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
 Ctrl+Shift+Home/End select to the file's start/end, Home goes to the first non-blank character and then the line start
 while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's;
@@ -140,7 +145,7 @@ restored after a restart; each project restores its own tabs and places as a sin
 
 ### Formatting JSON and XML
 
-**Format Document** (Ctrl+Alt+L; VS Code keymap Alt+Shift+F) formats JSON and XML offline using the file's resolved
+**Format Document** (Ctrl+Alt+L, **Cmd+Opt+L** on macOS; VS Code keymap Alt+Shift+F) formats JSON and XML offline using the file's resolved
 indentation, without a server or external tool:
 
 - **JSON** changes only whitespace: key order, duplicate keys, numeric spellings, string escapes, line-ending choices

@@ -4744,7 +4744,7 @@ fn open_recent_filters_and_open_folder_suggests_completes_and_opens_through_the_
     // Open Recent Project: a name with where it lives; typing filters by name or location; Ctrl+Enter asks for a new
     // project tab on the choice instead of replacing this one.
     a.run(CommandId::OpenRecent);
-    assert_eq!(a.choices().iter().map(|c| (c.label.as_str(), c.detail.as_deref().unwrap_or_default().starts_with("recent · "))).collect::<Vec<_>>(), [("lenz-api", true), ("billing", true)]);
+    assert_eq!(a.choices().iter().map(|c| (c.label.as_str(), c.detail.as_deref().unwrap_or_default().contains(&code.display().to_string()))).collect::<Vec<_>>(), [("lenz-api", true), ("billing", true)]);
     a.handle(Event::Paste("bill".into()));
     assert_eq!(a.choices().iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["billing"]);
     key(&mut a, KeyCode::Enter, KeyModifiers::CONTROL);
@@ -4769,4 +4769,26 @@ fn open_recent_filters_and_open_folder_suggests_completes_and_opens_through_the_
     assert!(a.choices().is_empty());
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(a.modal.as_ref().and_then(|m| m.error.as_deref()), Some("Enter an existing file or folder path"));
+}
+
+#[test]
+fn open_recent_project_shows_each_path_and_git_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("code/repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/release/2.4\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(dir.path().join("state/recent.json"), serde_json::to_string(&[&repo]).unwrap()).unwrap();
+    let mut a = App::with_text_input(config(dir.path()), None, false);
+    a.icons_override = Some(false);
+    draw(&mut a, 100, 24);
+    a.run(CommandId::OpenRecent);
+    settle(&mut a, |a| a.choices().first().and_then(|c| c.detail.as_deref()).is_some_and(|d| d.contains("release/2.4")));
+    let choice = a.choices().remove(0);
+    assert_eq!(choice.label, "repo");
+    assert_eq!(choice.detail.as_deref(), Some(format!("⌂ {}  ⎇ release/2.4", repo.display()).as_str()));
+    let screen = draw_screen(&mut a, 100, 24);
+    assert!(screen.contains("⎇ release/2.4"), "drawn in the prompt");
+    a.handle(Event::Paste("2.4".into()));
+    assert_eq!(a.choices().len(), 1, "the branch's name finds its project");
 }

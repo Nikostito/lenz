@@ -1812,6 +1812,7 @@ impl App {
                 let counter = find.counter();
                 if counter.is_empty() { hint.to_owned() } else { format!("{counter} · {hint}") }
             });
+            let recent_hint = code_core::start::recent_hint(self.session.primary_modifier());
             let footer = modal
                 .error
                 .as_deref()
@@ -1833,7 +1834,7 @@ impl App {
                 } else if matches!(modal.kind, Prompt::Menu(Some(_))) {
                     "Enter runs · ← back · Esc closes"
                 } else if modal.kind == Prompt::RecentRoots {
-                    code_core::start::RECENT_HINT
+                    recent_hint.as_str()
                 } else if matches!(modal.kind, Prompt::OpenFolder | Prompt::OpenFolderInProjectTab) {
                     "Enter open · Tab complete · Ctrl+Enter new project tab · ↑↓ choose · Esc close"
                 } else {
@@ -2007,7 +2008,7 @@ fn draw_start(frame: &mut ratatui::Frame, app: &App, items: &[StartItem], geomet
         y = y.saturating_add(1);
     }
     y = y.saturating_add(1);
-    for line in wrap(code_core::start::TIP, w as usize, usize::MAX) {
+    for line in wrap(&app.session.welcome_tip(), w as usize, usize::MAX) {
         if y >= bottom { break; }
         put(buf, y, x, &line, w, style(p.dim, p.bg));
         y = y.saturating_add(1);

@@ -888,7 +888,11 @@ impl App {
                     Err(why) => return self.dispatch(Command::Notice(why.into())),
                 }
             }
-            InterfaceAction::OpenRecent => Prompt::RecentRoots,
+            InterfaceAction::OpenRecent => {
+                // The branches may have moved since they were read.
+                self.dispatch(Command::RefreshRecentBranches);
+                Prompt::RecentRoots
+            }
             InterfaceAction::FindFile => return self.open_navigation(Scope::Files),
             InterfaceAction::SearchEverywhere => return self.open_navigation(Scope::All),
             InterfaceAction::FindSymbol => return self.open_navigation(Scope::Symbols),
@@ -2472,9 +2476,17 @@ impl App {
 
     /// The recent projects whose name or location holds `query`, as choices: the name, then where it lives.
     fn recent_choices(&self, query: &str) -> Vec<Choice> {
-        code_core::start::recent_projects(self.session.state().recent(), query, code_core::start::home().as_deref())
+        // The folder and branch marks: Nerd Font glyphs with file icons on, else the plain marks Lenz uses elsewhere
+        // (`⎇` as in the branch selector).
+        let (folder, branch) = if self.nerd_icons() { ("\u{f07b}", "\u{e725}") } else { ("⌂", "⎇") };
+        let home = code_core::start::home();
+        self.session.recent_projects(query)
             .into_iter()
-            .map(|r| Choice { label: r.name, detail: Some(format!("recent · {}", r.location)), disabled: None, target: ChoiceTarget::Path(r.path) })
+            .map(|r| {
+                let path = code_core::start::tilde(&r.path, home.as_deref());
+                let detail = match r.branch { Some(b) => format!("{folder} {path}  {branch} {b}"), None => format!("{folder} {path}") };
+                Choice { label: r.name, detail: Some(detail), disabled: None, target: ChoiceTarget::Path(r.path) }
+            })
             .collect()
     }
 

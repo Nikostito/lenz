@@ -1718,10 +1718,10 @@ fn folders_open_through_the_command_menu_recent_list_and_narrow_windows(cx: &mut
     let recent_at = menu.iter().position(|(text,_)| text == CommandId::OpenRecent.label()).unwrap();
     for _ in 0..recent_at { v.simulate_keystrokes("down"); }
     v.simulate_keystrokes("enter");
-    let (recent, locations) = f.view.read_with(&v, |v, _| (v.modal_rows(), v.modal_shortcuts()));
+    let recent = f.view.read_with(&v, |v, _| v.modal_rows());
     let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
-    assert_eq!(recent[FINDER_HEADER_ROWS..].iter().map(|r| r.0.clone()).collect::<Vec<_>>(), [name(&root), name(&missing)]);
-    assert_eq!(locations.len(), 2, "each with where it lives");
+    assert_eq!(recent[FINDER_HEADER_ROWS..].iter().map(|r| r.0.lines().next().unwrap_or_default().to_owned()).collect::<Vec<_>>(), [name(&root), name(&missing)]);
+    assert!(recent[FINDER_HEADER_ROWS..].iter().zip([&root, &missing]).all(|(r, p)| r.0.contains(&p.display().to_string())), "each with its path");
     v.simulate_keystrokes("escape");
     choose_menu_command(&mut v,&f,CommandId::FindFile);
     assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::Navigation { .. })), "Find File from the menu");
@@ -4916,9 +4916,9 @@ fn clicks_pick_rows_in_the_command_menu_recent_folders_and_theme_chooser(cx: &mu
     assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::Recent { at: 0, .. })));
     // Recent projects, newest first, after the filter and hint rows: each name with where it lives; a click on the
     // older one opens it.
-    let (rows, locations) = f.view.read_with(&v, |v, _| (v.modal_rows(), v.modal_shortcuts()));
-    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["proj", "proj"]);
-    assert!(locations.iter().any(|(row, at)| *row == FINDER_HEADER_ROWS + 1 && at.ends_with("one")), "{locations:?}");
+    let rows = f.view.read_with(&v, |v, _| v.modal_rows());
+    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.lines().next().unwrap_or_default()).collect::<Vec<_>>(), ["proj", "proj"]);
+    assert!(rows[FINDER_HEADER_ROWS + 1].0.lines().nth(1).is_some_and(|path| path.ends_with("one/proj")), "the project's path on its second line: {rows:?}");
     click_modal_row(&f, &mut v, FINDER_HEADER_ROWS + 1);
     assert!(f.view.read_with(&v, |v, _| v.modal.is_none()));
     drop(v);
@@ -8197,8 +8197,8 @@ fn the_welcome_screen_and_open_recent_project_work_through_the_keys(cx: &mut Tes
     let rows = fresh.read_with(&v, |view, _| view.modal_rows());
     assert_eq!(rows[0].0, "› alp");
     // The fixture's projects are both named `proj`: "alp" matches the one living under alpha by its location.
-    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["proj"]);
-    assert!(fresh.read_with(&v, |view, _| view.modal_shortcuts()).iter().any(|(_, at)| at.ends_with("alpha")));
+    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.lines().next().unwrap_or_default()).collect::<Vec<_>>(), ["proj"]);
+    assert!(rows[FINDER_HEADER_ROWS].0.contains("alpha/proj"));
     draw(&mut v);
     v.simulate_keystrokes("ctrl-enter");
     cx.run_until_parked();
@@ -8208,4 +8208,36 @@ fn the_welcome_screen_and_open_recent_project_work_through_the_keys(cx: &mut Tes
     for _ in 0..500 { cx.run_until_parked(); third.update(cx, |view, cx| view.poll(cx)); if third.read_with(cx, |view, _| view.session().state().project().is_some()) { break; } std::thread::sleep(std::time::Duration::from_millis(5)); }
     assert_eq!(third.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(one));
     assert_eq!(fresh.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(two), "the other tab keeps its project");
+}
+
+/// Open Recent Project shows each project's name, then its path and its git branch on lines of their own (painted
+/// after a folder and a branch icon); typing a branch's name finds its project.
+#[gpui::test]
+fn open_recent_project_rows_show_the_path_and_git_branch_under_the_name(cx: &mut TestAppContext) {
+    let f = fixture(cx, None);
+    let repo = project(&f.dir.path().join("repo"), &["a.rs"]);
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/invoice-pdf\n").unwrap();
+    let plain = project(&f.dir.path().join("plain"), &["b.rs"]);
+    for root in [&repo, &plain] {
+        f.view.update(cx, |v, cx| v.open_root(root.clone(), cx));
+        settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root() == root.as_path()));
+    }
+    let mut v = visual(cx, &f);
+    v.update(|window, cx| f.view.update(cx, |view, cx| view.run(CommandId::OpenRecent, window, cx)));
+    drop(v);
+    settle(cx, &f, |v| v.modal_rows().iter().any(|r| r.0.contains("feature/invoice-pdf")));
+    let rows = f.view.read_with(cx, |v, _| v.modal_rows());
+    let lines = |i: usize| rows[FINDER_HEADER_ROWS + i].0.lines().map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(lines(0), ["proj".to_string(), format!("{RECENT_PATH}{}", plain.display())], "no repository: no branch line");
+    assert_eq!(lines(1), ["proj".to_string(), format!("{RECENT_PATH}{}", repo.display()), format!("{RECENT_BRANCH}feature/invoice-pdf")]);
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(900.0), px(700.0)));
+    v.simulate_input("invoice");
+    draw(&mut v);
+    let rows = f.view.read_with(&v, |v, _| v.modal_rows());
+    assert_eq!(rows.len(), FINDER_HEADER_ROWS + 1, "the branch's name finds its project");
+    // Three lines a row, all of them the highlighted row's.
+    let layout = f.view.read_with(&v, |v, _| v.modal_layout()).unwrap();
+    assert_eq!(layout.lines.iter().filter(|(row, ..)| *row == layout.at).count(), 3);
 }

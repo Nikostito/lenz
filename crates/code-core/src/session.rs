@@ -495,6 +495,8 @@ pub enum Command {
     Format(FormatKind),
     /// Move the start screen's keyboard selection to the next (or previous) item, wrapping.
     StepStart { forward: bool },
+    /// Read the recent projects' git branches again (Open Recent Project is about to show them).
+    RefreshRecentBranches,
     /// Save without the project's format-on-save.
     SaveWithoutFormatting { tab: TabId },
     /// Move the popup's selection by rows (wrapping), or to a row.
@@ -1536,6 +1538,8 @@ pub struct Action {
 
 /// Results of background work, applied through [`Session::dispatch`].
 pub enum Completion {
+    /// The recent projects' git branches, read off the UI thread.
+    RecentBranches(Vec<(PathBuf, Option<String>)>),
     TerminalStarted { id: crate::terminal::Id, generation: u64, result: Result<crate::terminal::Process, String> },
     TerminalWake { id: crate::terminal::Id, generation: u64 },
     ExplorerCopied { request: u64, result: Result<(), String> },
@@ -1691,6 +1695,7 @@ impl Input {
             Input::Command(_) => "command",
             Input::Completion(c) => match c {
                 Completion::TerminalStarted { .. } | Completion::TerminalWake { .. } => "terminal",
+                Completion::RecentBranches(_) => "recent branches",
                 Completion::ExplorerCopied { .. } => "explorer copy",
                 Completion::FileClipboard { .. } => "file clipboard",
                 Completion::ClipboardTextReady { .. } => "text clipboard",
@@ -1785,6 +1790,8 @@ pub struct Effect {
 pub struct State {
     /// The start screen's keyboard selection (see [`State::start_selected`]).
     start_selected: usize,
+    /// The git branch of each recent project, as last read off the UI thread.
+    recent_branches: std::collections::HashMap<PathBuf, String>,
     terminal: crate::terminal::State,
     presentation: Option<Box<presentation::Presentation>>,
     comparison: Option<SavedComparison>,
@@ -2896,6 +2903,8 @@ pub struct Session {
     last_close: Option<crate::close::Committed>,
     /// The window's project tabs as its host last reported them.
     pub(crate) projects_info: crate::projects::Info,
+    /// Shortcut labels spelled as on macOS (see [`Session::set_mac_shortcuts`]).
+    mac_shortcuts: bool,
     state: State,
     cache: InactiveCache,
     index_cache_dir: PathBuf,
@@ -3150,14 +3159,15 @@ impl Session {
         // Recovered drafts live in the reader's own cache, outside every checkout.
         let recovery_dir = config.cache.join("recovery");
         let recovery = crate::recovery::Recovery::open(recovery_dir.clone());
-        Self {
+        let mut session = Self {
             terminals: terminal_work::Terminals::default(),
             text_input_enabled,
             vim_group_edit: false,
             comparison_seq: 0,
-            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs },
+            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs }, mac_shortcuts: false,
             state: State {
                 start_selected: 0,
+                recent_branches: Default::default(),
                 terminal: crate::terminal::State::default(),
                 presentation: None,
                 comparison: None,
@@ -3341,7 +3351,10 @@ impl Session {
             markers_debounce,
             tx,
             rx,
-        }
+        };
+        // The welcome screen and Open Recent Project show each recent project's branch: read off the UI thread.
+        session.refresh_recent_branches();
+        session
     }
 
     pub fn state(&self) -> &State {
@@ -5711,6 +5724,7 @@ impl Session {
             Command::CheckProjectSyntax => self.check_project_syntax(),
             Command::CancelProjectSyntax => self.cancel_project_syntax("Cancelled"),
             Command::Format(kind) => match self.state.active { Some(tab) => self.format_document(tab, kind, false), None => Effect::default() },
+            Command::RefreshRecentBranches => { self.refresh_recent_branches(); Effect::default() }
             Command::StepStart { forward } => {
                 let count = self.state.start_items().len();
                 if count == 0 { return Effect::default(); }
@@ -6789,6 +6803,15 @@ impl Session {
                 Effect { repaint: true, copy: None, ..Effect::default() }
             }
             Completion::ProjectFormatted { request, result } => self.project_formatted(request, result),
+            Completion::RecentBranches(found) => {
+                for (root, branch) in found {
+                    match branch { Some(b) => { self.state.recent_branches.insert(root, b); } None => { self.state.recent_branches.remove(&root); } }
+                }
+                // Only the roots still recent are kept.
+                let recent = &self.state.recent;
+                self.state.recent_branches.retain(|root, _| recent.contains(root));
+                Effect { repaint: true, ..Effect::default() }
+            }
             Completion::Sql(reply) => self.sql_reply(*reply),
             Completion::SqlMetadata { request, result } => self.sql_metadata_reply(request, result),
             Completion::ServerRuntimeSaved { request, kind, result } => {
@@ -8728,6 +8751,7 @@ impl Session {
         self.state.recent.retain(|r| *r != root);
         self.state.recent.insert(0, root.clone());
         self.state.recent.truncate(RECENT_ROOTS);
+        self.refresh_recent_branches();
         let (latest, tx) = (self.root_generation.clone(), self.tx.clone());
         let (recent, file) = (self.state.recent.clone(), self.recent_file.clone());
         self.recent_seq += 1;
@@ -9845,7 +9869,36 @@ impl Session {
 
     /// The keys a menu shows for `id`: its keymap chords, or the fixed editing key adapters map as text input.
     pub fn key_hint(&self, id: CommandId) -> Option<String> {
-        self.keymap.hint(id).or_else(|| id.input_hint().map(str::to_owned))
+        let hint = self.keymap.hint(id).or_else(|| id.input_hint().map(str::to_owned))?;
+        Some(if self.mac_shortcuts { keymap::mac_spelling(&hint) } else { hint })
+    }
+
+    /// Spell shortcut labels as macOS does (`Cmd+Opt+L`): the desktop adapter on macOS, where the Command key is the
+    /// primary modifier. Terminals keep `Ctrl`: they receive Control, never Command.
+    pub fn set_mac_shortcuts(&mut self, on: bool) { self.mac_shortcuts = on; }
+
+    /// The platform's primary modifier as labels spell it.
+    pub fn primary_modifier(&self) -> &'static str { if self.mac_shortcuts { "Cmd" } else { "Ctrl" } }
+
+    /// The welcome screen's tip, with the project-tab keys as this keymap and platform spell them.
+    pub fn welcome_tip(&self) -> String {
+        crate::start::tip(self.key_hint(CommandId::NextProjectTab).as_deref(), self.key_hint(CommandId::PreviousProjectTab).as_deref())
+    }
+
+    /// The recent projects Open Recent Project lists for `query`, with the branches last read for them.
+    pub fn recent_projects(&self, query: &str) -> Vec<crate::start::RecentProject> {
+        let branches = &self.state.recent_branches;
+        crate::start::recent_projects(&self.state.recent, query, crate::start::home().as_deref(), |p| branches.get(p).cloned())
+    }
+
+    /// Read the recent projects' git branches off the UI thread (they arrive as [`Completion::RecentBranches`]).
+    pub(crate) fn refresh_recent_branches(&mut self) {
+        let (roots, tx) = (self.state.recent.clone(), self.tx.clone());
+        if roots.is_empty() { return; }
+        self.jobs.submit(Priority::Background, move || {
+            let found = roots.into_iter().map(|root| { let branch = crate::start::git_branch(&root); (root, branch) }).collect();
+            let _ = tx.send_blocking(Completion::RecentBranches(found));
+        });
     }
 
     /// The command this key press runs under the current keymap, if any.
