@@ -840,11 +840,11 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents(cx: &mut TestAppC
     v.simulate_resize(size(px(900.0), px(600.0)));
     draw(&mut v);
     let hits = f.view.read_with(&v, |v, _| v.start_hits.clone());
-    assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [0, 1, 2, 3, 4], "Open Folder…, Open File…, New File, the recent project and file");
+    assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5], "Open Folder…, Open Folder in New Project Tab…, Open File…, New File, the recent project and file");
     assert!(hits.windows(2).all(|w| w[0].0.origin.y < w[1].0.origin.y), "one row each, top to bottom");
     // The welcome screen as painted: the name, the rows' labels and where the recent places live.
     let rows = f.view.read_with(&v, |v, _| v.start_rows());
-    for shown in ["Lenz Code", "Open Folder…", "Open File…", "New File", "Recent projects", "proj", "Recent files", "lone.txt"] {
+    for shown in ["Lenz Code", "Open Folder…", "Open Folder in New Project Tab…", "Open File…", "New File", "Recent projects", "proj", "Recent files", "lone.txt"] {
         assert!(rows.iter().any(|r| r.label == shown), "{shown} on the welcome screen: {rows:?}");
     }
     assert!(rows.iter().any(|r| r.label == "Open File…" && r.detail == "Ctrl+O"), "a command shows its shortcut");
@@ -859,11 +859,17 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents(cx: &mut TestAppC
     v.simulate_click(hits[1].0.center(), Modifiers::default());
     assert!(cx.did_prompt_for_paths());
     cx.simulate_path_prompt_response(|options| {
+        assert!(options.directories && !options.files, "a folder for a new project tab");
+        None
+    });
+    v.simulate_click(hits[2].0.center(), Modifiers::default());
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|options| {
         assert!(options.files && !options.directories);
         None
     });
     // A recent file opens; closing it returns to the start screen.
-    v.simulate_click(hits[4].0.center(), Modifiers::default());
+    v.simulate_click(hits[5].0.center(), Modifiers::default());
     drop(v);
     settle(cx, &f, active_is("lone.txt"));
     let mut v = visual(cx, &f);
@@ -871,9 +877,9 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents(cx: &mut TestAppC
     assert!(f.view.read_with(&v, |v, _| v.start_hits.is_empty()));
     v.simulate_keystrokes("ctrl-f4");
     draw(&mut v);
-    assert_eq!(f.view.read_with(&v, |v, _| v.start_hits.len()), 5);
+    assert_eq!(f.view.read_with(&v, |v, _| v.start_hits.len()), 6);
     // A recent folder opens, and the start screen gives way to it.
-    v.simulate_click(hits[3].0.center(), Modifiers::default());
+    v.simulate_click(hits[4].0.center(), Modifiers::default());
     settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root() == one));
     draw(&mut v);
     assert!(f.view.read_with(&v, |v, _| v.start_hits.is_empty()));
@@ -4920,6 +4926,9 @@ fn clicks_pick_rows_in_the_command_menu_recent_folders_and_theme_chooser(cx: &mu
     assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.lines().next().unwrap_or_default()).collect::<Vec<_>>(), ["proj", "proj"]);
     assert!(rows[FINDER_HEADER_ROWS + 1].0.lines().nth(1).is_some_and(|path| path.ends_with("one/proj")), "the project's path on its second line: {rows:?}");
     click_modal_row(&f, &mut v, FINDER_HEADER_ROWS + 1);
+    // Another project is open here: asked where; This Tab (Enter) opens it in its place.
+    assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::StatusDetails { kind: Details::OpenProject, .. })));
+    v.simulate_keystrokes("enter");
     assert!(f.view.read_with(&v, |v, _| v.modal.is_none()));
     drop(v);
     settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root().ends_with("one/proj")));
@@ -8179,11 +8188,11 @@ fn the_welcome_screen_and_open_recent_project_work_through_the_keys(cx: &mut Tes
     let fresh = host.update(&mut v, |h, _, _| h.views()[1].clone()).unwrap();
     // The welcome screen: commands, then recent projects with their initials; each row a click target.
     let items = fresh.read_with(&v, |view, _| view.session().state().start_items());
-    assert_eq!(items[..3], [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument)]);
+    assert_eq!(items[..4], [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::OpenFolderInProjectTab), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument)]);
     assert_eq!(fresh.read_with(&v, |view, _| view.start_hits.len()), items.len());
-    // Down three times reaches the first recent project; Enter opens it in this tab.
-    v.simulate_keystrokes("down down down");
-    assert_eq!(fresh.read_with(&v, |view, _| view.session().state().start_selected()), 3);
+    // Down four times reaches the first recent project; Enter opens it in this (empty) tab, without asking.
+    v.simulate_keystrokes("down down down down");
+    assert_eq!(fresh.read_with(&v, |view, _| view.session().state().start_selected()), 4);
     v.simulate_keystrokes("enter");
     for _ in 0..500 { cx.run_until_parked(); fresh.update(cx, |view, cx| view.poll(cx)); if fresh.read_with(cx, |view, _| view.session().state().project().is_some()) { break; } std::thread::sleep(std::time::Duration::from_millis(5)); }
     assert_eq!(fresh.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(two.clone()), "the newest recent project");
@@ -8262,4 +8271,47 @@ fn a_caret_cuts_copies_and_pastes_whole_lines_through_the_keys(cx: &mut TestAppC
     v.simulate_keystrokes("ctrl-c");
     assert_eq!(v.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("one\n"));
     assert_eq!(std::fs::read(f.dir.path().join("lines.txt")).unwrap(), b"one\ntwo\nthree\n", "only the draft changed");
+}
+
+/// Choosing a recent project while this tab has another open asks where: Escape keeps things as they are, New
+/// Project Tab (its key) opens it beside this one through the window's project host.
+#[gpui::test]
+fn choosing_a_recent_project_with_one_open_asks_this_tab_or_a_new_project_tab(cx: &mut TestAppContext) {
+    let f = fixture_setup(cx, None, &[], true);
+    let alpha = project(&f.dir.path().join("alpha"), &["a.rs"]);
+    let beta = project(&f.dir.path().join("beta"), &["b.rs"]);
+    for root in [&beta, &alpha] {
+        f.view.update(cx, |v, cx| v.open_root(root.clone(), cx));
+        settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root() == root.as_path()));
+    }
+    let host = f.window.downcast::<ProjectsWindow>().unwrap();
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(1000.0), px(700.0)));
+    let choose = |v: &mut VisualTestContext| {
+        v.update(|window, cx| f.view.update(cx, |view, cx| view.run(CommandId::OpenRecent, window, cx)));
+        v.simulate_input("beta");
+        v.simulate_keystrokes("enter");
+        draw(v);
+    };
+    choose(&mut v);
+    let text = f.view.read_with(&v, |view, _| match &view.modal { Some(Modal::StatusDetails { kind: Details::OpenProject, text, .. }) => text.clone(), other => panic!("{other:?}") });
+    assert!(text.contains("This project tab has proj open"), "{text}");
+    assert_eq!(f.view.read_with(&v, |view, _| view.details_labels(Details::OpenProject)), ["This Tab", "New Project Tab", "Cancel"]);
+    v.simulate_keystrokes("escape");
+    assert!(f.view.read_with(&v, |view, _| view.modal.is_none()));
+    assert_eq!(f.view.read_with(&v, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(alpha.clone()));
+    // New Project Tab: its key (n) asks the host, which opens beta in a second project tab with the keys.
+    choose(&mut v);
+    v.simulate_keystrokes("n");
+    cx.run_until_parked();
+    let (count, active) = host.update(cx, |h, _, _| (h.views().len(), h.projects().active())).unwrap();
+    assert_eq!((count, active), (2, 1));
+    let second = host.update(cx, |h, _, _| h.views()[1].clone()).unwrap();
+    settle_view(cx, &second, |v| v.session().state().project().is_some_and(|p| p.root() == beta.as_path()));
+    assert_eq!(f.view.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(alpha), "this tab keeps its project");
+    // The strip names each project with where it is.
+    let mut v = VisualTestContext::from_window(f.window, cx);
+    draw(&mut v);
+    assert!(v.debug_bounds("project-tab-0").is_some() && v.debug_bounds("project-tab-1").is_some());
+    assert!(second.read_with(&v, |view, _| view.session().project_place()).ends_with("beta/proj"));
 }

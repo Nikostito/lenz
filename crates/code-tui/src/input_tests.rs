@@ -3312,33 +3312,36 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents() {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
     terminal.draw(|f| a.draw(f)).unwrap();
     let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-    for shown in ["Lenz Code", "Open Folder…", "Open File…", "Ctrl+O", "New File", "Ctrl+N", "Recent projects", "proj", "Recent files", "lone.txt", "Tip:"] {
+    for shown in ["Lenz Code", "Open Folder…", "Open Folder in New Project Tab…", "Open File…", "Ctrl+O", "New File", "Ctrl+N", "Recent projects", "proj", "Recent files", "lone.txt", "Tip:"] {
         assert!(screen.contains(shown), "{shown} on the start screen");
     }
     assert!(screen.contains(&dir.path().display().to_string()), "where each recent place lives");
     let start = a.layout.panes[0].start.clone();
-    assert_eq!(start.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
-    // Open Folder… and Open File… ask for a path; a recent folder opens.
+    assert_eq!(start.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+    // Open Folder…, Open Folder in New Project Tab… and Open File… ask for a path; a recent folder opens.
     click(&mut a, start[0].1.x, start[0].1.y);
     assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::OpenFolder);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     click(&mut a, start[1].1.x, start[1].1.y);
+    assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::OpenFolderInProjectTab);
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    click(&mut a, start[2].1.x, start[2].1.y);
     assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::Open);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     // A recent file opens; closing it returns to the start screen.
-    click(&mut a, start[4].1.x, start[4].1.y);
+    click(&mut a, start[5].1.x, start[5].1.y);
     settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.source() == lone && t.loaded()));
     draw(&mut a, 100, 24);
     assert!(a.layout.panes[0].start.is_empty());
     key(&mut a, KeyCode::F(4), KeyModifiers::CONTROL);
     draw(&mut a, 100, 24);
-    assert_eq!(a.layout.panes[0].start.len(), 5);
+    assert_eq!(a.layout.panes[0].start.len(), 6);
     // The keys: Up wraps to the last row, Down steps on; Enter opens the chosen recent project.
     key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(a.session.state().start_selected(), 5);
+    for _ in 0..5 { key(&mut a, KeyCode::Down, KeyModifiers::NONE); }
     assert_eq!(a.session.state().start_selected(), 4);
-    for _ in 0..4 { key(&mut a, KeyCode::Down, KeyModifiers::NONE); }
-    assert_eq!(a.session.state().start_selected(), 3);
-    let chosen: String = { let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap(); t.draw(|f| a.draw(f)).unwrap(); let row = a.layout.panes[0].start[3].1; (row.x..row.right()).map(|x| t.backend().buffer()[(x, row.y)].symbol().to_owned()).collect() };
+    let chosen: String = { let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap(); t.draw(|f| a.draw(f)).unwrap(); let row = a.layout.panes[0].start[4].1; (row.x..row.right()).map(|x| t.backend().buffer()[(x, row.y)].symbol().to_owned()).collect() };
     assert!(chosen.starts_with('›') && chosen.contains("proj"), "the chosen row is marked: {chosen:?}");
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     settle(&mut a, |a| a.session.state().project().is_some_and(|p| p.root() == root));
@@ -4812,4 +4815,39 @@ fn a_caret_cuts_its_line_and_a_terminal_paste_puts_it_back_as_a_line() {
     a.handle(Event::Paste("two\r".into()));
     assert_eq!(text(&a), "one\ntwo\nthree\n");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+}
+
+#[test]
+fn choosing_a_recent_project_with_one_open_asks_this_tab_or_a_new_project_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alpha, beta) = (dir.path().join("code/alpha"), dir.path().join("code/beta"));
+    for root in [&alpha, &beta] { std::fs::create_dir_all(root).unwrap(); }
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(dir.path().join("state/recent.json"), serde_json::to_string(&[&beta]).unwrap()).unwrap();
+    let mut a = App::with_text_input(config(dir.path()), Some(alpha.clone()), false);
+    settle(&mut a, |a| a.session.state().project().is_some());
+    draw(&mut a, 100, 24);
+    let choose_beta = |a: &mut App| {
+        a.run(CommandId::OpenRecent);
+        let at = a.choices().iter().position(|c| c.label == "beta").unwrap();
+        for _ in 0..at { key(a, KeyCode::Down, KeyModifiers::NONE); }
+        key(a, KeyCode::Enter, KeyModifiers::NONE);
+    };
+    choose_beta(&mut a);
+    assert!(matches!(a.modal.as_ref().map(|m| &m.kind), Some(Prompt::Details { kind: crate::app::Details::OpenProject, .. })));
+    let screen = draw_screen(&mut a, 100, 24);
+    assert!(screen.contains("This Tab") && screen.contains("New Project Tab") && screen.contains("has alpha open"), "the question is drawn");
+    // Escape keeps alpha; n asks the runtime for a new project tab on beta.
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(a.modal.is_none() && !a.new_view);
+    choose_beta(&mut a);
+    key(&mut a, KeyCode::Char('n'), KeyModifiers::NONE);
+    assert!(a.modal.is_none() && a.new_view && a.new_view_root.as_deref() == Some(beta.as_path()));
+    assert_eq!(a.session.state().project().map(|p| p.root().to_owned()), Some(alpha.clone()));
+    a.new_view = false;
+    // t (or Enter) opens beta here instead.
+    choose_beta(&mut a);
+    key(&mut a, KeyCode::Char('t'), KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().project().is_some_and(|p| p.root() == beta));
+    assert!(!a.new_view);
 }

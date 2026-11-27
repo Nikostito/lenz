@@ -171,6 +171,8 @@ pub enum Details {
     Reconcile,
     Replace,
     Recovered,
+    /// A project chosen while this tab has another open: here, in a new project tab, or not at all.
+    OpenProject,
 }
 
 /// A drawn breadcrumb: its bounds, pane, crumb (`None`: a shrunk "…"), whether it is the `›` after the crumb, and its
@@ -922,6 +924,7 @@ impl ReaderView {
             Some(Modal::StatusDetails { kind: Details::External, .. }) => self.choose_external(code_core::external::Choice::Cancel,cx),
             Some(Modal::StatusDetails { kind: Details::Reconcile, .. }) => self.choose_reconcile(code_core::reconcile::Choice::KeepDraft,cx),
             Some(Modal::StatusDetails { kind: Details::Replace, .. }) => self.choose_replace(code_core::save::ReplaceChoice::Cancel,cx),
+            Some(Modal::StatusDetails { kind: Details::OpenProject, .. }) => self.choose_open_project(code_core::projects::OpenChoice::Cancel,cx),
             Some(Modal::StatusDetails { kind: Details::Close, .. }) => self.choose_close(code_core::close::Choice::Cancel,cx),
             Some(Modal::StatusDetails { kind: Details::Recovered, .. }) => self.choose_recovery(code_core::recovery::Choice::Later,cx),
             Some(Modal::StatusDetails { kind: Details::Change, .. }) => self.dispatch(Command::CloseChange, cx),
@@ -1015,6 +1018,7 @@ impl ReaderView {
         }
     }
     fn sync_prompts(&mut self) {
+        self.sync_open_project_prompt();
         self.sync_install_prompt();
         self.sync_close_prompt();
         self.sync_external_prompt();
@@ -1135,6 +1139,8 @@ impl ReaderView {
             }
         }
         self.sync_prompts();
+        // A project chosen for a new project tab: the window's host opens it.
+        if let Some(root) = self.session.take_project_tab_request() { cx.emit(ProjectRequest::OpenFolder(root)); }
         self.invalidate_input_source(cx);
         close::schedule(cx);
         if effect.repaint {
@@ -1993,8 +1999,9 @@ impl ReaderView {
                 if let Some(path) = files.get(at) { self.dispatch(Command::OpenScratch(path.clone()), cx); }
             }
             Some(Modal::Recent { query, at }) => {
+                // Asks where when this tab already has a project open.
                 if let Some(project) = self.recent_projects(&query).into_iter().nth(at) {
-                    self.open_root(project.path, cx);
+                    self.dispatch(Command::OpenProject(project.path), cx);
                 }
             }
             Some(Modal::Siblings { pane, crumb, query, at }) => {
@@ -2156,6 +2163,17 @@ impl ReaderView {
                 self.dispatch(Command::CheckoutChoice(c), cx);
             }
             return cx.notify();
+        }
+        if matches!(self.modal,Some(Modal::StatusDetails {kind:Details::OpenProject,..})) {
+            let plain=!(ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform || ev.keystroke.modifiers.alt);
+            let choice=match key {
+                "t" | "enter" if plain=>Some(code_core::projects::OpenChoice::ThisTab),
+                "n" if plain=>Some(code_core::projects::OpenChoice::NewTab),
+                "escape"=>Some(code_core::projects::OpenChoice::Cancel),
+                _=>None,
+            };
+            if let Some(choice)=choice {self.choose_open_project(choice,cx);}
+            return;
         }
         if matches!(self.modal,Some(Modal::StatusDetails {kind:Details::External,..})) {
             let ctrl=ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
@@ -3321,6 +3339,7 @@ impl ReaderView {
             Details::External => code_core::external::Choice::ALL.into_iter().map(|choice|choice.label()).collect(),
             Details::Reconcile => code_core::reconcile::Choice::ALL.into_iter().map(|choice|choice.label()).collect(),
             Details::Replace => code_core::save::ReplaceChoice::ALL.into_iter().map(|choice|choice.label()).collect(),
+            Details::OpenProject => code_core::projects::OpenChoice::ALL.into_iter().map(|choice|choice.label()).collect(),
             Details::Recovered => code_core::recovery::Choice::ALL.into_iter().map(|choice|choice.label()).collect(),
             Details::Close => [code_core::close::Choice::Save,code_core::close::Choice::Discard,code_core::close::Choice::Cancel].into_iter().map(|c|self.session.close_prompt().map_or(c.label(), |p|p.label(c))).collect(),
         }
@@ -3724,6 +3743,7 @@ impl ReaderView {
                             (Details::External,Some(i)) => {if let Some(choice)=code_core::external::Choice::ALL.get(i) {self.choose_external(*choice,cx);}}
                             (Details::Reconcile,Some(i)) => {if let Some(choice)=code_core::reconcile::Choice::ALL.get(i) {self.choose_reconcile(*choice,cx);}}
                             (Details::Replace,Some(i)) => {if let Some(choice)=code_core::save::ReplaceChoice::ALL.get(i) {self.choose_replace(*choice,cx);}}
+                            (Details::OpenProject,Some(i)) => {if let Some(choice)=code_core::projects::OpenChoice::ALL.get(i) {self.choose_open_project(*choice,cx);}}
                             (Details::Close,Some(i)) => {if let Some(choice)=[code_core::close::Choice::Save,code_core::close::Choice::Discard,code_core::close::Choice::Cancel].get(i) {self.choose_close(*choice,cx);}}
                             (Details::Recovered,Some(i)) => {if let Some(choice)=code_core::recovery::Choice::ALL.get(i) {self.choose_recovery(*choice,cx);}}
                             (Details::Checkout, Some(i)) => {
@@ -5973,6 +5993,7 @@ impl Render for ReaderView {
                     }
                     let badge = match item {
                         StartItem::Command(CommandId::OpenFolder) => "▸".to_string(),
+                        StartItem::Command(CommandId::OpenFolderInProjectTab) => "»".to_string(),
                         StartItem::Command(CommandId::NewDocument) => "+".to_string(),
                         StartItem::Command(_) => "≡".to_string(),
                         StartItem::RecentFolder(_) | StartItem::RecentFile(_) => code_core::start::initials(&label),

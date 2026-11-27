@@ -3022,7 +3022,7 @@ fn replacing_the_root_discards_the_old_scan_and_remembers_roots() {
     let mut s = session(d.path());
     assert_eq!(s.state().recent(), [b.clone(), a.clone()], "kept outside the checkout across sessions");
     // A window with nothing open starts on the file and folder commands, then the recent folders.
-    let start = [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument), StartItem::RecentFolder(b), StartItem::RecentFolder(a.clone())];
+    let start = [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::OpenFolderInProjectTab), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument), StartItem::RecentFolder(b), StartItem::RecentFolder(a.clone())];
     assert_eq!(s.state().start_items(), start);
     s.dispatch(Command::OpenRoot(a));
     assert_eq!(s.state().start_items(), [], "an open folder replaces the start screen");
@@ -3065,11 +3065,11 @@ fn files_opened_without_a_folder_are_recent_on_the_start_screen() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let mut s = session(d.path());
-    let start = [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument), StartItem::RecentFile(lone.clone())];
+    let start = [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::OpenFolderInProjectTab), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument), StartItem::RecentFile(lone.clone())];
     // Up/Down move the keys' choice through the items, wrapping at either end.
     assert_eq!(s.state().start_selected(), 0);
     s.dispatch(Command::StepStart { forward: false });
-    assert_eq!(s.state().start_selected(), 3, "back from the first wraps to the last");
+    assert_eq!(s.state().start_selected(), 4, "back from the first wraps to the last");
     s.dispatch(Command::StepStart { forward: true });
     assert_eq!(s.state().start_selected(), 0);
     assert_eq!(s.state().start_items(), start, "kept across sessions");

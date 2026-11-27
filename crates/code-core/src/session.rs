@@ -497,6 +497,9 @@ pub enum Command {
     StepStart { forward: bool },
     /// Read the recent projects' git branches again (Open Recent Project is about to show them).
     RefreshRecentBranches,
+    /// Open a project chosen from a list: here, or ask where when this tab has another one open.
+    OpenProject(PathBuf),
+    ChooseOpenProject { ticket: u64, choice: crate::projects::OpenChoice },
     /// Save without the project's format-on-save.
     SaveWithoutFormatting { tab: TabId },
     /// Move the popup's selection by rows (wrapping), or to a row.
@@ -2433,12 +2436,12 @@ impl State {
         if self.project.is_some() || !self.tabs.is_empty() || self.loading.is_some() {
             return Vec::new();
         }
-        [CommandId::OpenFolder, CommandId::Open, CommandId::NewDocument].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
+        [CommandId::OpenFolder, CommandId::OpenFolderInProjectTab, CommandId::Open, CommandId::NewDocument].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
             .chain(self.recent_alone.iter().cloned().map(StartItem::RecentFile)).collect()
     }
     /// The start item the keys have chosen (Up/Down move it, Enter runs it), within the items there are.
     pub fn start_selected(&self) -> usize {
-        self.start_selected.min(self.recent.len() + self.recent_alone.len() + 2)
+        self.start_selected.min(self.recent.len() + self.recent_alone.len() + 3)
     }
     /// The tree lists each folder's folders before its files.
     pub fn folders_first(&self) -> bool {
@@ -2905,6 +2908,11 @@ pub struct Session {
     pub(crate) projects_info: crate::projects::Info,
     /// What the last caret-only Copy or Cut took: whole lines, pasted above the caret's line when pasted back.
     pub(crate) line_clipboard: Option<String>,
+    /// Where to open a chosen project, while asked (see [`crate::projects::OpenPrompt`]), and its tickets.
+    pub(crate) open_prompt: Option<crate::projects::OpenPrompt>,
+    pub(crate) open_project_seq: u64,
+    /// A project the user chose to open in a new project tab, for the adapter's host.
+    pub(crate) project_tab_request: Option<PathBuf>,
     /// Shortcut labels spelled as on macOS (see [`Session::set_mac_shortcuts`]).
     mac_shortcuts: bool,
     state: State,
@@ -3166,7 +3174,7 @@ impl Session {
             text_input_enabled,
             vim_group_edit: false,
             comparison_seq: 0,
-            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs }, mac_shortcuts: false, line_clipboard: None,
+            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs }, mac_shortcuts: false, line_clipboard: None, open_prompt: None, open_project_seq: 0, project_tab_request: None,
             state: State {
                 start_selected: 0,
                 recent_branches: Default::default(),
@@ -5735,6 +5743,8 @@ impl Session {
             Command::CancelProjectSyntax => self.cancel_project_syntax("Cancelled"),
             Command::Format(kind) => match self.state.active { Some(tab) => self.format_document(tab, kind, false), None => Effect::default() },
             Command::RefreshRecentBranches => { self.refresh_recent_branches(); Effect::default() }
+            Command::OpenProject(root) => self.open_project(root),
+            Command::ChooseOpenProject { ticket, choice } => self.choose_open_project(ticket, choice),
             Command::StepStart { forward } => {
                 let count = self.state.start_items().len();
                 if count == 0 { return Effect::default(); }

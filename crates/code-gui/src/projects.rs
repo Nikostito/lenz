@@ -126,19 +126,25 @@ impl ProjectsWindow {
         }
     }
 
+    /// A project tab as IntelliJ shows a project window's tab: an equal share of the strip, `project – where` centred
+    /// (where: the shown file, else the folder), `●` for unsaved work, the active one raised, and its close mark.
     fn strip_tab(&self, index: usize, active: bool, palette: &lenz_content::theme::Palette, font: &Font, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let (title, dirty) = self.views.get(index).map(|v| { let s = &v.read(cx).session; (s.project_title(), s.project_dirty()) }).unwrap_or_default();
-        let label = format!("{} {}{}", index + 1, title, if dirty { " ●" } else { "" });
+        let (title, place, dirty) = self.views.get(index).map(|v| { let s = &v.read(cx).session; (s.project_title(), s.project_place(), s.project_dirty()) }).unwrap_or_default();
+        let label = match (place.is_empty(), dirty) {
+            (true, d) => format!("{title}{}", if d { " ●" } else { "" }),
+            (false, d) => format!("{title}{} – {place}", if d { " ●" } else { "" }),
+        };
         div()
             .id(("project-tab", index))
             .debug_selector(move || format!("project-tab-{index}"))
-            .flex().flex_row().items_center().h_full().px(px(10.0)).gap(px(8.0)).flex_shrink_0()
-            .font(font.clone()).text_size(px(font_size()))
+            .flex().flex_row().items_center().flex_1().min_w(px(80.0)).h(px(toolbar_h() - 6.0)).mx(px(2.0)).px(px(10.0)).gap(px(6.0))
+            .rounded(px(6.0))
+            .font(font.clone()).text_size(px(font_size() * 0.92))
             .bg(rgb(if active { palette.bg } else { palette.header_bg }))
+            .when(active, |d| d.border_1().border_color(rgb(palette.border)))
             .text_color(rgb(if active { palette.fg } else { palette.dim }))
-            .when(active, |d| d.border_t_2().border_color(rgb(palette.accent)))
-            .child(label)
-            .child(div().id(("project-close", index)).debug_selector(move || format!("project-close-{index}")).px(px(2.0)).text_color(rgb(palette.dim)).child("×")
+            .child(div().flex_1().min_w(px(0.0)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_center().child(label))
+            .child(div().id(("project-close", index)).debug_selector(move || format!("project-close-{index}")).px(px(3.0)).text_color(rgb(palette.dim)).child("×")
                 .on_mouse_down(MouseButton::Left, cx.listener(move |host, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     host.close(index, window, cx);
@@ -203,8 +209,8 @@ impl Render for ProjectsWindow {
             .flex().flex_row().items_center().overflow_hidden()
             .bg(rgb(palette.header_bg)).border_b_1().border_color(rgb(palette.border))
             .font(font.clone()).text_size(px(font_size()))
+            .px(px(4.0))
             .children(tabs)
-            .child(div().flex_1())
             .child(div().id("project-new").debug_selector(|| "project-new".into()).px(px(10.0)).h_full().flex().items_center().text_color(rgb(palette.accent)).child("+")
                 .on_mouse_down(MouseButton::Left, cx.listener(|host, _: &MouseDownEvent, window, cx| host.open(None, window, cx))))
             .child(div().id("project-layout").debug_selector(|| "project-layout".into()).px(px(10.0)).h_full().flex().items_center().text_color(rgb(palette.fg)).bg(rgb(palette.status_bg)).child(toggle)
@@ -229,4 +235,25 @@ pub fn open_projects_window(cx: &mut App, make_config: std::rc::Rc<dyn Fn(bool) 
         host
     })
     .map_err(|e| e.to_string())
+}
+
+impl ReaderView {
+    /// Show the core's question of where to open a chosen project while it is pending.
+    pub(super) fn sync_open_project_prompt(&mut self) {
+        match (self.session.open_project_prompt().map(|p| p.text()), &mut self.modal) {
+            (Some(now), Some(Modal::StatusDetails { kind: Details::OpenProject, text, .. })) => *text = now,
+            (Some(text), None) => {
+                self.modal_scroll.set(0);
+                self.modal = Some(Modal::StatusDetails { title: "Open Project", text, logo: None, kind: Details::OpenProject });
+            }
+            (None, Some(Modal::StatusDetails { kind: Details::OpenProject, .. })) => self.modal = None,
+            _ => {}
+        }
+    }
+
+    pub(super) fn choose_open_project(&mut self, choice: code_core::projects::OpenChoice, cx: &mut Context<Self>) {
+        if let Some(ticket) = self.session.open_project_prompt().map(|p| p.ticket) {
+            self.dispatch(Command::ChooseOpenProject { ticket, choice }, cx);
+        }
+    }
 }

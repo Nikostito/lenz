@@ -114,6 +114,8 @@ pub(crate) enum Details {
     Reconcile,
     Replace,
     Recovered,
+    /// A project chosen while this tab has another open: here, in a new project tab, or not at all.
+    OpenProject,
 }
 pub(crate) struct Modal {
     pub kind: Prompt,
@@ -1093,6 +1095,9 @@ impl App {
             Chosen::Action(id) => self.run(id),
         }
     }
+    fn choose_open_project(&mut self,choice:code_core::projects::OpenChoice) {
+        if let Some(prompt)=self.session.open_project_prompt() { let ticket=prompt.ticket; self.dispatch(Command::ChooseOpenProject {ticket,choice}); }
+    }
     fn choose_external(&mut self,choice:code_core::external::Choice) {
         if let Some(prompt)=self.session.external_prompt() { self.dispatch(Command::ChooseExternal {ticket:prompt.ticket,choice}); }
     }
@@ -1120,6 +1125,7 @@ impl App {
                 Prompt::Details { kind: Details::External, .. } => self.choose_external(code_core::external::Choice::Cancel),
                 Prompt::Details { kind: Details::Reconcile, .. } => self.choose_reconcile(code_core::reconcile::Choice::KeepDraft),
                 Prompt::Details { kind: Details::Replace, .. } => self.choose_replace(code_core::save::ReplaceChoice::Cancel),
+                Prompt::Details { kind: Details::OpenProject, .. } => self.choose_open_project(code_core::projects::OpenChoice::Cancel),
                 Prompt::Details { kind: Details::Close, .. } => self.choose_close(code_core::close::Choice::Cancel),
                 Prompt::Details { kind: Details::Recovered, .. } => self.choose_recovery(code_core::recovery::Choice::Later),
                 Prompt::Details { kind: Details::Change, .. } => self.dispatch(Command::CloseChange),
@@ -1657,6 +1663,16 @@ impl App {
         }
         // A delete confirmation takes Enter and Escape only: nothing types into it or reaches behind it.
         if matches!(kind, Prompt::ConfirmDelete { .. }) && !matches!(key.code, KeyCode::Enter | KeyCode::Esc) { return; }
+        if matches!(kind, Prompt::Details {kind:Details::OpenProject,..}) {
+            let choice=match key.code {
+                KeyCode::Char('t'|'T') | KeyCode::Enter if !control && !alt => Some(code_core::projects::OpenChoice::ThisTab),
+                KeyCode::Char('n'|'N') if !control && !alt => Some(code_core::projects::OpenChoice::NewTab),
+                KeyCode::Esc => Some(code_core::projects::OpenChoice::Cancel),
+                _=>None,
+            };
+            if let Some(choice)=choice { self.choose_open_project(choice); }
+            return;
+        }
         if matches!(kind, Prompt::Details {kind:Details::Replace,..}) {
             let choice=match key.code {
                 KeyCode::Char('r'|'R') if !control && !alt => Some(code_core::save::ReplaceChoice::Replace),
@@ -2275,7 +2291,8 @@ impl App {
                 match choice.target {
                     ChoiceTarget::Information | ChoiceTarget::ServerRuntime(_) | ChoiceTarget::Keymap(_) => {}
                     ChoiceTarget::Action(id) => self.run(id),
-                    ChoiceTarget::Path(path) if kind == Prompt::RecentRoots => self.open_root(path),
+                    // Asks where when this tab already has a project open.
+                    ChoiceTarget::Path(path) if kind == Prompt::RecentRoots => self.dispatch(Command::OpenProject(path)),
                     ChoiceTarget::Path(path) if matches!(kind, Prompt::ScratchFiles(_)) => self.dispatch(Command::OpenScratch(path)),
                     ChoiceTarget::Path(path) => self.dispatch(Command::Open(path)),
                     ChoiceTarget::Theme(id) => {
@@ -3232,6 +3249,10 @@ impl App {
                 if let Some(i)=self.layout.details_choices.iter().position(|b|b.contains(point)) && let Some(choice)=code_core::reconcile::Choice::ALL.get(i) { self.choose_reconcile(*choice); }
                 return;
             }
+            if matches!(event.kind,MouseEventKind::Down(MouseButton::Left)) && self.modal.as_ref().is_some_and(|m|matches!(m.kind,Prompt::Details {kind:Details::OpenProject,..})) {
+                if let Some(i)=self.layout.details_choices.iter().position(|b|b.contains(point)) && let Some(choice)=code_core::projects::OpenChoice::ALL.get(i) { self.choose_open_project(*choice); }
+                return;
+            }
             if matches!(event.kind,MouseEventKind::Down(MouseButton::Left)) && self.modal.as_ref().is_some_and(|m|matches!(m.kind,Prompt::Details {kind:Details::Replace,..})) {
                 if let Some(i)=self.layout.details_choices.iter().position(|b|b.contains(point)) && let Some(choice)=code_core::save::ReplaceChoice::ALL.get(i) { self.choose_replace(*choice); }
                 return;
@@ -3850,6 +3871,15 @@ impl App {
             (None,Some(Modal {kind:Prompt::Details {kind:Details::External,..},..})) => self.modal=None,
             _=>{}
         }
+        let open=self.session.open_project_prompt().map(|prompt|prompt.text());
+        match (open,&mut self.modal) {
+            (Some(text),Some(Modal {kind:Prompt::Details {kind:Details::OpenProject,body,..},..})) => *body=text,
+            (Some(body),None) => self.prompt(Prompt::Details {title:"Open Project",body,logo:false,kind:Details::OpenProject}),
+            (None,Some(Modal {kind:Prompt::Details {kind:Details::OpenProject,..},..})) => self.modal=None,
+            _=>{}
+        }
+        // A project chosen for a new project tab: the runtime opens it.
+        if let Some(root)=self.session.take_project_tab_request() { self.new_view=true; self.new_view_root=Some(root); }
         let replace=self.session.save_as_prompt().map(|prompt|prompt.text());
         match (replace,&mut self.modal) {
             (Some(text),Some(Modal {kind:Prompt::Details {kind:Details::Replace,body,..},..})) => *body=text,

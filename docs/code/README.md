@@ -35,7 +35,8 @@ cargo test --release -p code-core --test semantics -- --ignored --nocapture   # 
 ```
 
 Started with nothing to open (from home or `/`, as a desktop launcher does), and in every new project tab, a window
-shows the **welcome screen**: **Open Folder…**, **Open File…** and **New File** with their shortcuts, then **Recent
+shows the **welcome screen**: **Open Folder…**, **Open Folder in New Project Tab…**, **Open File…** and **New File**
+with their shortcuts, then **Recent
 projects** and **Recent files**, each with a coloured badge of its initials, its name and where it lives (`~` for
 your home folder, shortened from the left when narrow), and a tip. A click, or ↑/↓ and Enter, runs the command or
 opens the project or file ([terminal](tui.md)).
@@ -44,7 +45,8 @@ opens the project or file ([terminal](tui.md)).
 for a git repository, its checked-out branch after a branch icon (`detached` and the commit when no branch is checked
 out). The branches are read from each repository's `HEAD` file off the UI thread when the window opens, when the recent
 list changes and each time the dialog opens; git itself is not run. Typing filters by name, path or branch. Enter opens
-the project in this project tab; **Ctrl+Enter** (Cmd+Enter on macOS) opens it in a new [project tab](#project-tabs).
+the project in this project tab (asking first, This Tab or New Project Tab, when it already has another project open);
+**Ctrl+Enter** (Cmd+Enter on macOS) opens it in a new [project tab](#project-tabs) at once.
 The terminal shows the same on one line per project (`name  ⌂ ~/code/app  ⎇ main`, or Nerd Font folder and branch icons with File Icons on).
 In the terminal, **Open Folder…** and **Open Folder in New Project Tab…** list the recent projects until you type, then
 the folders the typed path names (`~/` and relative paths work; hidden folders once a `.` is typed): ↑/↓ choose, Tab
@@ -128,10 +130,15 @@ and `:set nornu`.
 One window (or terminal) can hold several projects, each in its own **project tab** with its own folder, tabs,
 explorer, language servers, terminal sessions and drafts. Projects never share or synchronize documents.
 
-- **File → Project Tabs → New Project Tab** opens one on the start screen; **Open Folder in New Project Tab…** asks
-  for a folder (the GUI's folder chooser, a typed path in the terminal) and opens it there.
-- Once there are two, a strip above the toolbar shows each project's number, folder name (else the shown file,
-  else Start), `●` for unsaved work and `×` to close it. Click a tab to switch; `+` opens a new project tab.
+- **File → Project Tabs → New Project Tab** opens one on the start screen; **Open Folder in New Project Tab…** (also
+  on the welcome screen) asks for a folder (the GUI's folder chooser, a typed path in the terminal) and opens it there.
+- Choosing a project in **Open Recent Project** while this tab has another one open asks **Open Project: This Tab /
+  New Project Tab / Cancel** (`t` or Enter, `n`, Esc); in an empty tab, or for the project already open, it just
+  opens. Ctrl+Enter there goes straight to a new project tab.
+- Once there are two, a strip above the toolbar shows a tab per project: in the desktop app the tabs share the
+  width, each reading `project – ~/path/to/the/shown/file` (the folder when no file is shown), as IntelliJ's project
+  windows do; in the terminal each shows its number and folder name. `●` marks unsaved work and `×` closes it.
+  Click a tab to switch; `+` opens a new project tab.
 - **Next / Previous Project Tab** (Ctrl+Alt+] / Ctrl+Alt+[ in both keymaps, IntelliJ's project-window chords) step
   through them; the terminal's F8 / Shift+F8 do the same.
 - **Projects Side by Side** (the strip's right-hand button, or the menu toggle) shows 2, 3, 4… projects as equal

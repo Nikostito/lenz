@@ -1989,6 +1989,7 @@ fn draw_start(frame: &mut ratatui::Frame, app: &App, items: &[StartItem], geomet
         let label = item.label();
         let (badge, badge_style) = match item {
             StartItem::Command(CommandId::OpenFolder) => (" ▸ ".to_string(), style(p.accent, bg)),
+            StartItem::Command(CommandId::OpenFolderInProjectTab) => (" » ".to_string(), style(p.accent, bg)),
             StartItem::Command(CommandId::NewDocument) => (" + ".to_string(), style(p.accent, bg)),
             StartItem::Command(_) => (" ≡ ".to_string(), style(p.accent, bg)),
             _ => (format!("{:^3}", code_core::start::initials(&label)), style(p.bg, colors[code_core::start::tint(&label) % colors.len()]).add_modifier(Modifier::BOLD)),

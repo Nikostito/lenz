@@ -38,6 +38,7 @@ impl App {
             Details::Sql => vec![b("SQL menu", "m", false, false), b("Copy", "Ctrl+C", false, false), close()],
             Details::Commit => vec![b("Show Diff", "d", false, false), b("Copy Revision", "c", false, false), close()],
             Details::Text => vec![b("Copy", "Ctrl+C", false, false), close()],
+            Details::OpenProject => code_core::projects::OpenChoice::ALL.into_iter().zip(["t", "n", "Esc"]).map(|(c, k)| b(c.label(), k, false, false)).collect(),
         }
     }
 }
@@ -70,6 +71,6 @@ pub(super) fn paint_footer(frame: &mut ratatui::Frame, geometry: &mut Geometry, 
     match kind {
         Details::Text => { geometry.details_copy = rects.first().copied().unwrap_or_default(); geometry.details_close = rects.get(1).copied().unwrap_or_default(); }
         Details::Change | Details::Sql | Details::Commit => { geometry.details_diff = rects.first().copied().unwrap_or_default(); geometry.details_copy = rects.get(1).copied().unwrap_or_default(); geometry.details_close = rects.get(2).copied().unwrap_or_default(); }
-        Details::Terminal(_) | Details::Install | Details::External | Details::Reconcile | Details::Replace | Details::Recovered | Details::Close | Details::Checkout => geometry.details_choices = rects,
+        Details::Terminal(_) | Details::Install | Details::External | Details::Reconcile | Details::Replace | Details::Recovered | Details::Close | Details::Checkout | Details::OpenProject => geometry.details_choices = rects,
     }
 }

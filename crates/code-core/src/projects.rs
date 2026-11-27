@@ -154,6 +154,44 @@ pub fn columns(total: u32, count: usize, divider: u32) -> Vec<Range<u32>> {
     }).collect()
 }
 
+/// Where a project chosen while this tab already has one open goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenChoice {
+    /// Open it here, in place of the project this tab has open.
+    ThisTab,
+    /// Open it in a new project tab, keeping this one as it is.
+    NewTab,
+    Cancel,
+}
+
+impl OpenChoice {
+    pub const ALL: [Self; 3] = [Self::ThisTab, Self::NewTab, Self::Cancel];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ThisTab => "This Tab",
+            Self::NewTab => "New Project Tab",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+/// The question asked when a project is chosen (Open Recent Project) while this tab has another one open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPrompt {
+    pub ticket: u64,
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub location: String,
+    /// The project this tab has open.
+    pub current: String,
+}
+
+impl OpenPrompt {
+    pub fn text(&self) -> String {
+        format!("Open {} ({}/{})?\n\nThis project tab has {} open. Open the project here in its place, or in a new project tab beside it?\n\nThis Tab (t, Enter) · New Project Tab (n) · Cancel (Esc)", self.name, self.location, self.name, self.current)
+    }
+}
+
 impl Session {
     /// The host's projects as this session sees them (set by the adapter whenever they change).
     pub fn projects(&self) -> Info { self.projects_info }
@@ -170,11 +208,51 @@ impl Session {
         state.active().map(|t| t.title()).unwrap_or_else(|| "Start".into())
     }
 
+    /// Where this project tab is, for its label beside the title: the shown file's path (`~` for home), else the
+    /// open folder's, else nothing (the start screen). A project tab reads `title – where`, as IntelliJ's windows do.
+    pub fn project_place(&self) -> String {
+        let state = self.state();
+        let home = crate::start::home();
+        state.active().filter(|t| t.is_file()).map(|t| t.source().to_owned())
+            .or_else(|| state.project().map(|p| p.root().to_owned()))
+            .map(|p| crate::start::tilde(&p, home.as_deref()))
+            .unwrap_or_default()
+    }
+
     /// Whether any of this project's tabs holds unsaved work (the project tab shows a mark).
     pub fn project_dirty(&self) -> bool {
         let state = self.state();
         state.tabs().iter().any(|t| state.tab_dirty(t.id()))
     }
+
+    /// Open the project at `root` as chosen from a list (Open Recent Project): here when this tab has no project
+    /// open or has this one, otherwise after asking where (see [`Session::open_project_prompt`]).
+    pub(crate) fn open_project(&mut self, root: std::path::PathBuf) -> crate::session::Effect {
+        let current = self.state().project().map(|p| p.root().to_owned());
+        if current.as_ref().is_none_or(|c| *c == root) { return self.dispatch(crate::session::Command::OpenRoot(root)); }
+        let home = crate::start::home();
+        let (name, location) = crate::start::place(&root, home.as_deref());
+        self.open_project_seq += 1;
+        self.open_prompt = Some(OpenPrompt { ticket: self.open_project_seq, path: root, name, location, current: self.project_title() });
+        crate::session::Effect { repaint: true, ..Default::default() }
+    }
+
+    /// The pending question of where to open a chosen project.
+    pub fn open_project_prompt(&self) -> Option<&OpenPrompt> { self.open_prompt.as_ref() }
+
+    /// The answer to [`Session::open_project_prompt`]: a stale ticket changes nothing.
+    pub(crate) fn choose_open_project(&mut self, ticket: u64, choice: OpenChoice) -> crate::session::Effect {
+        if self.open_prompt.as_ref().is_none_or(|p| p.ticket != ticket) { return Default::default(); }
+        let Some(prompt) = self.open_prompt.take() else { return Default::default() };
+        match choice {
+            OpenChoice::ThisTab => self.dispatch(crate::session::Command::OpenRoot(prompt.path)),
+            OpenChoice::NewTab => { self.project_tab_request = Some(prompt.path); crate::session::Effect { repaint: true, ..Default::default() } }
+            OpenChoice::Cancel => crate::session::Effect { repaint: true, ..Default::default() },
+        }
+    }
+
+    /// A project to open in a new project tab, which only the adapter's host can create: taken once.
+    pub fn take_project_tab_request(&mut self) -> Option<std::path::PathBuf> { self.project_tab_request.take() }
 
     /// Why a project-tab command cannot run (`None`: it can).
     pub(crate) fn project_disabled(&self, action: Action) -> Option<&'static str> {

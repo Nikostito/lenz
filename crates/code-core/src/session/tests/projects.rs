@@ -76,3 +76,42 @@ fn recent_projects_carry_the_branch_read_off_the_ui_thread() {
     s.dispatch(Command::RefreshRecentBranches);
     settle(&mut s, |s| s.recent_projects("login").len() == 1);
 }
+
+#[test]
+fn choosing_a_recent_project_while_another_is_open_asks_where_to_open_it() {
+    use crate::projects::OpenChoice;
+    let dir = tempfile::tempdir().unwrap();
+    let (alpha, beta) = (dir.path().join("alpha"), dir.path().join("beta"));
+    for root in [&alpha, &beta] { std::fs::create_dir_all(root).unwrap(); write(root, "a.txt", b"a"); }
+    let mut s = session(dir.path());
+    // No project open: it opens here, no question.
+    s.dispatch(Command::OpenProject(alpha.clone()));
+    assert!(s.open_project_prompt().is_none());
+    settle(&mut s, |s| s.state().project().is_some_and(|p| p.root() == alpha));
+    // The project already open: nothing to ask either.
+    s.dispatch(Command::OpenProject(alpha.clone()));
+    assert!(s.open_project_prompt().is_none());
+    // Another project: asked, with both names; Cancel changes nothing.
+    s.dispatch(Command::OpenProject(beta.clone()));
+    let prompt = s.open_project_prompt().cloned().unwrap();
+    assert!(prompt.text().contains("Open beta") && prompt.text().contains("has alpha open"), "{}", prompt.text());
+    assert_eq!(OpenChoice::ALL.map(OpenChoice::label), ["This Tab", "New Project Tab", "Cancel"]);
+    s.dispatch(Command::ChooseOpenProject { ticket: prompt.ticket, choice: OpenChoice::Cancel });
+    assert!(s.open_project_prompt().is_none() && s.take_project_tab_request().is_none());
+    assert_eq!(s.state().project().map(|p| p.root().to_owned()), Some(alpha.clone()));
+    // New Project Tab: this tab keeps alpha; the host is asked for a tab on beta, once.
+    s.dispatch(Command::OpenProject(beta.clone()));
+    let ticket = s.open_project_prompt().unwrap().ticket;
+    s.dispatch(Command::ChooseOpenProject { ticket: ticket + 1, choice: OpenChoice::NewTab });
+    assert!(s.open_project_prompt().is_some(), "a stale answer is ignored");
+    s.dispatch(Command::ChooseOpenProject { ticket, choice: OpenChoice::NewTab });
+    assert_eq!(s.take_project_tab_request(), Some(beta.clone()));
+    assert_eq!(s.take_project_tab_request(), None);
+    assert_eq!(s.state().project().map(|p| p.root().to_owned()), Some(alpha.clone()));
+    // This Tab: beta replaces alpha here.
+    s.dispatch(Command::OpenProject(beta.clone()));
+    let ticket = s.open_project_prompt().unwrap().ticket;
+    s.dispatch(Command::ChooseOpenProject { ticket, choice: OpenChoice::ThisTab });
+    settle(&mut s, |s| s.state().project().is_some_and(|p| p.root() == beta));
+    assert_eq!(s.project_place(), crate::start::tilde(&beta, crate::start::home().as_deref()));
+}
