@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod projects;
 mod terminal;
 mod render;
 mod runtime;

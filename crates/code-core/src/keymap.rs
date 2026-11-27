@@ -204,6 +204,9 @@ const INTELLIJ: &[Preset] = &[
     (CommandId::NextProblem, &["F8"]),
     (CommandId::PreviousProblem, &["Shift+F8"]),
     (CommandId::FormatDocument, &["Ctrl+Alt+L"]),
+    // IntelliJ's Next / Previous Project Window.
+    (CommandId::NextProjectTab, &["Ctrl+Alt+]"]),
+    (CommandId::PreviousProjectTab, &["Ctrl+Alt+["]),
     (CommandId::OrganizeImports, &["Ctrl+Alt+O"]),
     (CommandId::Save, &["Ctrl+S"]),
     (CommandId::SaveAs, &["Ctrl+Shift+S"]),
@@ -283,6 +286,8 @@ const VS_CODE: &[Preset] = &[
     (CommandId::NextProblem, &["F8"]),
     (CommandId::PreviousProblem, &["Shift+F8"]),
     (CommandId::FormatDocument, &["Alt+Shift+F"]),
+    (CommandId::NextProjectTab, &["Ctrl+Alt+]"]),
+    (CommandId::PreviousProjectTab, &["Ctrl+Alt+["]),
     (CommandId::OrganizeImports, &["Alt+Shift+O"]),
     (CommandId::ShowProblems, &["Ctrl+Shift+M"]),
     (CommandId::Save, &["Ctrl+S"]),

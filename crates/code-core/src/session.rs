@@ -35,6 +35,8 @@ mod diagnostics_work;
 mod format_work;
 #[path = "session/json.rs"]
 mod json;
+#[path = "session/xml_format.rs"]
+mod xml_format;
 pub use format_work::{FormatKind, ToolResult};
 #[path = "session/server_command.rs"]
 mod server_command;
@@ -681,6 +683,16 @@ pub enum CommandId {
     CloseTabsLeft,
     CloseTabsRight,
     CloseWindow,
+    /// A new project tab in this window, on the start screen (the adapter's host opens it).
+    NewProjectTab,
+    /// Choose a folder and open it in a new project tab (the adapter asks which).
+    OpenFolderInProjectTab,
+    /// Close this project's tab, asking about its unsaved work; the last project closes the window.
+    CloseProjectTab,
+    NextProjectTab,
+    PreviousProjectTab,
+    /// Show every project that fits side by side, or one at a time as tabs.
+    ProjectsSideBySide,
     QuitAll,
     SelectAll,
     Copy,
@@ -794,6 +806,8 @@ pub enum CommandId {
     CancelProjectSyntax,
     /// The language server formats the whole file, as one undoable edit.
     FormatDocument,
+    /// Format the selected JSON or XML alone (Format Document runs it while such a selection is active).
+    FormatSelection,
     /// The language server's organize-imports action for the file.
     OrganizeImports,
     /// Save, skipping the project's format-on-save.
@@ -946,7 +960,7 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 250] = [
+    pub const ALL: [CommandId; 257] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
@@ -1000,6 +1014,12 @@ impl CommandId {
         Self::CloseTabsLeft,
         Self::CloseTabsRight,
         Self::CloseWindow,
+        Self::NewProjectTab,
+        Self::OpenFolderInProjectTab,
+        Self::CloseProjectTab,
+        Self::NextProjectTab,
+        Self::PreviousProjectTab,
+        Self::ProjectsSideBySide,
         Self::QuitAll,
         Self::SelectAll,
         Self::Copy,
@@ -1086,6 +1106,7 @@ impl CommandId {
         Self::CheckProjectSyntax,
         Self::CancelProjectSyntax,
         Self::FormatDocument,
+        Self::FormatSelection,
         Self::OrganizeImports,
         Self::SaveWithoutFormatting,
         Self::AutoCompletion,
@@ -1265,6 +1286,12 @@ impl CommandId {
             Self::CloseTabsLeft => "Close Tabs to Left",
             Self::CloseTabsRight => "Close Tabs to Right",
             Self::CloseWindow => "Close Window",
+            Self::NewProjectTab => "New Project Tab",
+            Self::OpenFolderInProjectTab => "Open Folder in New Project Tab…",
+            Self::CloseProjectTab => "Close Project Tab",
+            Self::NextProjectTab => "Next Project Tab",
+            Self::PreviousProjectTab => "Previous Project Tab",
+            Self::ProjectsSideBySide => "Projects Side by Side",
             Self::QuitAll => "Quit All Windows",
             Self::SelectAll => "Select All",
             Self::Copy => "Copy",
@@ -1356,6 +1383,7 @@ impl CommandId {
             Self::CheckProjectSyntax => "Check Project Syntax",
             Self::CancelProjectSyntax => "Cancel Project Syntax Check",
             Self::FormatDocument => "Format Document",
+            Self::FormatSelection => "Format Selection",
             Self::OrganizeImports => "Organize Imports",
             Self::SaveWithoutFormatting => "Save Without Formatting",
             Self::AutoCompletion => "Completion While Typing",
@@ -2858,6 +2886,8 @@ pub struct Session {
     closing: Option<close_work::Pending>,
     closed: bool,
     last_close: Option<crate::close::Committed>,
+    /// The window's project tabs as its host last reported them.
+    pub(crate) projects_info: crate::projects::Info,
     state: State,
     cache: InactiveCache,
     index_cache_dir: PathBuf,
@@ -3117,7 +3147,7 @@ impl Session {
             text_input_enabled,
             vim_group_edit: false,
             comparison_seq: 0,
-            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None,
+            id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs },
             state: State {
                 terminal: crate::terminal::State::default(),
                 presentation: None,
@@ -3374,6 +3404,7 @@ impl Session {
     /// Toggle `id`'s state for the menus (`None`: not a toggle): a setting, or a find option (the session's, which the
     /// active tab's find uses).
     fn on(&self, id: CommandId) -> Option<bool> {
+        if id == CommandId::ProjectsSideBySide { return Some(self.projects_info.layout == crate::projects::Layout::SideBySide); }
         let o = self.find_options;
         match id {
             CommandId::KeymapIntelliJ => Some(self.state.settings.keymap == KeymapPreset::IntelliJ),
@@ -3389,8 +3420,8 @@ impl Session {
     pub fn disabled(&self, id: CommandId) -> Option<&'static str> {
         if self.closed {return Some("This reader view is closed");}
         if self.state.active().is_some_and(|tab| tab.csv.is_some()) && matches!(id,
-            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
-        if self.csv_pending() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
+            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::FormatSelection | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
+        if self.csv_pending() && id.project_action().is_none() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
         if (self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || self.install_running.is_some()) && matches!(id,
             CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
             | CommandId::RestartServer | CommandId::RebuildIndex | CommandId::ExcludeRubyTooling | CommandId::ResetProjectServerSettings) {
@@ -3666,6 +3697,11 @@ impl Session {
                 }
                 _ => None,
             },
+            CommandId::NewProjectTab | CommandId::OpenFolderInProjectTab | CommandId::CloseProjectTab | CommandId::NextProjectTab | CommandId::PreviousProjectTab | CommandId::ProjectsSideBySide => id.project_action().and_then(|action| self.project_disabled(action)),
+            CommandId::FormatSelection => self.format_selection_disabled(),
+            // With well-formed JSON or XML selected, Format Document formats the selection (as IntelliJ's Reformat Code
+            // does); any other selection leaves it formatting the file.
+            CommandId::FormatDocument if self.format_selection_routes() => None,
             CommandId::Completion | CommandId::ParameterInfo | CommandId::QuickFix | CommandId::FormatDocument | CommandId::OrganizeImports if self.text_action_disabled(id).is_some() => self.text_action_disabled(id),
             CommandId::Completion | CommandId::ParameterInfo | CommandId::FormatDocument if current.as_ref().is_some_and(|d| d.language() == Some(Language::Sql)) => self.sql_action_disabled(id),
             CommandId::OrganizeImports if current.as_ref().is_some_and(|d| d.language() == Some(Language::Sql)) => Some("SQL files have no imports to organize"),
@@ -3685,6 +3721,9 @@ impl Session {
             // Python, shell scripts and ERB templates format through the project's own formatter, whatever their language
             // server's state.
             CommandId::OrganizeImports if current.as_ref().is_some_and(|d| d.language() == Some(Language::Json)) => Some("JSON has no imports to organize"),
+            CommandId::OrganizeImports if current.as_ref().is_some_and(|d| d.language() == Some(Language::Xml)) => Some("XML has no imports to organize"),
+            // A plain-text document holding JSON or XML formats as that, offline.
+            CommandId::FormatDocument if current.as_deref().and_then(format_work::plain_structured).is_some() => None,
             CommandId::FormatDocument | CommandId::OrganizeImports if current.as_deref().is_some_and(format_work::project_formats) => match current.as_ref() {
                 _ if self.state.active().is_some_and(|t| t.retrieved.is_some()) => Some("Not available in source a language server returned"),
                 Some(d) if d.is_large() => Some("Large file: not formatted"),

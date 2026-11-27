@@ -54,6 +54,12 @@ mod xml;
 
 const HIGHLIGHT_CHUNK: usize = 256;
 
+/// Check that `text` is well-formed XML with the bounded validator highlighting uses (no external entities are
+/// resolved). `None` when `current` says the work is no longer wanted; the first problem otherwise.
+pub fn check_xml(text: &str, current: &dyn Fn() -> bool) -> Option<Result<(), SyntaxError>> {
+    xml::check(text, current)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,

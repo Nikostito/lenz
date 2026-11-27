@@ -48,6 +48,8 @@ pub(crate) enum Prompt {
     },
     Open,
     OpenFolder,
+    /// Open Folder in New Project Tab: the folder a new project view opens.
+    OpenFolderInProjectTab,
     TerminalPath,
     RenameTerminal { id: code_core::terminal::Id },
     /// Save As: the destination path for this tab's document.
@@ -205,8 +207,12 @@ pub(crate) struct App {
     pub quit: bool,
     pub quit_all: bool,
     pub new_view: bool,
-    /// The folder the new view opens (Open in New Window on a worktree).
+    /// The folder the new view opens (Open in New Window on a worktree, Open Folder in New Project Tab).
     pub new_view_root: Option<PathBuf>,
+    /// A project-tab request for the runtime, which holds the views (next, previous, side by side).
+    pub project_request: Option<code_core::projects::Action>,
+    /// Where this view draws while it shares the terminal with other projects (see [`crate::projects`]).
+    pub(crate) offscreen: Option<ratatui::Terminal<ratatui::backend::TestBackend>>,
     pub copy: Option<String>,
     pub copy_ticket: Option<code_core::session::ClipboardTicket>,
     /// Lenz Diff's terminal app, for the runtime to run in this terminal until it quits.
@@ -273,6 +279,8 @@ impl App {
             quit: false, quit_all: false,
             new_view: false,
             new_view_root: None,
+            project_request: None,
+            offscreen: None,
             copy: None,
             copy_ticket: None,
             foreground: None,
@@ -821,6 +829,15 @@ impl App {
                 None => return self.dispatch(Command::Notice("Highlight a file or folder in the explorer".into())),
             },
             InterfaceAction::OpenFolder => Prompt::OpenFolder,
+            InterfaceAction::Project(project) => match project {
+                code_core::projects::Action::New => { self.new_view = true; return; }
+                code_core::projects::Action::OpenFolder => Prompt::OpenFolderInProjectTab,
+                code_core::projects::Action::Close => { self.quit = true; return; }
+                code_core::projects::Action::Next | code_core::projects::Action::Previous | code_core::projects::Action::ToggleSideBySide => {
+                    self.project_request = Some(project);
+                    return;
+                }
+            },
             InterfaceAction::OpenInEditor | InterfaceAction::OpenWithDefaultApp => {
                 let default_app = action == InterfaceAction::OpenWithDefaultApp;
                 match self.session.external_command(&lenz_content::open::Host::current(), lenz_content::appearance::editor().as_deref(), default_app) {
@@ -1334,6 +1351,7 @@ impl App {
                     return format!("{} · Enter: {} · Esc cancels", self.session.delete_prompt(*removal, from), removal.label());
                 }
                 Prompt::OpenFolder => "Open folder · enter path",
+                Prompt::OpenFolderInProjectTab => "Open folder in new project tab · enter path",
                 Prompt::Compare(_) => code_core::external::COMPARISON_PROMPT,
                 Prompt::SqlMetadata => self.session.sql_metadata_prompt(),
                 Prompt::WorkspaceRoot => "Workspace root · empty restores discovery",
@@ -2095,18 +2113,22 @@ impl App {
                     self.terminal_command(code_core::terminal::Command::Paths(vec![path]));
                 }
             }
-            Prompt::Open | Prompt::OpenFolder => {
+            Prompt::Open | Prompt::OpenFolder | Prompt::OpenFolderInProjectTab => {
                 let path = self.resolve_path(&input);
+                let folder = matches!(kind, Prompt::OpenFolder | Prompt::OpenFolderInProjectTab);
                 if input.trim().is_empty()
                     || !path.exists()
-                    || (kind == Prompt::OpenFolder && !path.is_dir())
+                    || (folder && !path.is_dir())
                     || (kind == Prompt::Open && !path.is_file())
                 {
                     self.modal.as_mut().unwrap().error =
                         Some("Enter an existing file or folder path".into());
                 } else {
                     self.close_modal();
-                    if kind == Prompt::OpenFolder {
+                    if kind == Prompt::OpenFolderInProjectTab {
+                        self.new_view = true;
+                        self.new_view_root = Some(path);
+                    } else if kind == Prompt::OpenFolder {
                         self.open_root(path);
                     } else {
                         self.dispatch(Command::Open(path));

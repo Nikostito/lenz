@@ -40,7 +40,7 @@ fn source_range(source: &TextSnapshot, range: Range<usize>) -> Option<Range<usiz
 }
 impl ReaderView {
     fn input_context(&self, window: &Window) -> InputContext {
-        let size = window.viewport_size();
+        let size = self.view_size(window);
         InputContext { font: self.font.clone(), layout: self.layout, viewport: (f32::from(size.width).to_bits(), f32::from(size.height).to_bits()), wrap: self.session.state().soft_wrap(), split: self.session.state().split() }
     }
     fn capture_source_current(&self, capture: &Capture) -> bool {
@@ -311,41 +311,13 @@ impl EntityInputHandler for ReaderView {
         self.input_state.stale = false; self.input_state.ended = None;
         self.show_input(capture, cx);
     }
-    fn bounds_for_range(&mut self, range: Range<usize>, _: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
-        if self.session.state().terminal().focused() {
-            if !self.terminal_active() || !self.focus.is_focused(window) { return None; }
-            let _ = utf16_bytes(self.terminal_marked().unwrap_or(""),range)?;
-            return self.terminal_input_bounds();
-        }
-        if self.csv_active() {
-            let (_, _, value) = self.csv_field()?; let _ = utf16_bytes(value, range)?;
-            return self.csv_ui.input_bounds;
-        }
-        self.synchronize_input(window, cx); let source = self.input_snapshot(window)?; let bytes = source_range(&source, range)?;
-        let state = self.session.state(); let view = state.presentation_view(state.active()?.id())?; let tab = view.tab();
-        if !self.current_source_geometry(tab) || window.viewport_size() != gpui::size(px(self.width), px(self.height)) { return None; }
-        let geometry = self.panes.iter().find(|pane| pane.pane == tab.pane())?;
-        let rows = view.layout_rows(geometry.rows, state.wrap_cols(tab)); if rows.pending.is_some() { return None; }
-        let (at, row) = rows.rows.iter().enumerate().find(|(_, row)| row.source.start <= bytes.start && (bytes.start < row.end_byte() || row.last && bytes.start == row.end_byte()))?;
-        let projected = self.ready_source_row(tab, row)?; let local = projected.caret(bytes.start)?;
-        let start = projected.x_for(window, self.metrics(), local)?;
-        let end = projected.caret(bytes.end).and_then(|byte| projected.x_for(window, self.metrics(), byte)).unwrap_or(start);
-        let x = lenz_gpui::text_x(self.metrics(), f32::from(geometry.text.origin.x), tab.column() as f32 * self.char_w) + row.indent as f32 * self.char_w + start;
-        let y = f32::from(geometry.text.origin.y) + at as f32 * line_h();
-        if x < f32::from(geometry.text.left()) + num_w() + 4.0 || x >= f32::from(geometry.text.right())
-            || y < f32::from(geometry.text.top()) || y >= f32::from(geometry.text.bottom()) { return None; }
-        Some(Bounds { origin: gpui::point(px(x), px(y)), size: gpui::size(px((end - start).max(2.0)), px(line_h())) })
+    fn bounds_for_range(&mut self, range: Range<usize>, element: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        // Laid out in this view's own coordinates; the platform places its candidate window in the window's.
+        self.local_bounds_for_range(range, element, window, cx).map(|b| self.global(b))
     }
     fn character_index_for_point(&mut self, point: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
-        if self.session.state().terminal().focused() {
-            return (self.terminal_active() && self.focus.is_focused(window) && self.terminal_layout().is_some_and(|l| l.grid.contains(&point))).then_some(0);
-        }
-        if self.csv_active() {
-            let (_, _, value) = self.csv_field()?;
-            return self.csv_ui.input_bounds.filter(|b| b.contains(&point)).map(|_| value.encode_utf16().count());
-        }
-        self.synchronize_input(window, cx); let source = self.input_snapshot(window)?;
-        source.byte_to_utf16(self.byte_at(window, f32::from(point.x), f32::from(point.y))?)
+        let point = self.local(point);
+        self.local_character_index_for_point(point, window, cx)
     }
     fn text_length_utf16(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
         self.synchronize_input(window, cx); Some(self.input_snapshot(window)?.len_utf16())
@@ -363,5 +335,44 @@ impl EntityInputHandler for ReaderView {
     fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
         self.synchronize_input(window, cx); if !self.draft_context() { return; }
         self.cancel_input(true, cx); if let Some(text) = item.text() { self.dispatch(Command::Paste(text), cx); }
+    }
+}
+
+impl ReaderView {
+    fn local_bounds_for_range(&mut self, range: Range<usize>, _: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        if self.session.state().terminal().focused() {
+            if !self.terminal_active() || !self.focus.is_focused(window) { return None; }
+            let _ = utf16_bytes(self.terminal_marked().unwrap_or(""),range)?;
+            return self.terminal_input_bounds();
+        }
+        if self.csv_active() {
+            let (_, _, value) = self.csv_field()?; let _ = utf16_bytes(value, range)?;
+            return self.csv_ui.input_bounds;
+        }
+        self.synchronize_input(window, cx); let source = self.input_snapshot(window)?; let bytes = source_range(&source, range)?;
+        let state = self.session.state(); let view = state.presentation_view(state.active()?.id())?; let tab = view.tab();
+        if !self.current_source_geometry(tab) || self.view_size(window) != gpui::size(px(self.width), px(self.height)) { return None; }
+        let geometry = self.panes.iter().find(|pane| pane.pane == tab.pane())?;
+        let rows = view.layout_rows(geometry.rows, state.wrap_cols(tab)); if rows.pending.is_some() { return None; }
+        let (at, row) = rows.rows.iter().enumerate().find(|(_, row)| row.source.start <= bytes.start && (bytes.start < row.end_byte() || row.last && bytes.start == row.end_byte()))?;
+        let projected = self.ready_source_row(tab, row)?; let local = projected.caret(bytes.start)?;
+        let start = projected.x_for(window, self.metrics(), local)?;
+        let end = projected.caret(bytes.end).and_then(|byte| projected.x_for(window, self.metrics(), byte)).unwrap_or(start);
+        let x = lenz_gpui::text_x(self.metrics(), f32::from(geometry.text.origin.x), tab.column() as f32 * self.char_w) + row.indent as f32 * self.char_w + start;
+        let y = f32::from(geometry.text.origin.y) + at as f32 * line_h();
+        if x < f32::from(geometry.text.left()) + num_w() + 4.0 || x >= f32::from(geometry.text.right())
+            || y < f32::from(geometry.text.top()) || y >= f32::from(geometry.text.bottom()) { return None; }
+        Some(Bounds { origin: gpui::point(px(x), px(y)), size: gpui::size(px((end - start).max(2.0)), px(line_h())) })
+    }
+    fn local_character_index_for_point(&mut self, point: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        if self.session.state().terminal().focused() {
+            return (self.terminal_active() && self.focus.is_focused(window) && self.terminal_layout().is_some_and(|l| l.grid.contains(&point))).then_some(0);
+        }
+        if self.csv_active() {
+            let (_, _, value) = self.csv_field()?;
+            return self.csv_ui.input_bounds.filter(|b| b.contains(&point)).map(|_| value.encode_utf16().count());
+        }
+        self.synchronize_input(window, cx); let source = self.input_snapshot(window)?;
+        source.byte_to_utf16(self.byte_at(window, f32::from(point.x), f32::from(point.y))?)
     }
 }

@@ -43,6 +43,8 @@ mod external;
 mod save_as;
 mod recovery;
 mod reconcile;
+mod projects;
+pub use projects::{ProjectRequest, ProjectsWindow, open_projects_window};
 
 static FONTS: std::sync::OnceLock<lenz_content::appearance::FontPreferences> = std::sync::OnceLock::new();
 fn fonts() -> &'static lenz_content::appearance::FontPreferences {
@@ -236,6 +238,9 @@ impl ModalLayout {
 
 pub struct ReaderView {
     session: Session,
+    /// Where a project host placed this view in the window (`None`: the whole window). Layout uses its size; pointer
+    /// input arrives in window coordinates and is moved into the view's own by its origin.
+    pub(crate) frame: Option<Bounds<Pixels>>,
     focus: FocusHandle,
     font: Font,
     /// Rows that fit in the focused pane, and in the explorer, from the last paint.
@@ -471,55 +476,26 @@ impl SourceGeometry {
 }
 
 /// Open a reader window with its own session; `path` opens a file in it.
+/// Open a window (its project tabs start with one project, on `path` when given).
 pub fn open_window(cx: &mut App, make_config: std::rc::Rc<dyn Fn(bool) -> Config>, path: Option<PathBuf>) -> Result<(), String> {
-    open_reader_window(cx,make_config,path).map(|_|())
+    open_projects_window(cx, make_config, path).map(|_| ())
 }
-/// Native acceptance tools use the installed production constructor; opening does not opt into editing.
+/// Native acceptance tools use the installed production constructor (a project-tab window holding one project);
+/// opening does not opt into editing. Returns the window and its project's view.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn open_acceptance_window_for_test(
     cx: &mut App,
     make_config: std::rc::Rc<dyn Fn(bool) -> Config>,
     path: Option<PathBuf>,
-) -> Result<gpui::WindowHandle<ReaderView>, String> {
-    open_reader_window(cx, make_config, path)
+) -> Result<(gpui::WindowHandle<ProjectsWindow>, gpui::Entity<ReaderView>), String> {
+    let handle = open_projects_window(cx, make_config, path)?;
+    let view = handle.read(cx).map_err(|e| e.to_string())?.active_view().cloned().ok_or_else(|| "the window holds no project".to_owned())?;
+    Ok((handle, view))
 }
 /// Native text input (typing and input methods through `EntityInputHandler`) on the verified backends: Linux X11 and
 /// Wayland, and macOS.
 fn text_input_supported(compositor: &str) -> bool { cfg!(target_os = "macos") || cfg!(target_os = "linux") && matches!(compositor, "X11" | "Wayland") }
-
-fn open_reader_window(cx: &mut App, make_config: std::rc::Rc<dyn Fn(bool)->Config>,path:Option<PathBuf>)->Result<gpui::WindowHandle<ReaderView>,String> {
-    let options = WindowOptions {
-        app_id: Some(code_core::chrome::APP_ID.into()),
-        focus: true,
-        titlebar: Some(TitlebarOptions { title: Some(code_core::chrome::APP_NAME.into()), ..Default::default() }),
-        ..Default::default()
-    };
-    cx.open_window(options, |window, cx| {
-        let config = make_config(dark(window));
-        let view = cx.new(|cx| ReaderView::new(Session::with_text_input(config, text_input_supported(cx.compositor_name())), path, cx).with_config(make_config));
-        view.update(cx, |_, cx| {
-            cx.observe_window_appearance(window, |v, window, cx| {
-                v.dispatch(Command::Theme(ThemeCommand::NativeAppearance(dark(window))), cx);
-            })
-            .detach();
-            // Coming back to the window: recheck open sources against the disk.
-            cx.observe_window_activation(window, |v, window, cx| {
-                if window.is_window_active() {
-                    v.dispatch(Command::Recheck, cx);
-                }
-            })
-            .detach();
-        });
-        close::register(&view,window,cx);
-        let closing=view.downgrade();
-        window.on_window_should_close(cx,move|_,cx|closing.update(cx,|v,cx|v.window_should_close(cx)).unwrap_or(true));
-        let focus = view.read(cx).focus.clone();
-        window.focus(&focus, cx);
-        view
-    })
-    .map_err(|e| e.to_string())
-}
 
 
 /// Benchmark markers (the `perf-probe` feature only), milliseconds from launch on stderr: when the first frame
@@ -779,7 +755,7 @@ impl ReaderView {
 
     pub fn new(session: Session, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let (font, notice) = lenz_gpui::pick_mono(cx, fonts().font_family.as_deref());
-        let mut view = Self { session, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
+        let mut view = Self { session, frame: None, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
         view.layout = view.session.state().layout();
         cx.on_app_quit(|view, cx| {
             view.remember_explorer();
@@ -1320,6 +1296,21 @@ impl ReaderView {
                     })
                     .detach();
                 }
+                InterfaceAction::Project(project) => match project {
+                    code_core::projects::Action::OpenFolder => {
+                        let answer = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Open Folder in New Project Tab".into()) });
+                        cx.spawn_in(window, async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = answer.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                let _ = this.update(cx, |_, cx| cx.emit(ProjectRequest::OpenFolder(path)));
+                            }
+                        })
+                        .detach();
+                    }
+                    code_core::projects::Action::Close => close::request(self.session.id(), false, cx),
+                    code_core::projects::Action::New | code_core::projects::Action::Next | code_core::projects::Action::Previous | code_core::projects::Action::ToggleSideBySide => cx.emit(ProjectRequest::Action(project)),
+                },
                 InterfaceAction::LanguageServer => {
                     self.dispatch(Command::CloseDocumentation, cx);
                     self.modal = Some(Modal::LanguageServer { at: 0 });
@@ -1473,7 +1464,9 @@ impl ReaderView {
                     self.dispatch(Command::CheckPlaces, cx);
                     cx.notify();
                 }
-                InterfaceAction::CloseWindow | InterfaceAction::QuitAll => close::request(self.session.id(),action == InterfaceAction::QuitAll,cx),
+                // Close Window closes every project tab in the window; Quit All every window.
+                InterfaceAction::CloseWindow => close::request_window(window.window_handle(), cx),
+                InterfaceAction::QuitAll => close::request(self.session.id(), true, cx),
                 InterfaceAction::NewWindow => {
                     let make_config = self.make_config.clone();
                     cx.defer(move |cx| {
@@ -3328,7 +3321,7 @@ impl ReaderView {
     }
 
     fn byte_in(&self, window: &Window, tab: &Tab, bounds: Bounds<Pixels>, x: f32, y: f32) -> Option<(usize, usize)> {
-        if !self.current_source_geometry(tab) || window.viewport_size() != gpui::size(px(self.width), px(self.height)) || y < f32::from(bounds.origin.y) { return None; }
+        if !self.current_source_geometry(tab) || self.view_size(window) != gpui::size(px(self.width), px(self.height)) || y < f32::from(bounds.origin.y) { return None; }
         let state = self.session.state();
         let view = state.presentation_view(tab.id())?;
         let tab = view.tab();
@@ -3344,7 +3337,7 @@ impl ReaderView {
 
     fn fold_click(&self, window: &Window, x: f32, y: f32) -> Option<usize> {
         let (tab, bounds) = (self.session.state().active()?, self.text_bounds?);
-        if !self.current_source_geometry(tab) || window.viewport_size() != gpui::size(px(self.width), px(self.height)) || y < f32::from(bounds.origin.y) { return None; }
+        if !self.current_source_geometry(tab) || self.view_size(window) != gpui::size(px(self.width), px(self.height)) || y < f32::from(bounds.origin.y) { return None; }
         let state = self.session.state();
         let view = state.presentation_view(tab.id())?;
         let tab = view.tab();
@@ -3633,9 +3626,21 @@ impl ReaderView {
         } else if self.double_shift.update(ev.modifiers.shift, ev.modifiers.control || ev.modifiers.alt || ev.modifiers.platform || ev.modifiers.function, std::time::Instant::now()) {
             self.open_navigation(code_core::navigation::Scope::All, cx);
         }
-        let at = window.mouse_position();
+        let at = self.local(window.mouse_position());
         self.hover_link(window, f32::from(at.x), f32::from(at.y), ev.modifiers.control || ev.modifiers.platform, cx);
     }
+
+    /// The size this view lays itself out in: its host's frame, else the window's.
+    pub(crate) fn view_size(&self, window: &Window) -> gpui::Size<Pixels> { self.frame.map_or_else(|| window.viewport_size(), |f| f.size) }
+
+    /// A window position in this view's own coordinates.
+    pub(crate) fn local(&self, at: gpui::Point<Pixels>) -> gpui::Point<Pixels> { self.frame.map_or(at, |f| at - f.origin) }
+
+    /// A view position in window coordinates.
+    pub(crate) fn global(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> { self.frame.map_or(bounds, |f| Bounds { origin: bounds.origin + f.origin, size: bounds.size }) }
+
+    fn local_down(&self, ev: &MouseDownEvent) -> MouseDownEvent { MouseDownEvent { position: self.local(ev.position), ..ev.clone() } }
+    fn local_up(&self, ev: &gpui::MouseUpEvent) -> gpui::MouseUpEvent { gpui::MouseUpEvent { position: self.local(ev.position), ..ev.clone() } }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.reset_caret_blink();
@@ -5560,7 +5565,7 @@ impl Render for ReaderView {
             }).detach();
         }
         let palette = self.session.state().palette().clone();
-        let viewport = window.viewport_size();
+        let viewport = self.view_size(window);
         let run = gpui::TextRun { len: 10, font: self.font.clone(), color: gpui::Hsla::default(), background_color: None, underline: None, strikethrough: None };
         let shaped = window.text_system().shape_line("0123456789".into(), px(font_size()), &[run], None);
         self.char_w = (f32::from(shaped.width) / 10.0).max(1.0);
@@ -6100,29 +6105,31 @@ impl Render for ReaderView {
             .bg(rgb(palette.bg))
             .track_focus(&self.focus)
             .on_drop(cx.listener(|v, paths: &gpui::ExternalPaths, window, cx| {
-                if window.viewport_size() == gpui::size(px(v.width), px(v.height)) {
+                if v.view_size(window) == gpui::size(px(v.width), px(v.height)) {
                     v.terminal_ui.external_paths = None;
-                    v.terminal_drop_paths(paths.paths(), window.mouse_position(), cx);
+                    let at = v.local(window.mouse_position());
+                    v.terminal_drop_paths(paths.paths(), at, cx);
                 }
             }))
             .on_drag_move(cx.listener(|v,event: &gpui::DragMoveEvent<gpui::ExternalPaths>,_,cx| {
                 v.terminal_ui.external_paths = v.modal.is_none().then(|| event.drag(cx).paths().to_vec());
             }))
             .on_key_down(cx.listener(Self::on_key))
-            .on_scroll(cx.listener(Self::on_wheel))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_down(MouseButton::Middle, cx.listener(|v,ev,window,cx| { if v.modal.is_none() { v.terminal_click(ev,window,cx); } }))
-            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_mouse_up))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
+            // Pointer positions come in window coordinates: each handler sees them in this view's own.
+            .on_scroll(cx.listener(|v, ev: &ScrollEvent, window, cx| { let ev = ScrollEvent { position: v.local(ev.position), ..ev.clone() }; v.on_wheel(&ev, window, cx) }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, ev: &MouseDownEvent, window, cx| { let ev = v.local_down(ev); v.on_mouse_down(&ev, window, cx) }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_down(MouseButton::Middle, cx.listener(|v, ev: &MouseDownEvent, window, cx| { if v.modal.is_none() { let ev = v.local_down(ev); v.terminal_click(&ev, window, cx); } }))
+            .on_mouse_up(MouseButton::Middle, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_up(MouseButton::Right, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(|v, ev: &gpui::MouseUpEvent, window, cx| { let ev = v.local_up(ev); v.on_mouse_up(&ev, window, cx) }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|v, ev: &MouseDownEvent, window, cx| { let ev = v.local_down(ev); v.on_right_down(&ev, window, cx) }))
             // The mouse's back and forward side buttons, as Alt+Left and Alt+Right (a dialog open keeps them).
             .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Back), cx.listener(|v, _: &MouseDownEvent, window, cx| v.side_button(CommandId::Back, window, cx)))
             .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Forward), cx.listener(|v, _: &MouseDownEvent, window, cx| v.side_button(CommandId::Forward, window, cx)))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_move(cx.listener(|v, ev: &MouseMoveEvent, window, cx| { let ev = MouseMoveEvent { position: v.local(ev.position), ..ev.clone() }; v.on_mouse_move(&ev, window, cx) }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers))
             .child(
                 canvas(
@@ -6133,7 +6140,7 @@ impl Render for ReaderView {
                             // GPUI's hover filter suppresses on_drop after keyboard input, including native file drops.
                             if phase == gpui::DispatchPhase::Bubble && window.last_input_was_keyboard() && cx.has_active_drag() {
                                 let handled = terminal_drop.update(cx,|view,cx| {
-                                    view.terminal_ui.external_paths.take().is_some_and(|paths| view.terminal_drop_paths(&paths,event.position,cx))
+                                    view.terminal_ui.external_paths.take().is_some_and(|paths| { let at = view.local(event.position); view.terminal_drop_paths(&paths,at,cx) })
                                 }).unwrap_or(false);
                                 if handled {cx.stop_active_drag(window); cx.stop_propagation();}
                             }

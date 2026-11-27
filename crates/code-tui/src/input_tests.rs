@@ -4702,3 +4702,24 @@ fn the_pointer_is_text_over_pane_text_only() {
     a.handle(Event::Key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)));
     assert!(!moved(&mut a, text.x + 2, text.y), "under a dialog");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn format_shortcut_expands_selected_pasted_json_and_undo_restores_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    let original = "data: {\"a\":[1,2],\"b\":{}}\n";
+    std::fs::write(&path, original).unwrap();
+    let mut a = App::new(config(dir.path()), Some(path.clone()));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    draw(&mut a, 80, 16);
+    let start = original.find('{').unwrap();
+    a.dispatch(Command::Select(code_core::session::Selection { anchor: start, head: original.len() - 1 }));
+    key(&mut a, KeyCode::Char('l'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let text = |a: &App| { let s = a.session.state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    settle(&mut a, |a| text(a) != original);
+    assert_eq!(text(&a), "data: {\n    \"a\": [\n        1,\n        2\n    ],\n    \"b\": {}\n}\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "only the draft changes");
+    key(&mut a, KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert_eq!(text(&a), original);
+}

@@ -108,12 +108,50 @@ absolute line number. Wrapped continuation rows stay blank; clicking numbers and
 use the actual source line. The setting is independent of Vim and persists. Vim also accepts `:set rnu`
 and `:set nornu`.
 
-### JSON formatting
+### Project tabs
 
-**Format Document** (Ctrl+Alt+L) formats JSON offline using the file's resolved indentation, without a server
-or external tool. It changes only whitespace: key order, duplicate keys, numeric spellings, string escapes,
-line-ending choices and the presence of a final newline remain intact. Invalid JSON stays unchanged.
-Formatting is one Undo operation; project **Format on Save** uses the same formatter before writing.
+One window (or terminal) can hold several projects, each in its own **project tab** with its own folder, tabs,
+explorer, language servers, terminal sessions and drafts. Projects never share or synchronize documents.
+
+- **File → Project Tabs → New Project Tab** opens one on the start screen; **Open Folder in New Project Tab…** asks
+  for a folder (the GUI's folder chooser, a typed path in the terminal) and opens it there.
+- Once there are two, a strip above the toolbar shows each project's number, folder name (else the shown file,
+  else Start), `●` for unsaved work and `×` to close it. Click a tab to switch; `+` opens a new project tab.
+- **Next / Previous Project Tab** (Ctrl+Alt+] / Ctrl+Alt+[ in both keymaps, IntelliJ's project-window chords) step
+  through them; the terminal's F8 / Shift+F8 do the same.
+- **Projects Side by Side** (the strip's right-hand button, or the menu toggle) shows 2, 3, 4… projects as equal
+  columns. The active project has the keys; clicking in a column (or stepping) moves them. Each column lays itself
+  out as a window of that width would, so narrow columns use the narrow layouts. As many projects as fit at
+  least 36 character cells each are shown, keeping the active one in view; the others stay on the strip.
+- **Close Project Tab** (or `×`) asks about that project's unsaved work only (Save, Discard or Cancel) and closes it;
+  the last project closes the window. **Close Window** asks about every project in the window.
+
+With one project there is no strip and the window looks and behaves exactly as before. The open project tabs are not
+restored after a restart; each project restores its own tabs and places as a single-project window does.
+
+### Formatting JSON and XML
+
+**Format Document** (Ctrl+Alt+L; VS Code keymap Alt+Shift+F) formats JSON and XML offline using the file's resolved
+indentation, without a server or external tool:
+
+- **JSON** changes only whitespace: key order, duplicate keys, numeric spellings, string escapes, line-ending choices
+  and the presence of a final newline remain intact. Invalid JSON stays unchanged.
+- **XML** re-indents element-only content and changes nothing else: tags (attributes and their own line breaks),
+  text, comments, CDATA, processing instructions and the doctype keep their bytes. An element holding text or CDATA
+  (mixed or text-only content) or marked `xml:space="preserve"` keeps everything between its tags as written.
+  Malformed XML stays unchanged; a document declaring entities is left alone (the bounded validator cannot check it).
+- **A plain-text document** (an untitled document, a `.txt`) whose text starts like JSON or XML formats as that when
+  asked. Format on Save never guesses: it formats only JSON and XML files.
+
+**Format Selection** formats only the selected text, as JSON or XML: the file's own format for a JSON or XML file,
+otherwise what the selection starts with (`{` or `[`, or `<`). Ctrl+Alt+L runs it whenever the selection holds
+well-formed JSON or XML, as IntelliJ's Reformat Code formats a selection, so pasting a one-line JSON value anywhere
+(a Markdown note, a Ruby file, a scratch file), selecting it and pressing Ctrl+Alt+L expands it in place. Surrounding
+blanks stay outside, and each new line is indented like the line the selection starts on. With any other selection
+(several selections, or text that is not well-formed JSON or XML) Ctrl+Alt+L formats the document as before, and the
+**Format Selection** menu entry or Find Action says why it cannot run or what is malformed.
+
+Formatting is one Undo operation; project **Format on Save** uses the same formatters before writing.
 Object keys, string values, escapes, numbers, literals and structural punctuation have distinct syntax captures.
 
 ### SQL dialect
@@ -176,8 +214,9 @@ closing tag creates an indented line, and attribute quotes pair in tag context. 
 and refuses content that would make an illegal XML comment. The validator runs locally without resolving external
 entities. Documents declaring internal entities keep highlighting and folding but show an informational validation
 limit; they are not passed to the parser's unbounded entity expander or marked malformed. Save preserves the
-original encoding. This pass provides no schema completion, XML language server or
-formatter; mixed-content whitespace stays under the author's control.
+original encoding. This pass provides no schema completion or XML language server;
+[Format Document](#formatting-json-and-xml) re-indents element-only content and leaves mixed-content whitespace
+under the author's control.
 
 ### CSV tables
 
