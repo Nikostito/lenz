@@ -53,6 +53,26 @@ pub enum ToolResult {
     Unavailable(String),
     /// It ran and failed: nothing changes, and a save waiting for it writes nothing.
     Failed(String),
+    /// It would run the project's code (what, as the folder-trust dialog says it) in a folder the user does not trust
+    /// (the file's folder, its links resolved): nothing ran, and a save goes ahead unformatted.
+    Restricted(&'static str, PathBuf),
+}
+
+/// What erb_lint runs of a project, as the folder-trust dialog says it.
+const ERB_RUNS: &str = "erb_lint would run with this project's Gemfile, its configuration and the custom linters it loads (Format Document on ERB templates)";
+/// What haml-lint runs of a project, as the folder-trust dialog says it.
+pub(super) const HAML_RUNS: &str = "haml-lint would run in this project's bundle with its configuration and RuboCop's (Format Document on Haml templates)";
+
+/// Whether the user trusts the folder holding `file` (its links resolved). Resolves links: off the UI thread.
+pub(super) fn trusted_for(file: &Path, settings: &semantics::provider::Settings) -> bool {
+    file.parent().and_then(|d| std::fs::canonicalize(d).ok()).is_some_and(|d| settings.trust(&d) == semantics::provider::Trust::Trusted)
+}
+
+/// What a formatter held back for `file` says ([`ToolResult::Restricted`]): `runs`, and the file's folder with its
+/// links resolved, which the folder-trust dialog asks about. Resolves links: off the UI thread.
+pub(super) fn restricted(file: &Path, runs: &'static str) -> ToolResult {
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    ToolResult::Restricted(runs, std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned()))
 }
 
 /// How long a project formatter may take.
@@ -176,7 +196,7 @@ impl Session {
         }
         if crate::template::Kind::of(doc.source()) == Some(crate::template::Kind::Haml) {
             self.jobs.submit(Priority::Visible, move || {
-                let result = haml_work::format(&job, organize);
+                let result = haml_work::format(&job, organize, project.as_deref(), &settings);
                 let _ = tx.send_blocking(Completion::ProjectFormatted { request, result });
             });
             if let Some(f) = self.state.formatting.as_mut() { f.doc = Some(doc); }
@@ -208,6 +228,10 @@ impl Session {
             ToolResult::Formatted { tool, edit } => (tool, edit),
             ToolResult::Unavailable(why) => return self.format_unavailable(why),
             ToolResult::Failed(why) => return self.format_refused(&why),
+            ToolResult::Restricted(runs, folder) => {
+                self.want_trust(&folder, runs);
+                return self.format_unavailable(format!("{} ({runs})", semantics::provider::RESTRICTED));
+            }
         };
         let Some(f) = self.state.formatting.as_ref() else { return Effect::default() };
         if !f.current(&self.state) { return self.format_refused(&format!("the file changed while {tool} ran")); }
@@ -439,18 +463,36 @@ impl Session {
 pub(super) fn erb(file: &Path) -> bool { crate::template::Kind::of(file) == Some(crate::template::Kind::Erb) }
 
 /// The erb_lint an ERB template's project configures (its root: the open folder holding it, else its Ruby workspace),
-/// looked up on the Ruby provider's `PATH`. Reads project files.
+/// looked up on the Ruby provider's `PATH`. In a trusted folder, only what is found inside the trusted folder deciding
+/// it, as it runs (see [`run_erb_formatter`]), so Server Details never names a program that would not run. Reads
+/// project files.
 pub(crate) fn erb_formatter(file: &Path, project: Option<&Path>, settings: &semantics::provider::Settings) -> (Option<semantics::erb::ErbLint>, PathBuf, Option<std::ffi::OsString>) {
-    let root = project.filter(|p| file.starts_with(p)).map(Path::to_owned).or_else(|| semantics::provider::ruby_root(file, None)).unwrap_or_else(|| file.parent().unwrap_or(Path::new("/")).to_owned());
+    // Never above the opened folder (else the trusted folder holding it, else its own folder).
+    let root = semantics::provider::lookup_bound(file, project, settings).unwrap_or_else(|| file.parent().unwrap_or(Path::new("/")).to_owned());
     let path = semantics::provider::PROVIDERS.iter().find(|p| p.id == "ruby-lsp").and_then(|p| settings.launch(p).path().map(std::ffi::OsStr::to_owned)).or_else(|| std::env::var_os("PATH"));
-    (semantics::erb::configured(file, &root, path.as_deref()), root, path)
+    let lint = semantics::erb::configured(file, &root, path.as_deref());
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    match lint.as_ref().filter(|l| l.run.is_some()).and_then(|_| semantics::provider::trusted_bound(dir, &root, settings)) {
+        Some(within) if within != root => (semantics::erb::configured(file, &within, path.as_deref()), within, path),
+        _ => (lint, root, path),
+    }
 }
 
 /// Run the project's erb_lint on an ERB template's draft (see [`semantics::erb::format`]); templates have no imports to
 /// organize. Reads project files and runs erb_lint: off the UI thread.
 fn run_erb_formatter(doc: &Document, organize: bool, project: Option<&Path>, settings: &semantics::provider::Settings) -> ToolResult {
     if organize { return ToolResult::Unavailable("ERB templates have no imports to organize".into()); }
-    let (_, root, path) = erb_formatter(doc.source(), project, settings);
+    let (lint, root, path) = erb_formatter(doc.source(), project, settings);
+    // Configured and runnable, it would load the project's code: only in a folder the user trusts, and only what is
+    // found in the trusted folder deciding it (never in an opened folder holding it that is not trusted).
+    let dir = doc.source().parent().unwrap_or(Path::new("/"));
+    let root = match lint.is_some_and(|l| l.run.is_some()) {
+        true => match semantics::provider::trusted_bound(dir, &root, settings) {
+            Some(within) => within,
+            None => return restricted(doc.source(), ERB_RUNS),
+        },
+        false => root,
+    };
     match semantics::erb::format(doc.source(), doc.text(), &root, path.as_deref()) {
         semantics::erb::Formatted::Text(out) => ToolResult::Formatted { tool: "erb_lint", edit: difference(doc.text(), out) },
         semantics::erb::Formatted::Unavailable(why) => ToolResult::Unavailable(why),
@@ -480,16 +522,28 @@ fn run_shell_formatter(doc: &Document, organize: bool, project: Option<&Path>, s
 }
 
 /// The formatter a Python file's project configures, found in the project's configured Python environment (else, with
-/// none configured, the project's `.venv`/`venv`), else on `path`, with the root it was looked up under.
+/// none configured, the project's `.venv`/`venv`) when the user trusts the opened folder holding it, else on `path`,
+/// with the root it was looked up under.
 pub(crate) fn python_formatter(file: &Path, project: Option<&Path>, settings: &semantics::provider::Settings, path: Option<&std::ffi::OsStr>) -> Option<crate::preferences::Formatter> {
-    let workspace = semantics::provider::python_root(file, project)?;
+    let workspace = semantics::provider::python_root(file, project, semantics::provider::lookup_bound(file, project, settings).as_deref())?;
     let root = project.filter(|p| file.starts_with(p)).unwrap_or(&workspace);
+    // Trusted, the project's tools are found no higher than the trusted folder deciding it (never in an opened folder
+    // holding it that is not trusted).
+    let within = semantics::provider::trusted_bound(&workspace, root, settings);
+    let trusted = within.is_some();
+    let root = within.as_deref().unwrap_or(root);
     let pyright = semantics::provider::PROVIDERS.iter().find(|p| p.id == "pyright")?;
     use crate::preferences::Tools;
-    let configured = semantics::python::configured(&workspace, &settings.initialization(pyright, Some(&workspace)));
+    let configured = semantics::python::configured(&workspace, &settings.initialization(pyright, Some(&workspace)), root);
     let folder = configured.as_ref().ok().and_then(|c| c.as_ref()?.tools());
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    // An environment's tools run only from inside the folder holding the project, their links resolved (a venvPath
+    // of `../..`, an absolute one or a link out of it is not inside).
+    let inside = |dir: &Path| real(dir).zip(real(root)).is_some_and(|(d, r)| d.starts_with(r));
     let tools = match (&configured, &folder) {
-        (Ok(Some(_)), Some(folder)) => Tools::Environment(folder),
+        // The project's own tools are its programs.
+        _ if !trusted => Tools::PathOnly,
+        (Ok(Some(_)), Some(folder)) if inside(folder) => Tools::Environment(folder),
         (Ok(None), _) => Tools::Project,
         // A configured environment that is missing: never another project environment's tool, only PATH.
         _ => Tools::PathOnly,
@@ -510,7 +564,8 @@ fn run_python_formatter(file: &Path, text: &str, organize: bool, project: Option
     };
     let configured = formatter.config.as_ref().map_or_else(|| "its defaults".into(), |c| c.display().to_string());
     let Some(executable) = formatter.executable else {
-        return ToolResult::Unavailable(format!("{} is configured by {configured} but was not found in the project's Python environment or on PATH; Lenz never installs formatters", formatter.tool));
+        let untrusted = if !trusted_for(file, settings) { " (the project's own environment is searched only in a folder you trust: Restricted in the status bar, or Trust Project Tools in This Folder)" } else { "" };
+        return ToolResult::Unavailable(format!("{} is configured by {configured} but was not found in the project's Python environment or on PATH{untrusted}; Lenz never installs formatters", formatter.tool));
     };
     let cwd = file.parent().unwrap_or(Path::new("/"));
     match semantics::runtime::run_with_input(&executable, &args, text, cwd, TOOL_TIMEOUT) {
@@ -551,6 +606,31 @@ fn organize(value: &serde_json::Value, doc: &Document, encoding: semantics::lsp:
 #[cfg(test)]
 mod tests {
     use super::difference;
+
+    #[test]
+    fn erb_lint_is_named_only_where_it_would_run() {
+        use crate::semantics::erb::Run;
+        let dir = tempfile::tempdir().unwrap();
+        let open = std::fs::canonicalize(dir.path()).unwrap();
+        let inner = open.join("app");
+        let write = |p: &std::path::Path, text: &str| { std::fs::create_dir_all(p.parent().unwrap()).unwrap(); std::fs::write(p, text).unwrap(); };
+        let file = inner.join("views/page.html.erb");
+        write(&file, "<p></p>\n");
+        write(&inner.join(".erb_lint.yml"), "---\n");
+        let outer = open.join("bin/erb_lint");
+        write(&outer, "#!/bin/sh\n");
+        std::fs::set_permissions(&outer, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut settings = crate::semantics::provider::Settings::default();
+        // the opened folder is not trusted; the folder inside it is
+        settings.trusted.insert(inner.clone());
+        let (lint, root, _) = super::erb_formatter(&file, Some(&open), &settings);
+        assert_eq!(root, inner);
+        assert_ne!(lint.as_ref().and_then(|l| l.run.clone()), Some(Run::Binstub(outer.clone())), "{lint:?}");
+        assert!(!lint.unwrap().describe().contains(&outer.display().to_string()));
+        // trusting the opened folder instead names the binstub it holds, which then runs
+        settings.trusted = [open.clone()].into();
+        assert_eq!(super::erb_formatter(&file, Some(&open), &settings).0.and_then(|l| l.run), Some(Run::Binstub(outer)));
+    }
 
     fn apply(old: &str, new: &str) -> Option<(std::ops::Range<usize>, String)> {
         let edit = difference(old, new.to_owned())?;

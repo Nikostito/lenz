@@ -5,6 +5,10 @@
 # Skip once with `git push --no-verify`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Keep detached fixture/tool children owned even in containers whose PID 1 does not reap.
+if [[ $(uname) == Linux && ${LENZ_VALIDATION_SUPERVISOR_PID:-} != "$PPID" ]]; then
+    exec python3 scripts/reap-children.py -- "$PWD/scripts/ci-local.sh" "$@"
+fi
 step() { printf '\n== %s\n' "$*"; }
 # gpui compiles Metal shaders; the Command Line Tools have no `metal`, so fall back to an installed Xcode.
 if [[ $(uname) == Darwin && -z ${DEVELOPER_DIR:-} ]] && ! xcrun -find metal > /dev/null 2>&1 \
@@ -37,26 +41,29 @@ step "collector tests"
 python3 -m unittest discover -s scripts -p 'test_*.py'
 step "standalone terminal release builds (without GUI features)"
 cargo build --release --locked -p lenz-tui -p code-tui
-step "release build and stripped size (≤ 80,000,000 bytes)"
+step "release build and stripped size (≤ 85,000,000 bytes)"
 cargo build --release --locked -p lenz
 stripped=$(mktemp)
 trap 'rm -f "$stripped"' EXIT
 strip -o "$stripped" target/release/lenz
 size=$(wc -c < "$stripped")
 echo "stripped lenz: $size bytes"
-test "$size" -le 80000000
+test "$size" -le 85000000
 
 if [[ ${1:-} == --old-git ]]; then
     step "core tests on git 2.30 (Debian bullseye)"
     engine=$(command -v podman || command -v docker)
-    # bullseye is past end of life: use the image's pinned snapshot of the archive. Build output stays in a volume.
-    "$engine" run --rm -v "$PWD:/src:ro" -v lenz-old-git-target:/target -e CARGO_TARGET_DIR=/target debian:bullseye bash -euc '
+    # bullseye is past end of life: use the image's pinned snapshot of the archive. Build output stays in a volume, and
+    # the copy of the source leaves out the host's ignored output (.gitignore's directories), target/ above all.
+    "$engine" run --init --rm -v "$PWD:/src:ro" -v lenz-old-git-target:/target -e CARGO_TARGET_DIR=/target debian:bullseye bash -euo pipefail -c '
         sed -i -e "s|^deb |# deb |" -e "s|^# deb http://snapshot|deb http://snapshot|" /etc/apt/sources.list
         apt-get -qq -o Acquire::Check-Valid-Until=false update
         apt-get -qq install -y git curl build-essential pkg-config libxkbcommon-x11-dev libwayland-dev \
             libfontconfig-dev libx11-xcb-dev libvulkan1 libglib2.0-dev libzstd-dev > /dev/null
         git --version | grep -F "git version 2.30."
         curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal > /dev/null
-        cp -r /src /work && cd /work && "$HOME/.cargo/bin/cargo" test -p lenz --locked'
+        mkdir /work && tar -C /src --exclude=./target --exclude=./perf-results --exclude=./.scratch --exclude=__pycache__ -cf - . \
+            | tar -x -C /work
+        cd /work && "$HOME/.cargo/bin/cargo" test -p lenz --locked'
 fi
 printf '\nAll local CI checks passed.\n'

@@ -33,6 +33,7 @@ impl Session {
                 Some(if id == CommandId::MoveLinesDown { "Already on the last line" } else { "Already on the first line" })
             }
             CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown if doc.len_bytes() == 0 => Some("Nothing to duplicate"),
+            CommandId::DeleteLine if doc.len_bytes() == 0 => Some("Nothing to delete"),
             _ => None,
         }
     }
@@ -55,7 +56,12 @@ impl Session {
     /// Apply one structural transaction, then give the view the selections the planner produced (and the same one
     /// primary as before) where an edit's default anchor transform cannot express where a line went.
     pub(super) fn apply_structural(&mut self, tab: crate::tabs::TabId, expected: SnapshotKey, edits: Vec<crate::text::TextEdit>, after: Option<(Vec<Selection>, usize)>) -> Effect {
-        let effect = self.edit(tab, expected, edits, EditKind::Replace);
+        self.apply_planned(tab, expected, edits, EditKind::Replace, after)
+    }
+
+    /// [`Self::apply_structural`] as an edit of `kind` (Enter stays typing, so it joins the typing around it in Undo).
+    pub(super) fn apply_planned(&mut self, tab: crate::tabs::TabId, expected: SnapshotKey, edits: Vec<crate::text::TextEdit>, kind: EditKind, after: Option<(Vec<Selection>, usize)>) -> Effect {
+        let effect = self.edit(tab, expected, edits, kind);
         if !effect.repaint { return effect; }
         let Some((selections, primary)) = after else { return effect };
         let Some(t) = self.tab_mut(tab) else { return effect };
@@ -151,5 +157,15 @@ impl Session {
         let Some(view) = self.state.view(tab) else { return Effect::default() };
         let Some(edits) = crate::edit_ops::duplicate_lines(view.snapshot(), &selections, down) else { return Effect::default() };
         self.apply_structural(tab, expected, edits, None)
+    }
+
+    /// Delete every line the selections touch, endings included, in one transaction; each caret lands at its
+    /// column on the line that takes their place (the line before, when the file's last lines go).
+    pub(super) fn delete_lines(&mut self) -> Effect {
+        if self.disabled(CommandId::DeleteLine).is_some() { return Effect::default(); }
+        let Some((tab, expected, selections, _)) = self.structural_target() else { return Effect::default() };
+        let Some(view) = self.state.view(tab) else { return Effect::default() };
+        let Some((edits, after)) = crate::edit_ops::delete_lines(view.snapshot(), &selections) else { return Effect::default() };
+        self.apply_structural(tab, expected, edits, Some((after, 0)))
     }
 }

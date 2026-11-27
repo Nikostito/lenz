@@ -369,7 +369,7 @@ impl App {
         frame.render_widget(Clear, popup);
         for (i, r) in c.rows().enumerate().skip(first).take(shown) {
             let selected = i == c.selected();
-            let bg = if selected { p.selected_bg } else { p.status_bg };
+            let bg = if selected { p.menu_selected(p.status_bg) } else { p.status_bg };
             let at = row(popup, (i - first) as u16);
             fill(frame.buffer_mut(), at, style(p.fg, bg));
             let group = i > 0 && c.rows().nth(i-1).is_some_and(|previous|previous.kind != r.kind);
@@ -436,7 +436,7 @@ impl App {
         let popup = Rect::new(left, top, width, shown as u16);
         frame.render_widget(Clear, Rect::new(left, top, width, height));
         for (i, a) in c.actions.iter().enumerate().skip(first).take(shown) {
-            let bg = if i == c.selected { p.selected_bg } else { p.status_bg };
+            let bg = if i == c.selected { p.menu_selected(p.status_bg) } else { p.status_bg };
             let at = row(popup, (i - first) as u16);
             fill(frame.buffer_mut(), at, style(p.fg, bg));
             line(frame.buffer_mut(), at, &code_core::chrome::ellipsize(&label(a), width as usize), style(if a.unavailable.is_some() { p.dim } else { p.fg }, bg));
@@ -504,6 +504,7 @@ impl App {
         fill(frame.buffer_mut(), area, style(p.fg, p.bg));
         if area.is_empty() {
             self.layout = geometry;
+            if let Some(modal) = &mut self.modal { modal.top = 0; }
             for command in self.source_cache.borrow_mut().finish() { self.source_redraw |= self.session.dispatch(command).repaint; }
             self.sync_prompts();
             return;
@@ -517,9 +518,14 @@ impl App {
         );
         self.draw_activity(frame, &mut geometry, &mut body, p);
         self.draw_terminal(frame, &mut geometry, &mut body, p);
-        // A quarter of the width unless its right edge was dragged; the text keeps at least 24 columns.
+        // A browser with no document uses the available cells; a focused virtual tree also remains
+        // usable below the usual split threshold. Opening a member returns narrow windows to text.
+        let archive_browser = !self.session.state().archive_tree().rows().is_empty()
+            && (self.session.state().active().is_none() || area.width < 36 && self.focus == Focus::Tree
+                && self.session.state().tree_rows().nth(self.tree_at).is_some_and(|row| self.session.state().archive_tree().is_virtual(&row.path)));
         let tree_width =
-            if self.tree_shown && self.session.state().has_tree() && area.width >= 36 {
+            if self.tree_shown && self.session.state().has_tree() && archive_browser { body.width }
+            else if self.tree_shown && self.session.state().has_tree() && area.width >= 36 {
                 let dragged = self.explorer_drag.or_else(|| self.session.state().layout().explorer_columns.map(|w| w.min(u32::from(u16::MAX)) as u16));
                 dragged.map_or((area.width / 4).clamp(16, 32), |w| w.clamp(12, area.width - 24))
             } else {
@@ -610,6 +616,9 @@ impl App {
             for y in geometry.tree.top()..geometry.tree.bottom() {
                 frame.buffer_mut()[(listing.right(), y)].set_symbol("│").set_style(style(p.border, p.bg));
             }
+            // The explorer's scrollbar, on that edge below the title row.
+            let visible = listing.height.saturating_sub(1);
+            lenz_terminal_ui::scroll_thumb(frame.buffer_mut(), listing.right(), listing.y + 1.min(listing.height), visible, (self.session.state().tree_rows().count(), self.tree_top, usize::from(visible)), style(p.fg, p.bg));
         }
         if listing.width >= 3 && listing.height > 0 {
             let rect = Rect::new(listing.right() - 3, listing.y, 3, 1);
@@ -644,7 +653,8 @@ impl App {
                 let area = text_area(self.session.state(), pane as u8, rect);
                 self.session.dispatch(Command::Csv(code_core::csv::Command::Size { rows: area.height.saturating_sub(2) as usize, columns: usize::from(area.width / 18).max(1) }));
             }
-            let pane = draw_pane(frame, self, pane as u8, rect, p);
+            let mut pane = draw_pane(frame, self, pane as u8, rect, p);
+            draw_file_toggle(frame, self, &mut pane, p);
             draw_scrollbar(frame.buffer_mut(), self, &pane, p);
             geometry.panes.push(pane);
         }
@@ -697,7 +707,10 @@ impl App {
             frame.render_widget(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(color(p.border)))
                     .title(" Documentation · Esc closes ")
+                    .title_style(style(p.fg, p.status_bg).add_modifier(Modifier::BOLD))
                     .style(style(p.fg, p.status_bg)),
                 popup,
             );
@@ -775,21 +788,39 @@ impl App {
             style(p.fg, p.status_bg).add_modifier(Modifier::UNDERLINED),
         );
         geometry.command_menus.push(commands_rect);
+        if self.focus == Focus::Tree && let Some(row) = self.session.state().tree_rows().nth(self.tree_at)
+            && let Some(hint) = self.session.state().archive_tree().hint(&row.path) {
+            let message = if area.width >= 80 {
+                self.session.state().archive_tree().display_path(&row.path).map_or_else(|| hint.to_owned(), |path| format!("{hint} · {path}"))
+            } else { hint.to_owned() };
+            let rect = Rect::new(area.x, area.y, area.width.saturating_sub(commands_width), 1);
+            line(frame.buffer_mut(), rect, &code_core::chrome::ellipsize(&message, rect.width as usize), style(p.fg, p.status_bg));
+            return;
+        }
         let log_width = 10.min(area.width.saturating_sub(commands_width));
         let log_rect = Rect::new(commands_rect.x.saturating_sub(log_width), area.y, log_width, 1);
         line(frame.buffer_mut(), log_rect, &format!("Logs ({})", self.session.state().activity_log().len()), style(p.accent, p.status_bg));
         geometry.controls.push((CommandId::ToggleActivityLog, log_rect));
-        // "Results (4)" left of the log while the results panel is hidden; a click shows it again.
+        // "Details" left of the log: Status Details (Shift+F2), named where it can be found; narrow terminals keep the
+        // key and the menus.
+        let details_width = if area.width >= 120 { 8u16 } else { 0 };
+        let details_rect = Rect::new(log_rect.x.saturating_sub(details_width), area.y, details_width, 1);
+        if details_width > 0 {
+            line(frame.buffer_mut(), details_rect, "Details ", style(p.accent, p.status_bg));
+            geometry.controls.push((CommandId::StatusDetails, details_rect));
+        }
+        // "Results (4)" left of the details while the results panel is hidden; a click shows it again.
         let hidden = self.session.hidden_results_label().map(|label| format!("{label} ")).unwrap_or_default();
-        let results_width = (hidden.width() as u16).min(area.width.saturating_sub(commands_width + log_width) / 3);
-        let results_rect = Rect::new(log_rect.x.saturating_sub(results_width), area.y, results_width, 1);
+        let results_width = (hidden.width() as u16).min(area.width.saturating_sub(commands_width + log_width + details_width) / 3);
+        let results_rect = Rect::new(details_rect.x.saturating_sub(results_width), area.y, results_width, 1);
         if results_width > 0 {
             line(frame.buffer_mut(), results_rect, &code_core::chrome::ellipsize(&hidden, results_width as usize), style(p.accent, p.status_bg));
             geometry.controls.push((CommandId::ToggleResults, results_rect));
         }
-        let available = area.width.saturating_sub(commands_width + log_width + results_width);
+        let available = area.width.saturating_sub(commands_width + log_width + details_width + results_width);
         let state = self.session.state();
-        let lsp = format!(" {} [F2] ", state.language_server_label());
+        let (server_label, server_action) = self.session.language_server_control();
+        let lsp = format!(" {server_label} [F2] ");
         let sql = self.session.sql_dialect_label().map(|label| format!(" {label} ")).unwrap_or_default();
         let save_notice = area.width < 60 && state.active().and_then(|tab| state.view(tab.id()))
             .is_some_and(|view| view.save_status().message().is_some());
@@ -808,6 +839,10 @@ impl App {
             &code_core::chrome::ellipsize(&position, position_width as usize),
             style(p.fg, p.status_bg),
         );
+        // The position opens Go to Line, as in the GUI.
+        if position_width > 0 && !position.trim().is_empty() {
+            geometry.controls.push((CommandId::GoToLine, position_rect));
+        }
         let available = available.saturating_sub(position_width);
         let lsp_width = if save_notice { 0 } else { (lsp.width() as u16).min(available / 2) };
         let lsp_rect = Rect::new(position_rect.right(), area.y, lsp_width, 1);
@@ -817,6 +852,7 @@ impl App {
                 code_core::semantics::Status::Missing(_)
                     | code_core::semantics::Status::Failed(_)
                     | code_core::semantics::Status::Disabled
+                    | code_core::semantics::Status::Restricted(_)
             )
         });
         line(
@@ -828,7 +864,7 @@ impl App {
         );
         geometry
             .controls
-            .push((CommandId::LanguageServer, lsp_rect));
+            .push((server_action, lsp_rect));
         // The SQL dialect the file is written for, including "not set": never assumed, always visible.
         let sql_width = if save_notice { 0 } else { (sql.width() as u16).min(available.saturating_sub(lsp_width) / 2) };
         let sql_rect = Rect::new(lsp_rect.right(), area.y, sql_width, 1);
@@ -841,23 +877,19 @@ impl App {
             );
             geometry.controls.push((CommandId::SqlDialect, sql_rect));
         }
-        // The open draft's change-marker baseline: which version its letters are compared against.
-        let baseline = self.session.markers_baseline().map(|b| format!(" vs {} ", b.short())).unwrap_or_default();
-        let baseline_width = if save_notice || area.width < 60 { 0 } else { (baseline.width() as u16).min(available.saturating_sub(lsp_width + sql_width) / 4) };
-        let baseline_rect = Rect::new(sql_rect.right(), area.y, baseline_width, 1);
-        if baseline_width > 0 {
-            line(
-                frame.buffer_mut(),
-                baseline_rect,
-                &code_core::chrome::ellipsize(&baseline, baseline_width as usize),
-                style(p.fg, p.status_bg),
-            );
-            geometry.controls.push((CommandId::StatusDetails, baseline_rect));
+        // "Restricted" while the open folder is not trusted (Lenz runs no code from it), in the message's room: a click
+        // opens the folder-trust dialog.
+        let restricted = self.session.restricted_label().map(|label| format!(" {label} ")).unwrap_or_default();
+        let restricted_width = (restricted.width() as u16).min(results_rect.x.saturating_sub(sql_rect.right()) / 2);
+        let restricted_rect = Rect::new(results_rect.x.saturating_sub(restricted_width), area.y, restricted_width, 1);
+        if restricted_width > 0 {
+            line(frame.buffer_mut(), restricted_rect, &code_core::chrome::ellipsize(&restricted, restricted_width as usize), style(p.error, p.status_bg).add_modifier(Modifier::BOLD));
+            geometry.controls.push((CommandId::FolderTrust, restricted_rect));
         }
         let message_rect = Rect::new(
-            baseline_rect.right(),
+            sql_rect.right(),
             area.y,
-            results_rect.x.saturating_sub(baseline_rect.right()),
+            restricted_rect.x.saturating_sub(sql_rect.right()),
             1,
         );
         let message = self.session.status_message();
@@ -867,9 +899,10 @@ impl App {
             &code_core::chrome::ellipsize(&format!(" {message}"), message_rect.width as usize),
             style(p.fg, p.status_bg),
         );
-        geometry
-            .controls
-            .push((CommandId::StatusDetails, message_rect));
+        // A cell is a control only while it says something; blank space between cells does nothing.
+        if !message.is_empty() {
+            geometry.controls.push((CommandId::StatusDetails, message_rect));
+        }
     }
 
     fn draw_tree(&mut self, frame: &mut ratatui::Frame, area: Rect, p: &Palette) {
@@ -877,7 +910,10 @@ impl App {
             return;
         }
         fill(frame.buffer_mut(), area, style(p.fg, p.sidebar_bg));
-        let title = self.session.state().explorer_search().label().map(std::borrow::Cow::Owned).unwrap_or_else(|| self.session.state().project().map(|p| p.root().file_name().unwrap_or_default().to_string_lossy()).unwrap_or_else(|| "Files".into()));
+        let state = self.session.state();
+        let archive = state.project().is_none() || state.tree_rows().nth(self.tree_at).is_some_and(|row| state.archive_tree().is_virtual(&row.path));
+        let title = state.explorer_search().label().or_else(|| if archive { state.archive_tree().title() } else { None }).map(std::borrow::Cow::Owned)
+            .unwrap_or_else(|| state.project().map(|p| p.root().file_name().unwrap_or_default().to_string_lossy()).unwrap_or_else(|| "Files".into()));
         line(
             frame.buffer_mut(),
             area,
@@ -1274,19 +1310,11 @@ impl App {
                 field.width.saturating_sub(2),
                 field.height,
             );
-            let shown = tail_columns(value, text_area.width.saturating_sub(1) as usize);
-            if value.is_empty() {
-                line(frame.buffer_mut(), text_area, placeholder, style(p.dim, p.bg));
-            } else {
-                line(frame.buffer_mut(), text_area, shown, style(p.fg, if active && modal.selected { p.selected_bg } else { p.bg }));
-            }
-            if active && text_area.height > 0 && text_area.width > 0 {
-                frame.set_cursor_position((
-                    text_area.x
-                        + (shown.width() as u16).min(text_area.width.saturating_sub(1)),
-                    text_area.y,
-                ));
-            }
+            let cursor = modal.editors[i].unwrap_or_else(|| if active { Self::field_cursor(modal) } else { Default::default() });
+            lenz_terminal_ui::paint(frame, lenz_terminal_ui::Field { text: value, cursor, area: text_area, active }, style(p.fg,p.bg), style(p.fg,p.selected_bg));
+            if value.is_empty() { line(frame.buffer_mut(), text_area, placeholder, style(p.dim,p.bg)); }
+
+
         }
         for (((id, label), (dy, dx, w)), on) in labels.iter().zip(placed).zip(on) {
             let r = row(content, toggles_y + dy);
@@ -1386,7 +1414,7 @@ impl App {
                 &label,
                 style(
                     if selected { p.accent } else { p.dim },
-                    if selected { p.selected_bg } else { p.status_bg },
+                    if selected { p.menu_selected(p.status_bg) } else { p.status_bg },
                 )
                 .add_modifier(if selected {
                     Modifier::BOLD | Modifier::UNDERLINED
@@ -1398,21 +1426,10 @@ impl App {
             x = x.saturating_add(width + 1);
         }
         if content.height > 1 {
-            let query = tail_columns(&modal.input, content.width.saturating_sub(3) as usize);
-            line(
-                frame.buffer_mut(),
-                row(content, 1),
-                &format!("› {query}"),
-                style(p.fg, p.status_bg),
-            );
-            if content.width > 2 {
-                frame.set_cursor_position((
-                    content.x
-                        + 2
-                        + query.width().min(content.width.saturating_sub(3) as usize) as u16,
-                    content.y + 1,
-                ));
-            }
+            let r=row(content,1);
+            line(frame.buffer_mut(),r,"› ",style(p.fg,p.status_bg));
+            let area=Rect::new(r.x+2.min(r.width),r.y,r.width.saturating_sub(2),r.height);
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:&modal.input,cursor:Self::field_cursor(modal),area,active:true},style(p.fg,p.status_bg),style(p.fg,p.selected_bg));
         }
         let list_y = 2.min(content.height);
         let reserve = u16::from(content.height > list_y);
@@ -1432,13 +1449,14 @@ impl App {
             modal.reveal_selection = false;
         }
         geometry.modal_content_rows = search.rows.len();
+        lenz_terminal_ui::scroll_thumb(frame.buffer_mut(), list.right(), list.y, (visible as u16 * row_height).min(list.height), (search.rows.len(), modal.top, visible), style(p.fg, p.status_bg));
         for (index, result) in search.rows.iter().enumerate().skip(modal.top).take(visible) {
             let screen = ((index - modal.top) * row_height as usize) as u16;
             if screen >= list.height {
                 break;
             }
             let selected = index == modal.at;
-            let bg = if selected { p.selected_bg } else { p.status_bg };
+            let bg = if selected { p.menu_selected(p.status_bg) } else { p.status_bg };
             let fg = if result.disabled.is_some() {
                 p.dim
             } else {
@@ -1450,7 +1468,7 @@ impl App {
                 Kind::Symbol => Icon::Book.label(nerd, &result.label),
                 Kind::Action => Icon::Commands.label(nerd, &result.label),
             };
-            let setting = result.on.map_or("", |on| if on { "✓ " } else { "○ " });
+            let setting = code_core::chrome::toggle_mark(result.on);
             let label = format!(
                 "{}{}{}  {}{}",
                 if selected { "› " } else { "  " },
@@ -1534,6 +1552,7 @@ impl App {
         }
         let title = if self.modal.as_ref().is_some_and(|m| m.kind == Prompt::Branches) { self.session.state().branches().map_or_else(|| "Branches".to_string(), |b| b.heading().to_string()) } else { self.modal_title() };
         let details_buttons = self.details_buttons();
+        let details_focus = self.details_focus(crate::app::Details::Trust);
         let theme_source = self
             .modal
             .as_ref()
@@ -1561,6 +1580,16 @@ impl App {
         } else {
             self.choices()
         };
+        let branch_notice = self.modal.as_ref().filter(|m| m.kind == Prompt::Branches)
+            .and_then(|_| self.session.state().branches())
+            .and_then(|b| b.state_text()).map(str::to_owned);
+        let branch_footer = self.session.state().branches().map(|b| {
+            if b.worktrees_only || b.revisions_only {
+                "Enter compares · Alt+Enter actions · Alt+Home/End jumps · Esc closes"
+            } else {
+                "Enter selects · → / Alt+Enter actions · Alt+Home/End jumps · Esc closes"
+            }
+        });
         let Some(modal) = &mut self.modal else {
             return;
         };
@@ -1568,9 +1597,9 @@ impl App {
         let action_list = context || matches!(modal.kind, Prompt::Commands | Prompt::LanguageServer);
         let themes = modal.kind == Prompt::Themes;
         let mut separators = Vec::new();
+        let hint = |c: &crate::app::Choice| match c.target { crate::app::ChoiceTarget::Action(id) => self.session.key_hint(id).map_or(0, |key| key.width() + 3), _ => 0 };
         let area = if let Prompt::Menu(_) = modal.kind {
             // A dropdown under the toolbar's button, as wide as its longest row with its shortcut.
-            let hint = |c: &crate::app::Choice| match c.target { crate::app::ChoiceTarget::Action(id) => self.session.key_hint(id).map_or(0, |key| key.width() + 3), _ => 0 };
             let width = (choices.iter().map(|c| c.label.width() + hint(c)).max().unwrap_or(0) + 6)
                 .max(34)
                 .min(frame.area().width as usize) as u16;
@@ -1578,7 +1607,11 @@ impl App {
             let height = (choices.len() as u16 + 3).min(frame.area().height.saturating_sub(2));
             Rect::new(frame.area().x, frame.area().y + 1.min(frame.area().height), width, height)
         } else if let Prompt::Context { x, y, ref entries } = modal.kind {
-            let width = (choices.iter().map(|c| c.label.width()).max().unwrap_or(0) + 4)
+            // Wide enough for each row's shortcut where the terminal leaves room around it; otherwise as wide as the
+            // longest label, and rows whose shortcut no longer fits drop it rather than wrap.
+            let labels = choices.iter().map(|c| c.label.width()).max().unwrap_or(0) + 4;
+            let hinted = choices.iter().map(|c| c.label.width() + hint(c)).max().unwrap_or(0) + 4;
+            let width = (if hinted + 4 <= frame.area().width as usize { hinted } else { labels })
                 .max(20)
                 .min(frame.area().width as usize) as u16;
             let height = (entries.len() + 3).min(frame.area().height as usize) as u16;
@@ -1620,6 +1653,7 @@ impl App {
         };
         geometry.modal = area;
         if area.is_empty() {
+            modal.top = 0;
             return;
         }
         frame.render_widget(Clear, area);
@@ -1644,7 +1678,7 @@ impl App {
                 let rows = details::footer_rows(&details_buttons, content.width, content.height.saturating_sub(1)).min(content.height);
                 let footer = Rect::new(content.x, content.bottom().saturating_sub(rows), content.width, rows);
                 content.height = content.height.saturating_sub(rows + u16::from(content.height > rows + 2));
-                details::paint_footer(frame, geometry, footer, &details_buttons, kind, p);
+                details::paint_footer(frame, geometry, footer, &details_buttons, kind, if kind == crate::app::Details::Trust { details_focus } else { 0 }, p);
             }
             let body = match &modal.kind {
                 Prompt::Details { body, .. } => body.as_str(),
@@ -1664,20 +1698,26 @@ impl App {
                 .min(wrapped.len().saturating_sub(content.height as usize));
             for (n, text) in wrapped
                 .iter()
+                .enumerate()
                 .skip(modal.top)
                 .take(content.height as usize)
-                .enumerate()
             {
-                line(
-                    frame.buffer_mut(),
-                    row(content, n as u16),
-                    text,
-                    style(p.fg, p.status_bg).add_modifier(if text.split_once(':').is_some_and(|(label, _)| label.len() <= 40 && !label.contains('/') && !label.contains('`')) { Modifier::BOLD } else { Modifier::empty() }),
-                );
+                // As in the GUI: a section heading bold, a label dimmer than its value.
+                let at = row(content, (n - modal.top) as u16);
+                match code_core::chrome::detail_line(n.checked_sub(1).map(|i| wrapped[i].as_str()), text) {
+                    code_core::chrome::DetailLine::Heading => line(frame.buffer_mut(), at, text, style(p.fg, p.status_bg).add_modifier(Modifier::BOLD)),
+                    code_core::chrome::DetailLine::Labelled(end) => {
+                        let (label, value) = text.split_at(end.min(text.len()));
+                        let width = (label.width() as u16).min(at.width);
+                        line(frame.buffer_mut(), Rect { width, ..at }, label, style(p.dim, p.status_bg));
+                        line(frame.buffer_mut(), Rect { x: at.x + width, width: at.width - width, ..at }, value, style(p.fg, p.status_bg));
+                    }
+                    code_core::chrome::DetailLine::Plain => line(frame.buffer_mut(), at, text, style(p.fg, p.status_bg)),
+                }
             }
             return;
         }
-        let input_rows = if context || themes || modal.kind == Prompt::LanguageServer {
+        let input_rows = if context || themes || matches!(modal.kind, Prompt::LanguageServer | Prompt::BranchMenu { .. }) {
             0
         } else {
             1 + usize::from(
@@ -1688,14 +1728,14 @@ impl App {
             )
         };
         for i in 0..input_rows.min(content.height as usize) {
-            let active = (i == 1) == modal.secondary_focus;
-            let prefix = if modal.kind == Prompt::Branches { "Filter: " } else if active { "› " } else { "  " };
-            let room = content.width.saturating_sub(prefix.len() as u16) as usize;
-            let text = field_text(modal, i == 1);
-            let tail = tail_columns(&text, room);
-            let bg = if modal.kind == Prompt::Branches { p.bg } else { p.status_bg };
-            fill(frame.buffer_mut(), row(content, i as u16), style(p.fg, bg));
-            line(frame.buffer_mut(), row(content, i as u16), &format!("{prefix}{tail}"), style(if active { p.fg } else { p.dim }, bg));
+            let active=(i==1)==modal.secondary_focus;
+            let prefix=if modal.kind==Prompt::Branches { "Filter: ".to_string() } else if i==1 && modal.kind==Prompt::Find { format!("  {}: ",CommandId::ReplaceMatch.label()) } else if active { "› ".into() } else { "  ".into() };
+            let r=row(content,i as u16);let bg=if modal.kind==Prompt::Branches {p.bg}else{p.status_bg};
+            fill(frame.buffer_mut(),r,style(p.fg,bg));line(frame.buffer_mut(),r,&prefix,style(p.dim,bg));
+            let offset=(prefix.width() as u16).min(r.width);
+            let text=if i==1{&modal.secondary}else{&modal.input};
+            let cursor=modal.editors[i].unwrap_or_else(||if active {Self::field_cursor(modal)}else{Default::default()});
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text,cursor,area:Rect::new(r.x+offset,r.y,r.width.saturating_sub(offset),r.height),active},style(p.fg,bg),style(p.fg,p.selected_bg));
         }
         let list_y = input_rows.min(content.height as usize) as u16;
         let reserve = u16::from(!themes && content.height > list_y);
@@ -1709,6 +1749,14 @@ impl App {
         // Wrapped details participate in scrolling: selection remains a choice index, top is a visual row.
         let width = list.width.max(1) as usize;
         let mut rendered = Vec::new();
+        if modal.kind == Prompt::Branches {
+            let notice = branch_notice.as_deref().or(choices.is_empty().then_some("Nothing matches this filter"));
+            if let Some(notice) = notice {
+                for text in wrap_text(notice, width) {
+                    rendered.push((usize::MAX, text, true));
+                }
+            }
+        }
         if themes {
             for header in [
                 "↑/↓ choose · Enter select · Esc close".to_owned(),
@@ -1720,10 +1768,35 @@ impl App {
             }
         }
         let mut selected = 0..0;
+        let branch_list = modal.kind == Prompt::Branches;
+        let menu_marks = matches!(modal.kind, Prompt::Menu(_) | Prompt::LanguageServer) && choices.iter().any(|c| code_core::chrome::toggle_split(&c.label).1.is_some());
         modal.at = modal.at.min(choices.len().saturating_sub(1));
+        let mut previous_section = None;
+        let headings = if modal.kind == Prompt::LanguageServer { self.session.language_server_headings() } else { Vec::new() };
         for (i, choice) in choices.iter().enumerate() {
-            if modal.kind == Prompt::LanguageServer && matches!(i, 4 | 8) {
-                rendered.push((usize::MAX, if i == 4 { "Setup" } else { "Indexing" }.to_string(), true));
+            if choice.section != previous_section {
+                if let Some(section) = choice.section {
+                    // The branch picker: a rule above every section, its heading with its size.
+                    if branch_list && !rendered.is_empty() { rendered.push((usize::MAX, "─".repeat(width), true)); }
+                    let heading = if branch_list { code_core::branches::section_heading(section, self.session.state().branch_section_len(section, &modal.input)) } else { code_core::branches::branch_section_label(section).to_string() };
+                    for text in wrap_text(&heading, width) {
+                        rendered.push((usize::MAX, text, true));
+                    }
+                }
+                previous_section = choice.section;
+            }
+            // A branch row: one line, its name cut in the middle when long, its detail on the right.
+            if branch_list {
+                let path = matches!(choice.target, crate::app::ChoiceTarget::Branch(code_core::branches::BranchTarget::Worktree(_)));
+                let (name, detail) = code_core::branches::fit_text(&choice.label, choice.detail.as_deref().unwrap_or_default(), path, width.saturating_sub(2));
+                let marker = if i == modal.at { "› " } else { "  " };
+                let pad = width.saturating_sub(marker.width() + name.width() + detail.width());
+                if i == modal.at { selected = rendered.len()..rendered.len() + 1; }
+                rendered.push((i, format!("{marker}{name}{}{detail}", " ".repeat(pad)), false));
+                continue;
+            }
+            if modal.kind == Prompt::LanguageServer && let Some((_, title)) = headings.iter().find(|(at, _)| *at == i) {
+                rendered.push((usize::MAX, title.to_string(), true));
             }
             if separators.contains(&i) {
                 rendered.push((usize::MAX, "─".repeat(width), true));
@@ -1739,17 +1812,18 @@ impl App {
                     .unwrap_or_default()
             };
             let shortcut = if action_list { match choice.target { crate::app::ChoiceTarget::Action(id) => self.session.key_hint(id), _ => None } } else { None };
-            let shortcut = shortcut.filter(|key| key.width() + 3 < width / 2);
+            let shortcut = shortcut.filter(|key| key.width() + 3 < width / 2 && choice.label.width() + suffix.width() + 2 + key.width() + 3 <= width);
             let label_width = shortcut.as_ref().map_or(width, |key| width.saturating_sub(key.width() + 3).max(1));
-            for (part, text) in wrap_text(
-                &format!(
-                    "{}{}{}",
-                    if i == modal.at { "› " } else { "  " },
-                    choice.label,
-                    suffix
-                ),
-                label_width,
-            ).into_iter().enumerate() {
+            // A menu draws a setting's state as a mark in a column of its own, as the command list does.
+            let label = if !menu_marks || choice.label.starts_with('─') { choice.label.clone() } else {
+                let (label, on) = code_core::chrome::toggle_split(&choice.label);
+                format!("{}{label}", if on.is_some() { code_core::chrome::toggle_mark(on) } else { "  " })
+            };
+            // A wrapped label's continuation keeps the label's indent, clear of the selection marker.
+            for (part, text) in wrap_text(&format!("{label}{suffix}"), label_width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+                .map(|(part, text)| (part, format!("{}{text}", if part == 0 && i == modal.at { "› " } else { "  " }))) {
                 let text = match shortcut.as_ref().filter(|key| part == 0 && key.width() + 3 < width / 2) {
                     Some(key) => format!("{text}{}{key}", " ".repeat(width.saturating_sub(text.width() + key.width()))),
                     None => text,
@@ -1773,6 +1847,7 @@ impl App {
             }
             modal.reveal_selection = false;
         }
+        lenz_terminal_ui::scroll_thumb(frame.buffer_mut(), list.right(), list.y, list.height, (rendered.len(), modal.top, list.height as usize), style(p.fg, p.status_bg));
         for (n, (i, text, disabled)) in rendered
             .iter()
             .skip(modal.top)
@@ -1781,7 +1856,7 @@ impl App {
         {
             geometry.modal_items.push(*i);
             let bg = if *i == modal.at {
-                p.selected_bg
+                p.menu_selected(p.status_bg)
             } else {
                 p.status_bg
             };
@@ -1792,7 +1867,8 @@ impl App {
                 r,
                 text,
                 style(
-                    if themes && *i == usize::MAX {
+                    // a section heading is not one more (disabled) command
+                    if (themes || matches!(modal.kind, Prompt::Branches | Prompt::LanguageServer)) && *i == usize::MAX {
                         p.accent
                     } else if *disabled {
                         p.dim
@@ -1802,6 +1878,26 @@ impl App {
                     bg,
                 ),
             );
+            // A branch row's parts: its mark (the current one in the accent), its dim detail, a Show more row a link.
+            if branch_list && let Some(choice) = choices.get(*i) {
+                let target = match &choice.target { crate::app::ChoiceTarget::Branch(t) => Some(t), _ => None };
+                let buf = frame.buffer_mut();
+                if matches!(target, Some(code_core::branches::BranchTarget::More(_))) {
+                    let link = (choice.label.trim().width() as u16).min(r.width.saturating_sub(4));
+                    buf.set_style(Rect { x: r.x + 4, width: link, ..r }, style(p.accent, bg).add_modifier(Modifier::UNDERLINED));
+                } else if r.width > 3 {
+                    // the mark after its folder's indent: the current one and a star in the accent
+                    let trimmed = choice.label.trim_start_matches(' ');
+                    let indent = (choice.label.len() - trimmed.len()) as u16;
+                    if let Some(mark) = code_core::branches::MARKS.iter().find(|m| trimmed.starts_with(**m)) {
+                        let tone = if matches!(*mark, "●" | "★") { p.accent } else { p.dim };
+                        buf.set_style(Rect { x: (r.x + 2 + indent).min(r.right().saturating_sub(1)), width: 1, ..r }, style(tone, bg));
+                    }
+                    let path = matches!(target, Some(code_core::branches::BranchTarget::Worktree(_)));
+                    let detail = code_core::branches::fit_text(&choice.label, choice.detail.as_deref().unwrap_or_default(), path, width.saturating_sub(2)).1.width() as u16;
+                    if detail > 0 { buf.set_style(Rect { x: r.right().saturating_sub(detail), width: detail.min(r.width), ..r }, style(p.dim, bg)); }
+                }
+            }
         }
         if reserve > 0 {
             // The find prompt says which match is current, or why the expression cannot be matched.
@@ -1813,9 +1909,17 @@ impl App {
                 if counter.is_empty() { hint.to_owned() } else { format!("{counter} · {hint}") }
             });
             let recent_hint = code_core::start::recent_hint(self.session.primary_modifier());
+            // A branch name cut short on its row reads in full here while it is highlighted.
+            let full_name = choices.get(modal.at).filter(|_| branch_list).and_then(|c| {
+                let path = matches!(c.target, crate::app::ChoiceTarget::Branch(code_core::branches::BranchTarget::Worktree(_)));
+                let detail = c.detail.as_deref().unwrap_or_default();
+                (code_core::branches::fit_text(&c.label, detail, path, width.saturating_sub(2)).0 != c.label)
+                    .then(|| if detail.is_empty() { c.label.trim_start().to_string() } else { format!("{}  ·  {detail}", c.label.trim_start()) })
+            });
             let footer = modal
                 .error
                 .as_deref()
+                .or(full_name.as_deref())
                 .or(find_footer.as_deref())
                 .or_else(|| {
                     action_list
@@ -1827,6 +1931,7 @@ impl App {
                         .then_some(runtime_message.as_deref())
                         .flatten()
                 })
+                .or(branch_footer.filter(|_| modal.kind == Prompt::Branches))
                 .unwrap_or(if modal.kind == Prompt::LanguageServer {
                     "Ctrl+C copies details · Enter runs action · Esc closes"
                 } else if modal.kind == Prompt::Menu(None) {
@@ -1837,6 +1942,8 @@ impl App {
                     recent_hint.as_str()
                 } else if matches!(modal.kind, Prompt::OpenFolder | Prompt::OpenFolderInProjectTab) {
                     "Enter open · Tab complete · Ctrl+Enter new project tab · ↑↓ choose · Esc close"
+                } else if matches!(modal.kind, Prompt::BranchMenu { .. }) {
+                    "Enter runs · ← / Esc back"
                 } else {
                     "Enter accepts · Esc closes · ↑↓ selects · Tab field"
                 });
@@ -1854,38 +1961,13 @@ impl App {
                 ),
             );
         }
-        if !context
-            && !themes
-            && modal.kind != Prompt::LanguageServer
-            && content.height > 0
-            && content.width > 2
-        {
-            let text = field_text(modal, modal.secondary_focus);
-            frame.set_cursor_position((
-                content.x
-                    + 2
-                    + UnicodeWidthStr::width(tail_columns(
-                        &text,
-                        content.width.saturating_sub(3) as usize,
-                    ))
-                    .min(content.width.saturating_sub(3) as usize) as u16,
-                content.y + u16::from(modal.secondary_focus).min(content.height - 1),
-            ));
-        }
+
     }
 }
 
 /// What the find prompt's footer says under its fields.
 const FIND_HINT: &str = "Enter replaces · Alt+A all · Tab field · Esc closes";
 const FIND_QUERY_HINT: &str = "Enter next · F3 / Shift+F3 · Tab replace · Esc closes";
-
-/// A prompt field as drawn: the find prompt's second row is its replacement text, labelled so an empty one is
-/// clear; the caret column follows the same text.
-fn field_text(modal: &crate::app::Modal, second: bool) -> std::borrow::Cow<'_, str> {
-    use std::borrow::Cow;
-    let text = if second { modal.secondary.as_str() } else { modal.input.as_str() };
-    if second && modal.kind == Prompt::Find { Cow::Owned(format!("{}: {text}", CommandId::ReplaceMatch.label())) } else { Cow::Borrowed(text) }
-}
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(
@@ -1945,6 +2027,19 @@ fn text_area(state: &State, pane: u8, area: Rect) -> Rect {
 }
 
 /// The scrollbar column beside a pane's text: empty when the pane has none.
+/// The file's Preview/Table toggle, over the top-right of its text (one cell in from the edge), drawn after the
+/// pane so it stays on top. Panes too narrow for it keep the F10 and key action.
+fn draw_file_toggle(frame: &mut ratatui::Frame, app: &App, geometry: &mut PaneGeometry, p: &Palette) {
+    let text = geometry.text;
+    let Some(control) = app.session.csv_control(geometry.pane).or_else(|| app.session.preview_control(geometry.pane)) else { return };
+    if text.width < 17 || text.height < 2 { return; }
+    let button = Rect::new(text.right() - 10, text.y, 9, 1);
+    let st = style(if control.disabled.is_none() { p.fg } else { p.dim }, p.fold_bg);
+    fill(frame.buffer_mut(), button, st);
+    line(frame.buffer_mut(), button, &format!(" {} ", control.label), st);
+    geometry.controls.push((control.id, button));
+}
+
 fn strip_area(text: Rect, area: Rect) -> Rect {
     Rect::new(text.right(), text.y, area.right().saturating_sub(text.right()).min(1), text.height)
 }
@@ -2078,15 +2173,7 @@ fn draw_pane(
     }
     let active = state.shown(pane).map(Tab::id);
     fill(frame.buffer_mut(), row(area, 0), style(p.fg, p.header_bg));
-    let mut tab_end = area.right();
-    if let Some(control) = app.session.csv_control(pane).or_else(|| app.session.preview_control(pane)).filter(|_| area.width >= 17) {
-        let button = Rect::new(area.right() - 9, area.y, 9, 1);
-        let st = style(if control.disabled.is_none() { p.fg } else { p.dim }, p.fold_bg);
-        fill(frame.buffer_mut(), button, st);
-        line(frame.buffer_mut(), button, &format!(" {} ", control.label), st);
-        geometry.controls.push((control.id, button));
-        tab_end = button.x;
-    }
+    let tab_end = area.right();
     let mut x = area.x;
     let tab_width = tab_end.saturating_sub(x);
     geometry.tab_bar = Rect::new(x, area.y, tab_width, 1);
@@ -2783,6 +2870,13 @@ fn draw_source_row(
             let message = format!("{}: {}{extra}", problem.severity.label(), problem.message);
             line(buf, Rect::new(x, y, area.right() - x, 1), &message, style(fg, base));
         }
+    } else if r.last && !sticky && native.end.is_some() && !native.pending
+        && let Some((_, commit)) = state.caret_blame(tab.id()).filter(|(line, _)| *line == r.line) {
+        // Inline blame: the caret line's commit, faint, where no problem is labelled on that line.
+        let x = end_x.saturating_add(if fold.is_some_and(|(_, shut)| shut) { 2 } else { 0 }).saturating_add(2);
+        if x < area.right() {
+            line(buf, Rect::new(x, y, area.right() - x, 1), &commit, style(p.dim, base));
+        }
     }
 
 }
@@ -3164,18 +3258,6 @@ fn draw_markdown(
     }
 }
 
-fn tail_columns(text: &str, columns: usize) -> &str {
-    let mut width = 0;
-    let mut start = text.len();
-    for (i, g) in text.grapheme_indices(true).rev() {
-        width += UnicodeWidthStr::width(g);
-        if width > columns {
-            break;
-        }
-        start = i;
-    }
-    &text[start..]
-}
 
 /// `text` wrapped to `columns`, at most `max` lines, the last ending in `…` when cut.
 fn wrap(text: &str, columns: usize, max: usize) -> Vec<String> {

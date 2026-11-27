@@ -1,5 +1,76 @@
 use code_core::semantics::{installer, provider::{PROVIDERS, Settings}};
 
+// Tests here start processes and run in parallel threads: a child forked by one test holds every open file of the
+// test process until it execs, which keeps another test's install lock held or its fresh script busy ("Text file
+// busy"). They take this lock so no two start processes at once.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn spawning() -> std::sync::MutexGuard<'static, ()> { SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+
+#[test]
+#[ignore = "explicit live registry install into LENZ_INSTALL_PROBE_ROOT using an existing toolchain"]
+fn managed_server_live_install_probe() {
+    let id = std::env::var("LENZ_INSTALL_PROBE_PROVIDER").expect("choose a curated provider");
+    let root = std::path::PathBuf::from(std::env::var_os("LENZ_INSTALL_PROBE_ROOT").expect("choose a disposable absolute output folder"));
+    assert!(root.is_absolute()); std::fs::create_dir_all(&root).unwrap();
+    let provider = PROVIDERS.iter().find(|p| p.id == id).unwrap();
+    let settings = Settings::default(); let file = root.join("providers.json"); assert!(settings.save(&file));
+    let preview = installer::preview(provider, &settings, &root.join("servers"));
+    assert!(preview.disabled.is_none(), "{:?}", preview.disabled);
+    eprintln!("LIVE_INSTALL_COMMAND {}", preview.command);
+    let mut plan = preview.plan.unwrap(); let cancel = std::sync::atomic::AtomicBool::new(false);
+    if let Some(cache) = std::env::var_os("LENZ_INSTALL_PROBE_GEM_CACHE") {
+        assert_eq!(id, "ruby-lsp"); std::fs::create_dir_all(&plan.directory).unwrap();
+        for entry in std::fs::read_dir(cache).unwrap() {
+            let entry = entry.unwrap(); if entry.path().extension().is_some_and(|s| s == "gem") { std::fs::copy(entry.path(), plan.directory.join(entry.file_name())).unwrap(); }
+        }
+        plan.args.push("--local".into());
+        eprintln!("LIVE_INSTALL_OFFLINE_GEM_CACHE (registry access is not exercised)");
+    }
+    let lock = installer::run(&plan, &cancel, &mut |chunk| eprint!("{chunk}")).unwrap();
+    installer::persist(&plan, &file, &settings, &cancel).unwrap(); drop(lock);
+    assert_eq!(Settings::read(&file).providers[&id].executable.as_ref(), Some(&plan.executable));
+    eprintln!("LIVE_INSTALL_PASSED {} {}", id, plan.executable.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_ruby_and_go_install_validate_and_persist_only_the_selected_provider() {
+    let _spawning = spawning();
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicBool};
+    let d = tempfile::tempdir().unwrap(); let bin = d.path().join("toolchain"); std::fs::create_dir(&bin).unwrap();
+    for (name, script) in [
+        ("ruby", "#!/bin/sh\ncase \"$1\" in --version) echo 'ruby 3.3.6';; --disable=gems) [ \"$2\" = -c ];; -rrubygems) echo 0.26.11;; *) exit 19;; esac\n"),
+        ("gem", "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --install-dir) shift; gems=$1;; --bindir) shift; bin=$1;; esac; shift; done\nmkdir -p \"$gems\" \"$bin\"\nprintf '#!/usr/bin/env ruby\\n' > \"$bin/ruby-lsp\"\nchmod 700 \"$bin/ruby-lsp\"\n"),
+        ("go", "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'go version go1.26.0 linux/amd64'; exit; fi\n[ \"$1\" = install ] && [ \"$2\" = golang.org/x/tools/gopls@v0.24.0 ] || exit 18\n[ \"$GOWORK\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 17\nmkdir -p \"$GOBIN\"\nprintf '#!/bin/sh\\necho \"golang.org/x/tools/gopls v0.24.0\"\\n' > \"$GOBIN/gopls\"\nchmod 700 \"$GOBIN/gopls\"\n"),
+    ] { let path = bin.join(name); std::fs::write(&path, script).unwrap(); std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap(); }
+    for id in ["ruby-lsp", "gopls"] {
+        let provider = PROVIDERS.iter().find(|p| p.id == id).unwrap();
+        let mut settings = Settings::default();
+        let entry = settings.providers.entry(id.into()).or_default();
+        entry.env.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+        entry.settings = Some(serde_json::json!({"keep":true}));
+        let file = d.path().join(format!("{id}.json")); assert!(settings.save(&file));
+        let preview = installer::preview(provider, &settings, &d.path().join("servers"));
+        assert!(preview.disabled.is_none(), "{:?}", preview.disabled);
+        assert!(preview.command.contains("No sudo or project manifest changes"));
+        let plan = preview.plan.unwrap(); let cancel = AtomicBool::new(false);
+        let lock = installer::run(&plan, &cancel, &mut |_| {}).unwrap();
+        installer::persist(&plan, &file, &settings, &cancel).unwrap(); drop(lock);
+        let saved = Settings::read(&file);
+        assert_eq!(saved.providers[id].executable.as_ref(), Some(&plan.executable));
+        assert_eq!(saved.providers[id].settings, settings.providers[id].settings);
+        if id == "ruby-lsp" { assert_eq!(saved.providers[id].env["GEM_HOME"], plan.directory.join("gems").display().to_string()); }
+        else {
+            assert!(!saved.providers[id].env.contains_key("GOBIN"), "build-only environment is not persisted");
+            let script = std::fs::read_to_string(bin.join("go")).unwrap().replace("echo \"golang.org/x/tools/gopls v0.24.0\"", "echo wrong-package");
+            std::fs::write(bin.join("go"), script).unwrap();
+            assert!(installer::run(&plan, &cancel, &mut |_| {}).unwrap_err().contains("version failed validation"));
+        }
+        let mut custom = settings.clone(); custom.providers.get_mut(id).unwrap().executable = Some("/custom/server".into());
+        assert!(installer::preview(provider, &custom, &d.path().join("servers")).disabled.unwrap().contains("custom"));
+    }
+}
+
 #[test]
 fn server_install_recipes_are_curated_and_preserve_custom_configuration() {
     let temp = tempfile::tempdir().unwrap();
@@ -19,6 +90,7 @@ fn server_install_recipes_are_curated_and_preserve_custom_configuration() {
 #[cfg(unix)]
 #[test]
 fn server_install_streams_bounded_output_cancels_and_preserves_settings() {
+    let _spawning = spawning();
     use std::{os::unix::fs::PermissionsExt, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
@@ -50,6 +122,7 @@ fn server_install_streams_bounded_output_cancels_and_preserves_settings() {
 #[cfg(unix)]
 #[test]
 fn server_install_uses_the_selected_node_for_npm_and_validates_before_persisting() {
+    let _spawning = spawning();
     use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicBool};
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
@@ -102,12 +175,15 @@ fn server_install_uses_the_selected_node_for_npm_and_validates_before_persisting
     assert!(why.contains("executable"),"{why}");
     let script=std::fs::read_to_string(&npm).unwrap().replace("chmod 600","chmod 700").replace("1.1.414","0.0.0");
     std::fs::write(&npm,script).unwrap();
-    assert!(installer::run(&plan,&AtomicBool::new(false),&mut |_|{}).unwrap_err().contains("version"));
+    let mut validation_output = String::new();
+    let why = installer::run(&plan,&AtomicBool::new(false),&mut |chunk| validation_output.push_str(chunk)).unwrap_err();
+    assert!(why.contains("version"), "expected the wrong package version to be rejected, got: {why}\nInstaller output:\n{validation_output}");
 }
 
 #[cfg(unix)]
 #[test]
 fn server_install_bounds_and_sanitizes_subprocess_output() {
+    let _spawning = spawning();
     use std::{os::unix::fs::PermissionsExt,sync::atomic::AtomicBool};
     let dir=tempfile::tempdir().unwrap();let bin=dir.path().join("bin");std::fs::create_dir(&bin).unwrap();
     for (name,script) in [("node","#!/bin/sh\nif [ \"$1\" = --version ]; then echo v24.0.0; else exec \"$@\"; fi\n"),("npm","#!/bin/sh\nprintf '\\033[31m'\n/usr/bin/head -c 131072 /dev/zero\nexit 1\n")] {
@@ -143,6 +219,7 @@ fn server_install_lock_child() {
 #[cfg(unix)]
 #[test]
 fn server_install_lock_excludes_an_independent_process_and_cancel_allows_retry() {
+    let _spawning = spawning();
     use std::{os::unix::fs::PermissionsExt,sync::atomic::{AtomicBool,Ordering},time::{Duration,Instant}};
     let dir=tempfile::tempdir().unwrap();let bin=dir.path().join("bin");std::fs::create_dir(&bin).unwrap();
     for (name,script) in [("node","#!/bin/sh\nif [ \"$1\" = --version ]; then echo v24.0.0; else exec \"$@\"; fi\n"),("npm","#!/bin/sh\necho started >> \"$3/starts\"\necho LOCK_READY\nexec /bin/sleep 30\n")] {

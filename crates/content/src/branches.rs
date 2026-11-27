@@ -129,22 +129,60 @@ pub struct Refs {
     pub remote: Vec<String>,
     pub tags: Vec<String>,
     pub current: Option<String>,
+    /// Each local branch's upstream, as git names it (`origin/main`), for the branches that track one.
+    pub upstream: std::collections::BTreeMap<String, String>,
+    /// How far each local branch is from its upstream; read after the lists ([`tracking`]), so empty until then.
+    pub track: std::collections::BTreeMap<String, Track>,
+}
+
+/// A local branch against its upstream: commits only it has, commits only the upstream has, or an upstream that is
+/// gone (deleted on the remote and pruned).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Track { pub ahead: u32, pub behind: u32, pub gone: bool }
+
+impl Track {
+    /// As the picker shows it: `↑2 ↓1`, `gone`, or nothing when even.
+    pub fn label(self) -> String {
+        if self.gone { return "gone".into(); }
+        [(self.ahead, '↑'), (self.behind, '↓')].into_iter().filter(|(n, _)| *n > 0).map(|(n, a)| format!("{a}{n}")).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// How far each local branch with an upstream is from it. git walks history for each one, so this is read apart
+/// from [`refs`] (it can take a while across thousands of commits) and never holds up the lists.
+pub fn tracking(root: &Path) -> Result<std::collections::BTreeMap<String, Track>, String> {
+    let out = git::run(root, &["for-each-ref", "--format=%(refname)%00%(upstream:track,nobracket)", "refs/heads"])?;
+    Ok(String::from_utf8_lossy(&out).lines().filter_map(|line| {
+        let (name, track) = line.split_once('\0')?;
+        let name = name.strip_prefix("refs/heads/")?;
+        if track.is_empty() { return None; }
+        let mut t = Track { gone: track == "gone", ..Track::default() };
+        for part in track.split(", ") {
+            if let Some(n) = part.strip_prefix("ahead ") { t.ahead = n.parse().ok()?; }
+            if let Some(n) = part.strip_prefix("behind ") { t.behind = n.parse().ok()?; }
+        }
+        Some((name.to_string(), t))
+    }).collect())
 }
 
 /// How many recently checked-out branches [`refs`] lists.
 pub const RECENT: usize = 5;
 
 pub fn refs(root: &Path) -> Result<Refs, String> {
-    let out = git::run(root, &["for-each-ref", "--sort=refname", "--format=%(refname)%00%(HEAD)", "refs/heads", "refs/remotes", "refs/tags"])?;
+    let out = git::run(root, &["for-each-ref", "--sort=refname", "--format=%(refname)%00%(HEAD)%00%(upstream:short)", "refs/heads", "refs/remotes", "refs/tags"])?;
     let mut refs = Refs::default();
     for line in String::from_utf8_lossy(&out).lines() {
-        let (name, head) = line.split_once('\0').unwrap_or((line, ""));
+        let (name, rest) = line.split_once('\0').unwrap_or((line, ""));
+        let (head, upstream) = rest.split_once('\0').unwrap_or((rest, ""));
         if name.rsplit('/').next().is_some_and(|n| n.starts_with('-')) || name.contains("/-") {
             continue; // named like an option: only `update-ref` makes those, and git is never handed them
         }
         if let Some(b) = name.strip_prefix("refs/heads/") {
             if head == "*" {
                 refs.current = Some(b.to_string());
+            }
+            if !upstream.is_empty() {
+                refs.upstream.insert(b.to_string(), upstream.to_string());
             }
             refs.local.push(b.to_string());
         } else if let Some(r) = name.strip_prefix("refs/remotes/").filter(|r| !r.ends_with("/HEAD")) {
@@ -326,7 +364,7 @@ fn parse_status(entry: &[u8]) -> Option<(String, FileStatus)> {
 fn read_status(dir: &Path, untracked: &str, each: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), String> {
     use std::io::{BufRead, Read};
     let mut child = git::command(dir)?
-        .args(["status", "--porcelain=v2", "-z", untracked])
+        .args(["status", "--porcelain=v2", "-z", "--ignore-submodules=dirty", untracked])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -532,7 +570,7 @@ fn smart(root: &Path, args: &[&str]) -> Result<Outcome, CheckoutError> {
 /// stays and the conflicted files (possibly none) are returned.
 fn restore(root: &Path) -> Result<(), Vec<String>> {
     let conflicted = || {
-        let out = git::run(root, &["diff", "--name-only", "--diff-filter=U", "-z"]).unwrap_or_default();
+        let out = git::run(root, &["diff", "--name-only", "--diff-filter=U", "-z", "--ignore-submodules=dirty"]).unwrap_or_default();
         out.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect::<Vec<_>>()
     };
     if git::run_as_user(root, &["stash", "pop", "--index"]).is_ok() {
@@ -574,7 +612,7 @@ fn blocked(stderr: &str) -> Option<CheckoutError> {
 
 /// Every tracked file with uncommitted changes, staged or not: what Force Checkout discards.
 pub fn discarded_by_force(root: &Path) -> Result<Vec<String>, String> {
-    let out = git::run(root, &["status", "--porcelain=v1", "-z", "--untracked-files=no"])?;
+    let out = git::run(root, &["status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=dirty"])?;
     let mut entries = out.split(|&b| b == 0).filter(|e| !e.is_empty());
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
@@ -651,7 +689,9 @@ pub struct CheckoutProblem {
 /// How a checkout target is named in messages: the branch it ends on, or the revision.
 pub fn target_label(t: &Target) -> &str {
     match t {
-        Target::Branch(b) | Target::Detached(b) | Target::Remote(b) => b,
+        // A tag is checked out by its full name; it is shown by its own.
+        Target::Detached(b) => b.strip_prefix("refs/tags/").unwrap_or(b),
+        Target::Branch(b) | Target::Remote(b) => b,
     }
 }
 
@@ -726,8 +766,9 @@ pub fn default_base(root: &Path) -> Option<Base> {
     }).collect();
     let listed = |name: &str| found.iter().any(|(r, _)| *r == name.as_bytes());
     let (local, remote) = BASES.split_at(2);
-    // A broken origin/HEAD (its branch deleted) is not listed.
-    let origin_head = || found.iter().find(|(r, s)| *r == b"refs/remotes/origin/HEAD" && !s.is_empty()).map(|(_, s)| *s);
+    // A broken origin/HEAD (its branch deleted) is not listed. The repository writes origin/HEAD itself: only a
+    // remote-tracking target names a base branch, never a word Lenz Diff would read as a subcommand or option.
+    let origin_head = || found.iter().find(|(r, s)| *r == b"refs/remotes/origin/HEAD" && s.starts_with(b"refs/remotes/")).map(|(_, s)| *s);
     let name = local.iter().find(|b| listed(b)).map(|b| b.as_bytes())
         .or_else(origin_head)
         .or_else(|| remote.iter().find(|b| listed(b)).map(|b| b.as_bytes()))?;
@@ -792,6 +833,24 @@ mod tests {
         git(r.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
         git(r.path(), &["update-ref", "-d", "refs/remotes/origin/master"]);
         assert_eq!(base(r.path()), None);
+    }
+
+    #[test]
+    fn an_origin_head_outside_refs_remotes_is_no_base() {
+        let r = two_branches();
+        git(r.path(), &["branch", "-q", "-m", "main", "dev"]);
+        let sha = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::create_dir_all(r.path().join(".git/refs/remotes/origin")).unwrap();
+        for target in ["pr", "merge", "--about", "refs/heads/dev"] {
+            if !target.starts_with("refs/") {
+                std::fs::write(r.path().join(".git").join(target), format!("{sha}\n")).unwrap();
+            }
+            std::fs::write(r.path().join(".git/refs/remotes/origin/HEAD"), format!("ref: {target}\n")).unwrap();
+            assert_eq!(default_base(r.path()), None, "{target}: a Lenz Diff subcommand or local ref is no base branch");
+        }
+        git(r.path(), &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(r.path(), &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
+        assert_eq!(default_base(r.path()).map(|b| b.name).as_deref(), Some("refs/remotes/origin/trunk"));
     }
 
     #[test]
@@ -908,6 +967,28 @@ mod tests {
         checkout(r.path(), &Target::Remote("origin/feature/y".into()), Mode::Normal).unwrap();
         assert_eq!(branch(r.path()).as_deref(), Some("feature/y"));
         assert!(matches!(checkout(r.path(), &Target::Detached("nope".into()), Mode::Normal), Err(CheckoutError::Git(e)) if e == "No commit named \"nope\""));
+    }
+
+    #[test]
+    fn a_nested_repositorys_own_config_runs_nothing() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ran = elsewhere.path().join("ran");
+        let hook = elsewhere.path().join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let r = crate::git::testing::nested_with_fsmonitor(&hook);
+        status(r.path(), 100, &|| false).unwrap();
+        discarded_by_force(r.path()).unwrap();
+        assert!(worktrees(r.path()).unwrap().iter().all(|w| w.dirty.is_some()));
+        assert!(!ran.exists(), "git ran status inside the nested repository");
+        // a moved gitlink is still listed
+        git(&r.path().join("sub"), &["config", "--unset", "core.fsmonitor"]);
+        commit_all(&r.path().join("sub"), "moved");
+        assert_eq!(status(r.path(), 100, &|| false).unwrap().files, [("sub".to_string(), FileStatus::Modified)]);
+        git(&r.path().join("sub"), &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        write(&r.path().join("sub"), "f", "c\n");
+        crate::git::testing::try_git(r.path(), &["status"]);
+        assert!(ran.exists(), "git itself runs it");
     }
 
     #[test]

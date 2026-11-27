@@ -4,6 +4,8 @@
 #![deny(unsafe_code)] // audited FFI only: the macOS terminal's `os` module in `terminal/worker.rs`
 
 pub mod actions;
+pub mod archive;
+pub mod archive_tree;
 mod analysis;
 mod draft;
 pub mod save;
@@ -48,6 +50,9 @@ mod snippet;
 pub mod session;
 pub mod shown;
 pub mod breadcrumbs;
+mod reference;
+mod relevant;
+mod ruby_declarations;
 pub mod tabs;
 pub mod template;
 pub mod watch;
@@ -55,6 +60,8 @@ pub mod watch;
 pub mod workspace;
 
 pub mod navigation;
+pub mod line_edit;
+pub mod scratch;
 
 pub mod text;
 
@@ -69,4 +76,5 @@ pub mod layout;
 mod layout_jobs;
 
 pub mod native;
+pub mod open_path;
 pub mod terminal;

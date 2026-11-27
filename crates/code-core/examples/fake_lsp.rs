@@ -20,6 +20,8 @@
 //! replacement starting at 0:0 here); a change without a range leaves its text as it was.
 //! `FAKE_LSP_PULL_DIAGNOSTICS` publishes only for the first version and otherwise answers `textDocument/diagnostic`.
 //! `html/autoInsert` (VS Code's HTML server's request) closes the `<NAME>` just typed (`slow*` names 400 ms late).
+//! On-type formatting after Enter answers as Ruby LSP does: `end` below a block opener while the file does not parse
+//! (`FAKE_LSP_NO_ON_TYPE`: not offered). `rubyLsp/workspace/dependencies` lists the gem folders in `FAKE_LSP_GEMS`.
 //! Formatting re-indents by brace depth with the requested options and trims trailing blanks (`slow_format` in the
 //! text answers 400 ms late, `error_format` fails; `FAKE_LSP_NO_FORMAT`: not offered; `FAKE_LSP_LINE_FORMAT`: one edit per
 //! changed line instead of one for the whole text). Organize imports sorts the
@@ -125,6 +127,10 @@ impl Fake {
     fn diagnostics(&self, text: &str) -> Vec<Value> {
         let word = |c: char| c.is_alphanumeric() || c == '_';
         let mut found = Vec::new();
+        // As JDT LS 1.63 says of every publication for a file outside the project's source folders.
+        if env("FAKE_LSP_OUTSIDE").is_some() {
+            found.push(json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "severity": 2, "code": "32", "source": "Java", "message": "The file is not on the classpath of project proj, only syntax errors are reported" }));
+        }
         for (l, line) in text.split('\n').enumerate() {
             let line = line.trim_end_matches('\r');
             let mut at = 0;
@@ -453,8 +459,12 @@ fn main() {
                 if env("FAKE_LSP_NO_CODE_ACTION").is_none() {
                     caps["codeActionProvider"] = json!({ "codeActionKinds": ["quickfix", "refactor", "source.organizeImports"] });
                 }
+                if env("FAKE_LSP_RENAME").is_some() { caps["renameProvider"] = json!(true); }
                 if env("FAKE_LSP_NO_FORMAT").is_none() {
                     caps["documentFormattingProvider"] = json!(true);
+                }
+                if env("FAKE_LSP_NO_ON_TYPE").is_none() {
+                    caps["documentOnTypeFormattingProvider"] = json!({ "firstTriggerCharacter": "{", "moreTriggerCharacter": ["\n", "|", "d"] });
                 }
                 if env("FAKE_LSP_PULL_DIAGNOSTICS").is_some() {
                     caps["diagnosticProvider"] = json!({ "interFileDependencies": true, "workspaceDiagnostics": false });
@@ -603,6 +613,30 @@ fn main() {
             }
             // As VS Code's HTML server: `>` typed after `<NAME` (attributes allowed) closes NAME, `slow*` names 400 ms late;
             // anything else (or another kind) inserts nothing.
+            // As Ruby LSP 0.26.11 after Enter: below a line opening a block, while the file does not parse (an
+            // opener without its `end`, or `syntax_error` in the text), a line break and `end` at the opener's
+            // indentation, inserted at the caret as two edits, then a `$0` cursor marker (`slow_end` 400 ms late).
+            "textDocument/onTypeFormatting" => {
+                let p = &m["params"];
+                fake.log(&json!({ "onType": { "ch": p["ch"], "options": p["options"], "position": p["position"] } }));
+                let text = fake.text(p["textDocument"]["uri"].as_str().unwrap_or_default()).unwrap_or_default();
+                if text.contains("slow_end") { std::thread::sleep(std::time::Duration::from_millis(400)); }
+                let lines: Vec<&str> = text.split('\n').collect();
+                let line = p["position"]["line"].as_u64().unwrap_or(0) as usize;
+                let previous = lines.get(line.saturating_sub(1)).copied().unwrap_or_default();
+                let opens = |l: &str| { let t = l.trim(); ["def ", "class ", "module ", "if "].iter().any(|k| t.starts_with(k)) || t.ends_with(" do") };
+                let openers = lines.iter().filter(|l| opens(l)).count();
+                let ends = lines.iter().filter(|l| l.trim() == "end").count();
+                let broken = text.contains("syntax_error") || openers > ends;
+                if p["ch"] != "\n" || !opens(previous) || !broken { reply(&mut out, json!([])); continue; }
+                let indent = &previous[..previous.len() - previous.trim_start().len()];
+                let at = p["position"].clone();
+                reply(&mut out, json!([
+                    { "range": { "start": at, "end": at }, "newText": "\n" },
+                    { "range": { "start": at, "end": at }, "newText": format!("{indent}end") },
+                    { "range": { "start": at, "end": at }, "newText": "$0" },
+                ]));
+            }
             "html/autoInsert" => {
                 let p = &m["params"];
                 let uri = p["textDocument"]["uri"].as_str().unwrap_or_default().to_owned();
@@ -678,6 +712,24 @@ fn main() {
                 });
                 reply(&mut out, found.unwrap_or(Value::Null));
             }
+            "textDocument/rename" => {
+                let p = &m["params"];
+                let uri = p["textDocument"]["uri"].as_str().unwrap_or_default();
+                let name = fake.name_at(uri, &p["position"]).unwrap_or_default();
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                let mut changes = serde_json::Map::new();
+                for (uri, text) in fake.files() {
+                    let mut edits = Vec::new();
+                    for (line_number, line) in text.split('\n').enumerate() {
+                        for (i, _) in line.match_indices(&name).filter(|_| !name.is_empty()) {
+                            if line[..i].chars().next_back().is_some_and(word) || line[i + name.len()..].chars().next().is_some_and(word) { continue; }
+                            edits.push(json!({"range":{"start":{"line":line_number,"character":fake.units(&line[..i])},"end":{"line":line_number,"character":fake.units(&line[..i+name.len()])}},"newText":p["newName"]}));
+                        }
+                    }
+                    if !edits.is_empty() { changes.insert(uri,json!(edits)); }
+                }
+                reply(&mut out, json!({"changes":changes}));
+            }
             "textDocument/formatting" => {
                 let p = &m["params"];
                 let uri = p["textDocument"]["uri"].as_str().unwrap_or_default().to_owned();
@@ -713,6 +765,14 @@ fn main() {
                     json!({ "title": "Run something else", "kind": "quickfix", "command": { "title": "Other", "command": "evil.command", "arguments": [] } }),
                 ]).collect();
                 reply(&mut out, Value::Array(actions));
+            }
+            // Ruby LSP's add-on list, which Lenz asks behind text changes as a sync barrier.
+            "rubyLsp/workspace/addons" => reply(&mut out, json!([])),
+            // Ruby LSP's bundle: the gem folders in `FAKE_LSP_GEMS` (`:`-separated).
+            "rubyLsp/workspace/dependencies" => {
+                let gems: Vec<Value> = env("FAKE_LSP_GEMS").unwrap_or_default().split(':').filter(|p| !p.is_empty())
+                    .map(|p| json!({ "name": p.rsplit('/').next().unwrap_or(p), "version": "1.0", "path": p, "dependency": true })).collect();
+                reply(&mut out, Value::Array(gems));
             }
             "textDocument/diagnostic" => {
                 let text = fake.text(m["params"]["textDocument"]["uri"].as_str().unwrap_or_default()).unwrap_or_default();

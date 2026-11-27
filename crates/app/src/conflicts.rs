@@ -159,7 +159,7 @@ impl ConflictedFile {
 
 /// The Conflicted Files of the repository at `root` (its top level), in path order.
 pub fn list(root: &Path) -> Result<Vec<ConflictedFile>, String> {
-    let out = git::run(root, &["status", "--porcelain=v2", "-z", "--untracked-files=no"])?;
+    let out = git::run(root, &["status", "--porcelain=v2", "-z", "--untracked-files=no", "--ignore-submodules=dirty"])?;
     let mut fields = out.split(|&b| b == 0).filter(|f| !f.is_empty());
     let mut files = Vec::new();
     while let Some(entry) = fields.next() {
@@ -384,9 +384,19 @@ pub fn mark_resolved(root: &Path, path: &str, delete: bool) -> Result<(), String
 /// (`checkout --conflict`). A one-sided conflict has no markers to write: only its stages come back.
 pub fn reopen(root: &Path, path: &str, style: Style) -> Result<(), String> {
     let conflict = format!("--conflict={}", style.name());
-    let Err(e) = git::run(root, &["--literal-pathspecs", "checkout", &conflict, "--", path]) else { return Ok(()) };
-    // `--unresolve` succeeds silently when the index has nothing to restore
-    git::run(root, &["update-index", "--unresolve", "--", path]).map_err(|_| e.clone())?;
+    // the style reaches git's text merge standing in for a repository's merge driver (see `git::command`)
+    let config = format!("merge.conflictStyle={}", style.name());
+    let Err(e) = git::run(root, &["-c", &config, "--literal-pathspecs", "checkout", &conflict, "--", path]) else { return Ok(()) };
+    // The stages come back from git's resolve-undo record, not through `update-index --unresolve`: older git (2.30)
+    // rebuilds a path no longer in the index (a Delete) from HEAD and MERGE_HEAD, and fails without MERGE_HEAD.
+    let undo = git::run(root, &["--literal-pathspecs", "ls-files", "--resolve-undo", "-z", "--", path])?;
+    // <mode> <sha> <stage>\t<path>, `--index-info`'s own input; the pathspec also matches paths below `path`
+    let records: Vec<&[u8]> = undo.split(|&b| b == 0).filter(|r| r.splitn(2, |&b| b == b'\t').nth(1) == Some(path.as_bytes())).collect();
+    let Some(sha) = records.first().and_then(|r| r.split(|&b| b == b' ').nth(1)) else { return Err(e) };
+    // a mode-0 entry first drops whatever stage 0 the path has
+    let mut input = format!("0 {}\t{path}\0", "0".repeat(sha.len())).into_bytes();
+    records.iter().for_each(|r| input.extend(r.iter().chain(&[0])));
+    git::run_with_input(root, &["update-index", "-z", "--index-info"], input).map_err(|_| e.clone())?;
     let restored = !git::run(root, &["--literal-pathspecs", "ls-files", "-u", "--", path])?.is_empty();
     if restored { Ok(()) } else { Err(e) }
 }
@@ -432,7 +442,7 @@ fn head_name(root: &Path) -> String {
 
 /// `76c12fd (topic: edit two)`, as git labels a picked commit; `rev` itself when it can't be read.
 fn describe(root: &Path, rev: &str) -> String {
-    let out = git::run(root, &["log", "-1", "--no-show-signature", "--format=%h (%s)", rev, "--"]);
+    let out = git::run(root, &["log", "-1", "--no-show-signature", "--format=%h (%s)", "--end-of-options", rev, "--"]);
     out.map(|o| String::from_utf8_lossy(&o).trim().to_string()).unwrap_or_else(|_| rev.to_string())
 }
 
@@ -689,10 +699,18 @@ mod tests {
         assert_eq!(kind("del-us.txt"), (Kind::DeletedBy(Side::Us), "DU", "deleted by us"));
         assert_eq!(kind("del-them.txt"), (Kind::DeletedBy(Side::Them), "UD", "deleted by them"));
         assert_eq!(kind("link"), (Kind::Symlink, "UU", "both modified"));
-        // file vs symlink: git keeps our file aside as `type.txt~HEAD`
-        assert_eq!(kind("type.txt"), (Kind::DeletedBy(Side::Us), "UA", "added by them"));
-        assert_eq!(kind("type.txt~HEAD"), (Kind::DeletedBy(Side::Them), "UD", "deleted by them"));
-        assert_eq!(file(&files, "type.txt").stages[2].as_ref().map(|s| s.mode), Some(0o120000));
+        let mode = |path, i: usize| file(&files, path).stages[i].as_ref().map(|s| s.mode);
+        if git::version().is_some_and(|v| v >= (2, 34)) {
+            // file vs symlink: ort keeps our file aside as `type.txt~HEAD`
+            assert_eq!(kind("type.txt"), (Kind::DeletedBy(Side::Us), "UA", "added by them"));
+            assert_eq!(kind("type.txt~HEAD"), (Kind::DeletedBy(Side::Them), "UD", "deleted by them"));
+            assert_eq!(mode("type.txt", 2), Some(0o120000));
+        } else {
+            // recursive, the default merge before git 2.34, keeps both at the one path
+            assert_eq!(kind("type.txt"), (Kind::Symlink, "UU", "both modified"));
+            assert_eq!((mode("type.txt", 1), mode("type.txt", 2)), (Some(0o100644), Some(0o120000)));
+            assert!(files.iter().all(|f| f.path != "type.txt~HEAD"));
+        }
         assert!(files.iter().all(|f| !f.rerere));
 
         let text = file(&files, "text.txt");
@@ -700,7 +718,7 @@ mod tests {
         assert_eq!([stage(0), stage(1), stage(2)], [Some((0o100644, Some(6))), Some((0o100644, Some(9))), Some((0o100644, Some(10)))]);
         assert_eq!(file(&files, "added.txt").stages[0], None);
         assert_eq!(file(&files, "del-them.txt").stages[2], None);
-        assert_eq!(file(&files, "link").stages[1].as_ref().map(|s| s.mode), Some(0o120000));
+        assert_eq!(mode("link", 1), Some(0o120000));
 
         // versions in working-tree form
         assert_eq!(read_stage(d, "text.txt", 3).unwrap(), b"a\ntopic\nc\n");
@@ -817,9 +835,32 @@ mod tests {
         assert!(!d.join("f").exists());
 
         reopen(d, "f", Style::Merge).unwrap();
+        assert_eq!(list(d), Ok(before.clone()));
+        // Keep: git writes no markers for it, so the stage 0 entry gives way to the recorded stages
+        git(d, &["checkout", "-q", "--ours", "--", "f"]);
+        mark_resolved(d, "f", false).unwrap();
+        reopen(d, "f", Style::Merge).unwrap();
         assert_eq!(list(d), Ok(before));
+        assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "main\n");
+        assert!(!git(d, &["ls-files", "-s", "--", "f"]).lines().any(|l| l.contains(" 0\t")));
         // nothing to undo
         assert!(reopen(d, "nope", Style::Merge).is_err());
+    }
+
+    #[test]
+    fn reopen_a_delete_restores_the_recorded_stages() {
+        // older git's `update-index --unresolve` (2.30) failed on a path no longer in the index
+        for op in ["merge", "cherry-pick"] {
+            let dir = text_conflict();
+            let d = dir.path();
+            assert!(!try_git(d, &[op, "topic"]));
+            let before = list(d).unwrap();
+            fs::remove_file(d.join("f")).unwrap();
+            mark_resolved(d, "f", true).unwrap();
+            assert_eq!(list(d), Ok(vec![]));
+            reopen(d, "f", Style::Merge).unwrap();
+            assert_eq!(list(d), Ok(before), "{op}");
+        }
     }
 
     #[test]
@@ -838,6 +879,59 @@ mod tests {
         assert_eq!(list(d), Ok(vec![]));
         reopen(d, "l", Style::Merge).unwrap();
         assert_eq!(list(d), Ok(before));
+    }
+
+    #[test]
+    fn reopen_writes_gits_own_markers_not_a_repository_merge_drivers() {
+        let styles = if git::version().is_some_and(|v| v >= (2, 35)) { &[Style::Merge, Style::Diff3, Style::Zdiff3][..] } else { &[Style::Merge, Style::Diff3] };
+        let marked_conflict = || {
+            let dir = text_conflict();
+            assert!(!try_git(dir.path(), &["merge", "topic"]));
+            write(dir.path(), "f", "a\nboth\nc\n");
+            mark_resolved(dir.path(), "f", false).unwrap();
+            dir
+        };
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ran = elsewhere.path().join("ran");
+        for &style in styles {
+            let plain = marked_conflict();
+            reopen(plain.path(), "f", style).unwrap();
+            let expected = fs::read(plain.path().join("f")).unwrap();
+            // selected by an attribute no one sees in the working tree, or by merge.default alone
+            for by_default in [false, true] {
+                let dir = marked_conflict();
+                let d = dir.path();
+                if by_default {
+                    git(d, &["config", "merge.default", "evil"]);
+                } else {
+                    fs::write(d.join(".git/info/attributes"), "* merge=evil\n").unwrap();
+                }
+                git(d, &["config", "merge.evil.driver", &format!("touch {}; false", ran.display())]);
+                reopen(d, "f", style).unwrap();
+                assert!(!ran.exists(), "{}: Re-open ran the repository's merge driver", style.name());
+                assert_eq!(String::from_utf8_lossy(&fs::read(d.join("f")).unwrap()), String::from_utf8_lossy(&expected), "{}", style.name());
+                assert_eq!(list(d).unwrap().len(), 1);
+            }
+        }
+        let dir = marked_conflict();
+        fs::write(dir.path().join(".git/info/attributes"), "* merge=evil\n").unwrap();
+        git(dir.path(), &["config", "merge.evil.driver", &format!("touch {}; false", ran.display())]);
+        try_git(dir.path(), &["checkout", "--conflict=merge", "--", "f"]);
+        assert!(ran.exists(), "git itself runs the driver");
+    }
+
+    #[test]
+    fn a_state_file_revision_is_never_a_git_option() {
+        let dir = text_conflict();
+        let d = dir.path();
+        assert!(!try_git(d, &["merge", "topic"]));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("written");
+        let injected = format!("--output={}", target.display());
+        fs::write(d.join(".git/MERGE_HEAD"), format!("{injected}\n")).unwrap();
+        fs::write(d.join(".git/MERGE_MSG"), "not git's message\n").unwrap();
+        assert_eq!(in_progress(d).unwrap().unwrap().theirs, injected);
+        assert!(!target.exists(), "git log took the state file's text as an option");
     }
 
     // APFS refuses non-UTF-8 file names (EILSEQ), so the fixture can't exist on macOS.
@@ -916,7 +1010,9 @@ mod tests {
         assert!(!try_git(d, &["merge", "topic"]));
         let files = list(d).unwrap();
         let worktree = String::from_utf8(fs::read(d.join("f")).unwrap()).unwrap();
-        for object_ids in [true, false] {
+        // `--object-id` needs git 2.43; `merge_file` uses temp files before
+        let object_ids = git::version().is_some_and(|v| v >= (2, 43));
+        for object_ids in [object_ids, false] {
             let (text, n) = merge_file_with(d, &files[0], ["HEAD", "base", "topic"], Style::Merge, 7, object_ids).unwrap();
             assert_eq!((String::from_utf8(text).unwrap(), n), (worktree.clone(), 1));
         }
@@ -930,8 +1026,14 @@ mod tests {
         let d = dir.path();
         assert!(!try_git(d, &["merge", "topic"]));
         let files = list(d).unwrap();
-        let (text, n) = merge_file(d, &files[0], ["o", "b", "t"], Style::Zdiff3, 7).unwrap();
-        assert_eq!((String::from_utf8(text).unwrap().as_str(), n), ("x\n<<<<<<< o\nmain\n||||||| b\n=======\ntopic\n>>>>>>> t\n", 1));
+        let merged = |style| merge_file(d, &files[0], ["o", "b", "t"], style, 7).map(|(text, n)| (String::from_utf8(text).unwrap(), n));
+        assert_eq!(merged(Style::Diff3), Ok(("<<<<<<< o\nx\nmain\n||||||| b\n=======\nx\ntopic\n>>>>>>> t\n".into(), 1)));
+        if git::version().is_some_and(|v| v >= (2, 35)) {
+            assert_eq!(merged(Style::Zdiff3), Ok(("x\n<<<<<<< o\nmain\n||||||| b\n=======\ntopic\n>>>>>>> t\n".into(), 1)));
+        } else {
+            // older git knows no zdiff3, not even as `merge.conflictStyle`: git's own error, as its merges give
+            assert!(merged(Style::Zdiff3).unwrap_err().contains("unknown style 'zdiff3'"));
+        }
     }
 
     #[test]

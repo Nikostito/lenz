@@ -2,6 +2,7 @@
 
 mod app;
 mod projects;
+mod fields;
 mod terminal;
 mod render;
 mod runtime;

@@ -9,6 +9,7 @@ pub mod hierarchy;
 pub mod hover;
 pub mod lsp;
 pub mod java;
+pub mod maven;
 pub mod python;
 pub mod runtime;
 pub mod provider;
@@ -34,8 +35,6 @@ pub type Clock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
 
 /// How long a server with no open documents and nothing pending stays warm before it is stopped.
 pub const IDLE: std::time::Duration = std::time::Duration::from_secs(600);
-/// Combined server memory above which the reader says so (it never stops servers for it).
-pub const MEMORY_NOTICE: u64 = 2 << 30;
 /// Usages and symbols kept at most (the panel's limit).
 pub const USAGE_LIMIT: usize = crate::search::RESULT_LIMIT;
 /// Usages a type-hierarchy level reads at most (and children it shows).
@@ -88,9 +87,14 @@ pub enum Question {
     Formatting,
     /// The `source.organizeImports` actions for a document.
     OrganizeImports,
+    /// A workspace edit renaming the symbol at the caret.
+    Rename,
     /// What the server inserts at a position after a typed character (its provider's `auto_insert` request). Not in
     /// [`Question::ALL`]: no protocol capability declares it, so only a server that has it lists it as offered.
     AutoInsert,
+    /// The edits a server makes after Enter (`textDocument/onTypeFormatting` with `\n`): Ruby LSP closes the block
+    /// just opened with `end`. Asked only of providers that allow it ([`provider::Provider::formats_on_enter`]).
+    OnTypeFormatting,
 }
 
 /// Which of a server's requests a question replaces: each lane has at most one pending, so a background question
@@ -111,6 +115,8 @@ pub enum Lane {
     CodeAction,
     /// Formatting or organizing a document's imports, explicitly or before a save.
     Format,
+    /// An explicit rename request, independent of other semantic work.
+    Rename,
     /// Text inserted after a typed character (a closing tag): never cancelled by completion or documentation.
     AutoInsert,
 }
@@ -138,8 +144,10 @@ impl Question {
             Question::SignatureHelp => "textDocument/signatureHelp",
             Question::CodeAction | Question::OrganizeImports => "textDocument/codeAction",
             Question::Formatting => "textDocument/formatting",
+            Question::Rename => "textDocument/rename",
             // Its provider's own request (see `ask_with`).
             Question::AutoInsert => "",
+            Question::OnTypeFormatting => "textDocument/onTypeFormatting",
         }
     }
 
@@ -160,8 +168,10 @@ impl Question {
             Question::SignatureHelp => "signatureHelpProvider",
             Question::CodeAction | Question::OrganizeImports => "codeActionProvider",
             Question::Formatting => "documentFormattingProvider",
+            Question::Rename => "renameProvider",
             // No protocol capability: its provider declares it (see `supports`).
             Question::AutoInsert => "",
+            Question::OnTypeFormatting => "documentOnTypeFormattingProvider",
         }
     }
 
@@ -186,7 +196,9 @@ impl Question {
             Question::CodeAction => "quick fixes",
             Question::Formatting => "formatting",
             Question::OrganizeImports => "organize imports",
+            Question::Rename => "symbol rename",
             Question::AutoInsert => "automatic closing tags",
+            Question::OnTypeFormatting => "formatting on Enter",
         }
     }
 
@@ -200,7 +212,9 @@ impl Question {
             Question::SignatureHelp => Lane::Signature,
             Question::CodeAction => Lane::CodeAction,
             Question::Formatting | Question::OrganizeImports => Lane::Format,
-            Question::AutoInsert => Lane::AutoInsert,
+            Question::Rename => Lane::Rename,
+            // Both insert after a typed character, fenced to the same caret: one is pending at a time.
+            Question::AutoInsert | Question::OnTypeFormatting => Lane::AutoInsert,
             // A hierarchy's root is the user's own request; its levels load in the background.
             Question::IncomingCalls | Question::OutgoingCalls | Question::Supertypes | Question::Subtypes | Question::TypeUsages => Lane::Hierarchy,
             Question::Definition | Question::Usages | Question::Symbols | Question::FileSymbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy => Lane::Foreground,
@@ -208,7 +222,7 @@ impl Question {
     }
 
     /// Every question, for capability views.
-    pub const ALL: [Question; 20] = [
+    pub const ALL: [Question; 22] = [
         Question::Definition,
         Question::Usages,
         Question::Symbols,
@@ -229,6 +243,8 @@ impl Question {
         Question::CodeAction,
         Question::Formatting,
         Question::OrganizeImports,
+        Question::Rename,
+        Question::OnTypeFormatting,
     ];
 }
 
@@ -246,6 +262,10 @@ pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// After initializing, a server without a readiness status (progress reports do not say the workspace is
 /// loaded) may still be loading it for about this long: its answers meanwhile are marked possibly incomplete.
 pub const UNREPORTED_WARMUP: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a ready server may index again (servers do briefly for each opened file) before the status bar says so.
+pub const REINDEX_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+/// Ticks (see `session::TICK`) questions wait for a sync barrier's answer before the text counts as applied.
+const SETTLE_TICKS: u8 = 2;
 /// Definition targets kept at most.
 pub const TARGET_LIMIT: usize = 200;
 /// How long a server may take to answer `initialize` before it is given up on (its startup slot freed).
@@ -278,6 +298,18 @@ pub enum Status {
     Failed(String),
     /// Turned off for this folder by the user.
     Disabled,
+    /// Not started: it runs the project's code (what it would run, as [`provider::Provider::runs`] says it), and the
+    /// folder is not trusted (Restricted mode).
+    Restricted(&'static str),
+}
+
+/// A file a server checks for syntax only, because it is outside the server's build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outside {
+    /// The server's own words.
+    pub message: String,
+    /// In no project at all, rather than outside the project's source folders.
+    pub no_project: bool,
 }
 
 /// A provider's state for one workspace, for presentation.
@@ -299,6 +331,8 @@ pub struct ProviderView {
     /// The project environment it analyses with (Pyright's Python environment), once checked at launch; `Err`: it
     /// was not started because that environment is missing (the reason is its status).
     pub environment: Option<Result<String, String>>,
+    /// Indexing again after being ready, for less than [`REINDEX_QUIET`]: the status bar still says ready.
+    pub quiet: bool,
 }
 
 impl ProviderView {
@@ -307,18 +341,15 @@ impl ProviderView {
         match &self.status {
             Status::Queued => "LSP waiting",
             Status::Starting => "LSP starting",
-            Status::Indexing(what) if !what.is_empty() => return format!("LSP {}indexing {what}", self.error_mark()),
-            Status::Indexing(_) => return format!("LSP {}indexing", self.error_mark()),
-            Status::Ready => return format!("LSP {}ready", self.error_mark()),
+            Status::Indexing(_) if self.quiet => "LSP ready",
+            Status::Indexing(what) if !what.is_empty() => return format!("LSP indexing {what}"),
+            Status::Indexing(_) => "LSP indexing",
+            Status::Ready => "LSP ready",
             Status::Missing(_) => "LSP unavailable",
             Status::Failed(_) => "LSP stopped",
             Status::Disabled => "LSP off",
+            Status::Restricted(_) => "LSP off until trusted",
         }.to_owned()
-    }
-
-    /// First, so a narrow status bar keeps it.
-    fn error_mark(&self) -> &'static str {
-        if self.error.is_some() { "error · " } else { "" }
     }
 
     /// Whether it offers `question` (false until it has initialized).
@@ -336,6 +367,7 @@ impl ProviderView {
             Status::Missing(why) => format!("unavailable: {why}"),
             Status::Failed(why) => format!("stopped: {why}"),
             Status::Disabled => "disabled for this folder".to_string(),
+            Status::Restricted(_) => provider::RESTRICTED.to_lowercase(),
         };
         let untested = match (&self.version, self.untested) {
             (Some(v), true) => format!(" (untested version {v})"),
@@ -395,7 +427,12 @@ type Served = (usize, PathBuf);
 pub enum Event {
     /// The workspace root for sources in `dir` by provider `provider`'s rules (or the override), or none.
     /// `provider` is the language's; `serve` the provider serving `root` ([`provider::serving`]).
-    Resolved { root_epoch: u64, provider: usize, dir: PathBuf, root: Option<PathBuf>, serve: usize },
+    /// `real`: the root with its links resolved, which folder trust is decided on; `trusted`: where the project's own
+    /// programs may be found for it ([`provider::trusted_bound`]; `None`: not trusted).
+    Resolved { root_epoch: u64, provider: usize, dir: PathBuf, root: Option<PathBuf>, serve: usize, real: Option<PathBuf>, trusted: Option<PathBuf> },
+    /// The server would run the project's own code (`runs` says what) in a folder that is not trusted: `held`, it was
+    /// not started (its executable was found); else it runs without that program.
+    Restricted { session: u64, runs: &'static str, held: bool },
     /// The executable answered `--version` (or could not be run).
     Detected { session: u64, version: Result<String, String> },
     /// The project environment it analyses with, as Server Details says it, or why it must not start with it
@@ -411,6 +448,9 @@ pub enum Event {
     StartTimeout { session: u64 },
     /// Time passed: idle servers may stop.
     Tick,
+    /// A quiet moment passed ([`REINDEX_QUIET`] since a ready server started indexing again, or
+    /// [`crate::session::LOADING_QUIET`] since a load began): the status bar may say so now.
+    Quiet,
     /// Resident bytes per server session: the server's own, and its process group's other members'.
     Memory(Vec<(u64, u64, u64)>),
     /// Lenz's own check of a shell script finished ([`shell::Lint`]).
@@ -537,9 +577,25 @@ struct Server {
     /// The diagnostics last published for each open document, for the version they describe.
     diagnostics: HashMap<PathBuf, Arc<diagnostics::FileDiagnostics>>,
     published_problems: HashMap<PathBuf, (Option<u64>, Vec<diagnostics::PublishedDiagnostic>)>,
+    /// Files it checks for syntax only, being outside its build (JDT LS): what it said, and whether the file is in no
+    /// project at all rather than outside the project's source folders.
+    outside: HashMap<PathBuf, Outside>,
     /// `textDocument/diagnostic` requests in flight (a server that is asked rather than publishing), by id, with the
     /// exact text each asks about.
     pulls: HashMap<i64, Arc<Document>>,
+    /// A server that applies text on another thread than it parses requests on ([`provider::Provider::sync_barrier`]):
+    /// the id of the barrier request sent behind the latest text. Until it is answered the text counts as still on
+    /// its way, so no question about it is sent yet.
+    settling: Option<i64>,
+    /// Ticks the barrier has gone unanswered; the text counts as applied after [`SETTLE_TICKS`].
+    settle_waits: u8,
+    /// Documents whose problems are asked once the barrier is answered.
+    unpulled: std::collections::HashSet<PathBuf>,
+    /// The id of the request for its bundle's gems (see [`provider::Provider::dependencies`]), and their folders.
+    gems_request: Option<i64>,
+    gems: Option<Arc<Vec<PathBuf>>>,
+    /// Their macro declarations by name, built by the first definition that needs them (off the UI thread).
+    gem_index: crate::ruby_declarations::SharedIndex,
     /// Credits survive close/reopen and rename until their writer acknowledgement arrives.
     flights: HashMap<u64, TextFlight>,
     open_epoch: HashMap<PathBuf, u64>,
@@ -564,6 +620,10 @@ struct Server {
     idle_since: Option<std::time::Instant>,
     /// When it answered `initialize`.
     initialized_at: Option<std::time::Instant>,
+    /// Since when it has been indexing again after being ready.
+    reindexing: Option<std::time::Instant>,
+    /// JDT LS is re-importing its project: open documents are reopened once it ends.
+    reimporting: bool,
     memory: Option<(u64, u64)>,
     /// The server's semantic token legend (empty without one).
     legend: Arc<Legend>,
@@ -677,10 +737,20 @@ pub struct Semantics {
     waiting: Option<Waiting>,
     /// The browsing root, as of the last sync.
     browse: Option<PathBuf>,
+    /// Workspace roots with their links resolved (as resolved), which trust is decided on, and where the project's
+    /// own programs may be found for them when trusted ([`provider::trusted_bound`]).
+    real: HashMap<PathBuf, (PathBuf, Option<PathBuf>)>,
+    /// What servers held back in a folder that is not trusted would run, with their workspace roots' links resolved:
+    /// for the session to ask about once.
+    trust_wanted: Vec<(PathBuf, &'static str)>,
+    /// The settings file's modification time and size when last read: another window's change shows in them.
+    stamp: Option<(std::time::SystemTime, u64)>,
     /// The server session last sent a question of the user's: the one whose answer opened a dependency.
     last_asked: Option<u64>,
     /// Server-originated notices for the session to show (declined edits, server errors).
     pub(crate) notices: Vec<String>,
+    /// For the activity log only: a server error's full text (Server Details shows its first line).
+    pub(crate) logged: Vec<String>,
     idle: std::time::Duration,
     clock: Clock,
     /// The reader's cache folder, outside any checkout: servers' workspace data lives under it.
@@ -703,6 +773,7 @@ impl Semantics {
             idle,
             clock,
             settings: Settings::read(&settings_file),
+            stamp: stamp(&settings_file),
             settings_file,
             servers: Vec::new(),
             processes: Vec::new(),
@@ -712,8 +783,11 @@ impl Semantics {
             next_session: 0,
             waiting: None,
             browse: None,
+            real: HashMap::new(),
+            trust_wanted: Vec::new(),
             last_asked: None,
             notices: Vec::new(),
+            logged: Vec::new(),
             shell: shell::Linter::default(),
             unmapped: HashMap::new(),
             templates: HashMap::new(),
@@ -737,6 +811,7 @@ impl Semantics {
 
     /// [`Self::wants_text`] for a source: a template's when any of its embedded languages has a provider.
     pub(crate) fn wants_source(&self, source: &crate::document::SourceMeta, large: bool, browse: Option<&Path>) -> bool {
+        if source.archive().is_some() { return false; }
         match crate::template::languages(source.source()) {
             [] => self.wants_text(source.language(), large, browse),
             languages => languages.iter().any(|l| self.wants_text(Some(*l), large, browse)),
@@ -746,6 +821,7 @@ impl Semantics {
     /// The provider for `doc`'s language (a template view's embedded one) and, once resolved, its workspace root and
     /// the provider serving it.
     pub(crate) fn resolved(&self, doc: &Document) -> Option<(usize, Option<Option<PathBuf>>)> {
+        if doc.source_meta().archive().is_some() { return None; }
         match doc.served_language() {
             Some(language) => self.resolved_language(language, doc.source()),
             None => self.resolved_source(doc.source_meta()),
@@ -775,16 +851,22 @@ impl Semantics {
         self.view_source(doc.source_meta(), doc.is_large())
     }
     pub(crate) fn view_source(&self, source: &crate::document::SourceMeta, large: bool) -> Option<ProviderView> {
-        let (p, root) = self.resolved_source(source)?;
+        if source.archive().is_some() { return None; }
+        self.view_at(source.source(), source.language(), large)
+    }
+    /// As [`Self::view_source`], from a file's path and language: a tab whose text is still loading.
+    pub(crate) fn view_at(&self, path: &Path, language: Option<lenz_content::highlight::Language>, large: bool) -> Option<ProviderView> {
+        let language = language.or_else(|| crate::template::languages(path).first().copied())?;
+        let (p, root) = self.resolved_language(language, path)?;
         let provider = &PROVIDERS[p];
-        let view = |root: Option<PathBuf>, status| ProviderView { name: provider.name, root, status, version: None, untested: false, limits: provider.limits, memory: None, supports: Vec::new(), error: None, environment: None };
+        let view = |root: Option<PathBuf>, status| ProviderView { name: provider.name, root, status, version: None, untested: false, limits: provider.limits, memory: None, supports: Vec::new(), error: None, environment: None, quiet: false };
         if large {
             return Some(view(None, Status::Missing("not used for large files".into())));
         }
-        if self.disabled_for(p, source.source()) {
+        if self.disabled_for(p, path) {
             return Some(view(None, Status::Disabled));
         }
-        if let Some(why) = self.unmapped.get(source.source()) {
+        if let Some(why) = self.unmapped.get(path) {
             return Some(view(None, Status::Missing(format!("{UNMAPPED_TEMPLATE}: {why}"))));
         }
         Some(match root {
@@ -792,14 +874,15 @@ impl Semantics {
             Some(None) => view(None, Status::Missing(provider.no_root.into())),
             Some(Some(root)) => match self.server(p, &root) {
                 None => view(Some(root), Status::Queued),
-                Some(s) => s.view(),
+                Some(s) => s.view((self.clock)()),
             },
         })
     }
 
     /// Every server this session runs or has tried to run, in launch order.
     pub fn views(&self) -> Vec<ProviderView> {
-        self.servers.iter().map(Server::view).collect()
+        let now = (self.clock)();
+        self.servers.iter().map(|s| s.view(now)).collect()
     }
 
     /// Workspace manifests changed: roots are resolved again for the next documents shown.
@@ -828,7 +911,7 @@ impl Semantics {
         self.unmapped.clear();
         self.templates.clear();
         let mut served = Vec::with_capacity(docs.len());
-        for doc in docs.iter().filter(|d| !d.is_large()) {
+        for doc in docs.iter().filter(|d| !d.is_large() && d.source_meta().archive().is_none()) {
             match doc.templates() {
                 Some(views) => {
                     if let Some(why) = views.unmapped() { self.unmapped.insert(doc.source().to_owned(), why); }
@@ -869,7 +952,10 @@ impl Semantics {
             };
             let session = match self.server(q, &root) {
                 Some(s) => s.session,
-                None => self.queue(Key { provider: q, root, launch: self.settings.launch(&PROVIDERS[q]) }, doc.source().to_owned()),
+                None => {
+                    let launch = self.settings.launch_in(&PROVIDERS[q], self.trusted(&root));
+                    self.queue(Key { provider: q, root, launch }, doc.source().to_owned())
+                }
             };
             wanted.entry(session).or_default().insert(doc.source().to_owned(), doc.clone());
         }
@@ -919,8 +1005,11 @@ impl Semantics {
         self.settings.disabled(&PROVIDERS[provider::primary(provider)], self.browse.as_deref())
     }
 
-    /// Stop servers idle for longer than the idle period (no open documents, nothing pending).
+    /// Stop servers idle for longer than the idle period (no open documents, nothing pending). Text whose barrier
+    /// has gone unanswered too long counts as applied.
     pub fn expire(&mut self) -> bool {
+        let mut repaint = false;
+        for s in &mut self.servers { repaint |= s.settle_late(); }
         let now = (self.clock)();
         let idle = self.idle;
         let waiting = self.waiting.as_ref().map(|w| w.path.clone());
@@ -930,7 +1019,7 @@ impl Semantics {
         self.servers = keep;
         let stopped = !stop.is_empty();
         stop.into_iter().for_each(Server::stop);
-        stopped
+        stopped || repaint
     }
 
     /// A new server for `key`, waiting for a startup slot.
@@ -956,7 +1045,7 @@ impl Semantics {
             process,
             next_id: 0,
             initializing: None,
-            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), pulls: HashMap::new(),
+            open: HashMap::new(), desired: HashMap::new(), written: HashMap::new(), diagnostics: HashMap::new(), published_problems: HashMap::new(), outside: HashMap::new(), pulls: HashMap::new(), settling: None, settle_waits: 0, unpulled: Default::default(), gems_request: None, gems: None, gem_index: Default::default(),
             flights: HashMap::new(), open_epoch: HashMap::new(), next_text: 0, text_bytes: 0,
             desired_epoch: 0, deferred: HashMap::new(), failed: HashMap::new(), refresh: Default::default(),
             dirty_open: HashMap::new(),
@@ -967,6 +1056,8 @@ impl Semantics {
             held: true,
             idle_since: None,
             initialized_at: None,
+            reindexing: None,
+            reimporting: false,
             memory: None,
             legend: Default::default(),
             asked: Default::default(),
@@ -994,7 +1085,7 @@ impl Semantics {
                     "clientInfo": { "name": crate::chrome::APP_NAME },
                     "rootUri": lsp::file_uri(&s.key.root),
                     "workspaceFolders": [{ "uri": lsp::file_uri(&s.key.root), "name": name }],
-                    "initializationOptions": (provider.withheld)(self.settings.initialization(provider, Some(&s.key.root))),
+                    "initializationOptions": sent(&s.key, (provider.withheld)(self.settings.initialization(provider, Some(&s.key.root)))),
                     "capabilities": {
                         "general": { "positionEncodings": if provider.utf8 { json!(["utf-8", "utf-16"]) } else { json!(["utf-16"]) } },
                         "textDocument": {
@@ -1057,6 +1148,7 @@ impl Semantics {
     /// A template is asked through the view the caret is in (its Ruby, else an HTML template's markup), and
     /// whole-document questions through its Ruby; a caret no view maps says why instead.
     pub fn ask_with(&mut self, doc: &Arc<Document>, offset: usize, request: u64, question: Question, extra: Value) -> Result<(), String> {
+        if doc.source_meta().archive().is_some() { return Err("Language-server actions require a standalone file; archive entries can be exported with Save As".into()); }
         self.cancel_lane(question.lane());
         let routed;
         let doc = match doc.templates() {
@@ -1103,6 +1195,7 @@ impl Semantics {
         };
         match &s.status {
             Status::Missing(why) => return Err(format!("{name} is unavailable: {why}")),
+            Status::Restricted(_) => return Err(format!("{name}: {}", provider::RESTRICTED)),
             Status::Failed(why) => return Err(format!("{name} stopped: {why}")),
             _ if !s.initialized() && background => return Err(not_ready()),
             _ if !s.initialized() => {
@@ -1141,7 +1234,7 @@ impl Semantics {
                 params = json!({ "textDocument": { "uri": lsp::file_uri(doc.source()) }, "range": { "start": { "line": 0, "character": 0 }, "end": end },
                     "context": { "diagnostics": [], "only": ["source.organizeImports"], "triggerKind": 1 } });
             }
-            Question::Definition | Question::Symbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy | Question::Hover | Question::Highlight | Question::AutoInsert => {}
+            Question::Definition | Question::Symbols | Question::Implementation | Question::TypeDefinition | Question::PrepareCallHierarchy | Question::PrepareTypeHierarchy | Question::Hover | Question::Highlight | Question::Rename | Question::AutoInsert | Question::OnTypeFormatting => {}
         }
         if let (Value::Object(params), Value::Object(extra)) = (&mut params, extra) { params.extend(extra); }
         if !background {
@@ -1200,6 +1293,11 @@ impl Semantics {
     }
 
     /// The diagnostics an initialized server last published for `path`, for the version they describe.
+    /// Whether a server checks `path` for syntax only, being outside its build (see [`Outside`]).
+    pub fn outside_build(&self, path: &Path) -> Option<&Outside> {
+        self.servers.iter().filter(|s| s.initialized()).find_map(|s| s.outside.get(path))
+    }
+
     pub fn diagnostics(&self, path: &Path) -> Option<Arc<diagnostics::FileDiagnostics>> {
         // A shell script's problems are ShellCheck's, as Lenz runs it; never bash-language-server's.
         if self.shell.checks(path) { return self.shell.latest(path)?.diagnostics.clone(); }
@@ -1301,6 +1399,23 @@ impl Semantics {
         })
     }
 
+    /// Whether Enter in `path` asks the initialized server holding it for its on-type edits: its provider allows it
+    /// and the server lists `\n` among its on-type formatting triggers.
+    pub fn formats_on_enter(&self, path: &Path) -> bool {
+        self.servers.iter().filter(|s| s.initialized() && s.open.contains_key(path)).any(|s| {
+            let options = &s.capabilities["documentOnTypeFormattingProvider"];
+            let triggers = std::iter::once(&options["firstTriggerCharacter"]).chain(options["moreTriggerCharacter"].as_array().into_iter().flatten());
+            PROVIDERS[s.key.provider].formats_on_enter && s.supports(Question::OnTypeFormatting) && triggers.into_iter().any(|t| t.as_str() == Some("\n"))
+        })
+    }
+
+    /// The gem folders of server session `session`'s bundle, once it has listed them (see
+    /// [`provider::Provider::dependencies`]).
+    pub(crate) fn gem_roots(&self, session: u64) -> Option<(Arc<Vec<PathBuf>>, crate::ruby_declarations::SharedIndex)> {
+        let server = self.servers.iter().find(|s| s.session == session)?;
+        Some((server.gems.clone()?, server.gem_index.clone()))
+    }
+
     /// The characters after which the initialized server holding `path` offers completion unasked.
     pub fn completion_triggers(&self, path: &Path) -> Vec<char> {
         self.servers.iter().filter(|s| s.initialized() && s.open.contains_key(path))
@@ -1400,6 +1515,61 @@ impl Semantics {
         true
     }
 
+    /// Trust `folder` (a canonical path: the browsing root, or the folder holding it), or keep it restricted,
+    /// remembered across restarts: the servers of browsing root `browse`, those held back and those of workspaces in
+    /// `folder` stop, and every workspace's server is chosen again (typescript-go depends on it), so held-back servers
+    /// start (or trusted ones stay stopped) without reopening anything. Returns the settings to save.
+    /// `inner` keeps the answers for folders inside `folder` (the dialog's Stay Restricted); else they are replaced.
+    pub fn set_trust(&mut self, folder: PathBuf, trusted: bool, inner: bool, browse: Option<&Path>) -> Settings {
+        self.reload();
+        if !trusted && inner { self.settings.stay_restricted(folder.clone()); } else { self.settings.set_trust(folder.clone(), trusted); }
+        self.restart_where(|me, s| browse.is_some_and(|b| s.key.root.starts_with(b)) || matches!(s.status, Status::Restricted(_))
+            || me.real.get(&s.key.root).is_some_and(|r| r.0.starts_with(&folder)));
+        self.settings.clone()
+    }
+
+    /// Another window (or the user) changed the settings file: its folder trust is taken over, and the servers whose
+    /// trust it changes stop and are chosen again (Stop Trusting in one window stops them in every window). Only the
+    /// file's time and size are read unless it changed. Returns whether folder trust changed.
+    pub fn settings_changed(&mut self) -> bool {
+        let now = stamp(&self.settings_file);
+        if now == self.stamp { return false; }
+        self.stamp = now;
+        let disk = Settings::read(&self.settings_file);
+        if disk.trusted == self.settings.trusted && disk.declined == self.settings.declined { return false; }
+        let before = Settings { trusted: std::mem::replace(&mut self.settings.trusted, disk.trusted), declined: std::mem::replace(&mut self.settings.declined, disk.declined), ..Settings::default() };
+        self.restart_where(|me, s| {
+            let real = me.real.get(&s.key.root).map_or(s.key.root.as_path(), |r| r.0.as_path());
+            before.trusted_folder(real) != me.settings.trusted_folder(real)
+        });
+        true
+    }
+
+    /// Stop the servers `affected` picks and choose every workspace's server again (typescript-go depends on trust).
+    fn restart_where(&mut self, affected: impl Fn(&Self, &Server) -> bool) {
+        let (stop, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.servers).into_iter().partition(|s| affected(self, s));
+        self.servers = keep;
+        let servers = &self.servers;
+        self.queued.retain(|q| servers.iter().any(|s| s.session == *q));
+        self.waiting = None;
+        self.roots.clear();
+        self.invalidate_root_lookups();
+        stop.into_iter().for_each(Server::stop);
+    }
+
+    /// Where the project's own programs for workspace `root` may be found, while the user trusts the folder deciding
+    /// it (decided on its links resolved, once known): see [`provider::trusted_bound`].
+    fn trusted(&self, root: &Path) -> Option<&Path> {
+        let (real, bound) = self.real.get(root)?;
+        bound.as_deref().filter(|_| self.settings.trust(real) == provider::Trust::Trusted)
+    }
+
+    /// What servers held back in a folder that is not trusted would run, since last asked, with their workspace roots'
+    /// links resolved.
+    pub fn take_trust_wanted(&mut self) -> Vec<(PathBuf, &'static str)> {
+        std::mem::take(&mut self.trust_wanted)
+    }
+
     /// Turn `provider` off (or on again) for browsing root `browse`, remembered across restarts. Turning it off
     /// stops its servers there. Returns the settings to save.
     pub fn set_enabled(&mut self, provider: usize, browse: PathBuf, enabled: bool) -> Settings {
@@ -1470,6 +1640,7 @@ impl Semantics {
     /// Re-read the settings file (the user may have edited it) before acting on or saving settings.
     fn reload(&mut self) {
         self.settings = Settings::read(&self.settings_file);
+        self.stamp = stamp(&self.settings_file);
         // Shell scripts are checked again with the settings as they are now.
         self.shell.again();
     }
@@ -1495,7 +1666,15 @@ impl Semantics {
     /// Ruby LSP also indexes previously unknown files on Changed. Directory events are expanded by the session.
     pub fn files_changed(&mut self, changes: &[(PathBuf, bool)]) {
         for s in &mut self.servers {
-            for (path, exists) in changes { if !exists { s.published_problems.remove(path); s.diagnostics.remove(path); } }
+            for (path, exists) in changes { if !exists { s.published_problems.remove(path); s.diagnostics.remove(path); s.outside.remove(path); } }
+        }
+        // Build files reach a server that re-imports from them (JDT LS) though it watches nothing else through Lenz.
+        for s in self.servers.iter_mut().filter(|s| s.initialized() && !PROVIDERS[s.key.provider].watched_files && !PROVIDERS[s.key.provider].build_files.is_empty()) {
+            let builds = PROVIDERS[s.key.provider].build_files;
+            let events: Vec<Value> = changes.iter()
+                .filter(|(p, _)| p.starts_with(&s.key.root) && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| builds.contains(&n)))
+                .map(|(p, exists)| json!({ "uri": lsp::file_uri(p), "type": if *exists { 2 } else { 3 } })).collect();
+            if !events.is_empty() { s.notify("workspace/didChangeWatchedFiles", json!({ "changes": events })); }
         }
         for s in self.servers.iter_mut().filter(|s| s.initialized() && PROVIDERS[s.key.provider].watched_files) {
             let events: Vec<Value> = changes.iter().filter(|(p, _)| p.starts_with(&s.key.root)).map(|(p, exists)| json!({ "uri": lsp::file_uri(p), "type": if *exists { 2 } else { 3 } })).collect();
@@ -1523,10 +1702,11 @@ impl Semantics {
 
     pub fn event(&mut self, event: Event, events: &async_channel::Sender<Completion>) -> Outcome {
         let mut outcome = match event {
-            Event::Resolved { root_epoch, provider, dir, root, serve } => {
+            Event::Resolved { root_epoch, provider, dir, root, serve, real, trusted } => {
                 if root_epoch != self.root_epoch {
                     Outcome::default()
                 } else {
+                    if let (Some(root), Some(real)) = (&root, real) { self.real.insert(root.clone(), (real, trusted)); }
                     // One choice per root: a server of the language already there keeps serving it.
                     let serve = root.as_ref().and_then(|r| self.servers.iter().find(|s| provider::primary(s.key.provider) == provider && s.key.root == *r)).map_or(serve, |s| s.key.provider);
                     self.roots.insert((provider, dir), Some(root.map(|r| (serve, r))));
@@ -1542,6 +1722,16 @@ impl Semantics {
                         s.initializing = None;
                     }
                 }
+                Outcome { repaint: true, ..Outcome::default() }
+            }
+            Event::Restricted { session, runs, held } => {
+                let Some(s) = self.servers.iter_mut().find(|s| s.session == session) else { return Outcome::default() };
+                if held {
+                    s.status = Status::Restricted(runs);
+                    s.initializing = None;
+                }
+                let real = self.real.get(&s.key.root).map_or_else(|| s.key.root.clone(), |r| r.0.clone());
+                self.trust_wanted.push((real, runs));
                 Outcome { repaint: true, ..Outcome::default() }
             }
             Event::Environment { session, line } => {
@@ -1596,12 +1786,21 @@ impl Semantics {
             }
             Event::Message { session, message } => {
                 let Some(s) = self.servers.iter_mut().find(|s| s.session == session) else { return Outcome::default() };
-                let outcome = s.message(message, &self.settings, (self.clock)(), &mut self.notices);
+                let quiet = s.reindexing.is_some();
+                let outcome = s.message(message, &self.settings, (self.clock)(), &mut self.notices, &mut self.logged);
                 s.touch((self.clock)());
+                if !quiet && s.reindexing.is_some() {
+                    let events = events.clone();
+                    let _ = std::thread::Builder::new().name("reader-quiet".into()).spawn(move || {
+                        std::thread::sleep(REINDEX_QUIET);
+                        let _ = events.send_blocking(Completion::Semantic(Event::Quiet));
+                    });
+                }
                 outcome
             }
             // The session handles ticks (expiry and sampling); nothing else sends them here.
             Event::Tick => Outcome::default(),
+            Event::Quiet => Outcome { repaint: true, ..Outcome::default() },
             Event::Memory(samples) => {
                 for (session, server, helpers) in samples {
                     if let Some(s) = self.servers.iter_mut().find(|s| s.session == session) {
@@ -1726,6 +1925,19 @@ impl Semantics {
         }
     }
 
+    /// Forget every decoration request about `path` (its view dropped what they gave, or would have given): pending
+    /// ones are cancelled, and showing it again asks afresh even when its version is the one already asked about.
+    pub fn forget_path(&mut self, path: &Path) {
+        for s in &mut self.servers {
+            let pending: Vec<i64> = s.decor.iter().filter(|(_, d)| d.0 == path).map(|(id, _)| *id).collect();
+            for id in pending {
+                s.decor.remove(&id);
+                s.notify("$/cancelRequest", json!({ "id": format!("{}{id}", lsp::DECORATION) }));
+            }
+            for asked in &mut s.asked { asked.remove(path); }
+        }
+    }
+
     /// The name of `doc`'s running server when it does not offer `kind` (`None`: it does, or none runs for it).
     pub fn lacks(&self, doc: &Document, kind: Decor) -> Option<&'static str> {
         self.lacks_source(doc.source(), kind)
@@ -1757,7 +1969,7 @@ fn same_document(a: &Document, b: &Document) -> bool {
 }
 
 impl Server {
-    fn view(&self) -> ProviderView {
+    fn view(&self, now: std::time::Instant) -> ProviderView {
         let p = &PROVIDERS[self.key.provider];
         ProviderView {
             name: p.name,
@@ -1772,6 +1984,7 @@ impl Server {
             supports: Question::ALL.into_iter().chain([Question::AutoInsert]).filter(|q| self.initialized() && self.supports(*q)).collect(),
             error: self.error.clone(),
             environment: self.environment.clone(),
+            quiet: self.reindexing.is_some_and(|t| now.duration_since(t) < REINDEX_QUIET),
         }
     }
 
@@ -1842,7 +2055,7 @@ impl Server {
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        let sources = if matches!(lane, Lane::Foreground | Lane::Hierarchy) {
+        let sources = if matches!(lane, Lane::Foreground | Lane::Hierarchy | Lane::Rename) {
             source_context(&self.open)
         } else { Default::default() };
         self.pending.insert(lane, PendingRequest { request, id, sources });
@@ -1872,6 +2085,28 @@ impl Server {
         let _ = self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
     }
 
+    /// Forget `path` as open and tell the server it closed.
+    fn close_document(&mut self, path: &Path) {
+        self.open.remove(path);
+        self.written.remove(path);
+        self.diagnostics.remove(path);
+        self.open_epoch.remove(path);
+        self.refresh.remove(path);
+        self.asked.iter_mut().for_each(|a| { a.remove(path); });
+        self.decor.retain(|_, d| d.0 != path);
+        // The close stays after any in-flight old text and before a future reopen. Its credit
+        // remains outstanding, including when the same URI returns before the acknowledgement.
+        self.notify("textDocument/didClose", json!({ "textDocument": { "uri": lsp::file_uri(path) } }));
+    }
+
+    /// After JDT LS re-imported its project, open files keep their old project's errors (a wrong package, unresolved
+    /// types) until reopened: close each, then open the wanted ones again.
+    fn reopen_documents(&mut self) {
+        let open: Vec<PathBuf> = self.open.keys().cloned().collect();
+        for path in open { self.close_document(&path); }
+        self.pump_text();
+    }
+
     fn refresh_index(&mut self, path: &Path) {
         // Ruby LSP indexes open-file changes during document requests; watcher reports alone are ignored.
         if PROVIDERS[self.key.provider].id != "ruby-lsp" || !self.supports(Question::FileSymbols) { return; }
@@ -1899,16 +2134,7 @@ impl Server {
         }
         let gone: Vec<PathBuf> = self.open.keys().filter(|p| !docs.contains_key(*p)).cloned().collect();
         for path in gone {
-            self.open.remove(&path);
-            self.written.remove(&path);
-            self.diagnostics.remove(&path);
-            self.open_epoch.remove(&path);
-            self.refresh.remove(&path);
-            self.asked.iter_mut().for_each(|a| { a.remove(&path); });
-            self.decor.retain(|_, d| d.0 != path);
-            // The close stays after any in-flight old text and before a future reopen. Its credit
-            // remains outstanding, including when the same URI returns before the acknowledgement.
-            self.notify("textDocument/didClose", json!({ "textDocument": { "uri": lsp::file_uri(&path) } }));
+            self.close_document(&path);
             if let Some(exists) = self.dirty_open.remove(&path) {
                 self.notify("workspace/didChangeWatchedFiles", json!({ "changes": [{ "uri": lsp::file_uri(&path), "type": if exists { 2 } else { 3 } }] }));
             }
@@ -1918,8 +2144,29 @@ impl Server {
         self.pump_text();
     }
 
+    /// The server has applied the text sent before its barrier: the questions, problem pulls and refreshes held
+    /// for it go now.
+    fn settled(&mut self) {
+        self.settling = None;
+        self.settle_waits = 0;
+        for path in std::mem::take(&mut self.unpulled) {
+            if let Some(doc) = self.open.get(&path).cloned() { self.pull_diagnostics(&path, &doc); }
+        }
+        self.pump_text();
+    }
+
+    /// Called each tick: a barrier unanswered for [`SETTLE_TICKS`] ticks is given up on, so a server that never
+    /// answers it cannot hold every question back.
+    fn settle_late(&mut self) -> bool {
+        if self.settling.is_none() { return false; }
+        self.settle_waits += 1;
+        if self.settle_waits < SETTLE_TICKS { return false; }
+        self.settled();
+        true
+    }
+
     fn text_pending(&self) -> bool {
-        self.desired.iter().any(|(path, doc)| self.open.get(path).is_none_or(|sent| !same_document(sent, doc)))
+        self.settling.is_some() || self.desired.iter().any(|(path, doc)| self.open.get(path).is_none_or(|sent| !same_document(sent, doc)))
     }
 
     fn failed_reply(&self, lane: Lane, request: u64, why: &str) -> Reply {
@@ -1928,6 +2175,7 @@ impl Server {
 
     fn pump_text(&mut self) {
         if !self.initialized() { return; }
+        let mut sent = false;
         let wanted: Vec<_> = self.desired.iter().filter(|(path, doc)| self.open.get(*path).is_none_or(|sent| !same_document(sent, doc)))
             .map(|(path, doc)| (path.clone(), doc.clone())).collect();
         for (path, doc) in wanted {
@@ -1954,12 +2202,26 @@ impl Server {
             if language.is_some() && doc.embedded().is_some_and(|p| p.indexed()) { self.index_now(&path); }
             self.flights.insert(token, TextFlight { path: path.clone(), document: doc.clone(), epoch });
             // A server that answers problems when asked (Kotlin LSP stops publishing after the first versions): ask
-            // about this text, queued behind it so the server has it first.
-            self.pull_diagnostics(&path, &doc);
+            // about this text, queued behind it so the server has it first (behind its barrier, for one that has one).
+            if PROVIDERS[self.key.provider].sync_barrier.is_some() { self.unpulled.insert(path.clone()); } else { self.pull_diagnostics(&path, &doc); }
+            sent = true;
             self.open.insert(path.clone(), doc);
             if language.is_none() && PROVIDERS[self.key.provider].watched_files {
                 self.dirty_open.insert(path.clone(), true);
                 self.refresh.insert(path);
+            }
+        }
+        // Ruby LSP 0.26.11 applies `didChange` on its worker thread but parses a document on its reader thread as soon
+        // as a request about it arrives: a request right behind an edit was parsed on the text before it, answered
+        // from that parse on the worker, and the answer cached under the edited text (a deletion undone at once left
+        // the old text's syntax errors at the restored text's offsets until the file was reopened). Its worker answers
+        // in order, so a document-free request's answer means every text before it has been applied.
+        if sent && let Some(method) = PROVIDERS[self.key.provider].sync_barrier {
+            self.next_id += 1;
+            let id = self.next_id;
+            if self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })).is_ok() {
+                self.settling = Some(id);
+                self.settle_waits = 0;
             }
         }
         if self.text_pending() { return; }
@@ -1981,7 +2243,7 @@ impl Server {
         }
     }
 
-    fn message(&mut self, m: Value, settings: &Settings, now: std::time::Instant, notices: &mut Vec<String>) -> Outcome {
+    fn message(&mut self, m: Value, settings: &Settings, now: std::time::Instant, notices: &mut Vec<String>, logged: &mut Vec<String>) -> Outcome {
         let name = PROVIDERS[self.key.provider].name;
         match (m.get("method").and_then(Value::as_str), m.get("id").cloned()) {
             (Some(method), Some(id)) => {
@@ -2000,7 +2262,11 @@ impl Server {
                     "workspace/configuration" => {
                         let provider = &PROVIDERS[self.key.provider];
                         let items = m["params"]["items"].as_array().map_or(&[][..], Vec::as_slice);
-                        Ok(Value::Array(items.iter().map(|i| settings.configuration(provider, Some(&self.key.root), i["section"].as_str())).collect()))
+                        Ok(Value::Array(items.iter().map(|i| match i["section"].as_str() {
+                            // A relative interpreter is withheld whichever way it is asked.
+                            Some("python.pythonPath") => sent(&self.key, json!({ "pythonPath": settings.configuration(provider, Some(&self.key.root), Some("python.pythonPath")) }))["pythonPath"].clone(),
+                            section => sent(&self.key, settings.configuration(provider, Some(&self.key.root), section)),
+                        }).collect()))
                     }
                     "window/workDoneProgress/create" | "client/registerCapability" | "client/unregisterCapability" | "window/showMessageRequest" => Ok(Value::Null),
                     // Its results changed: forget what was asked; the next sync asks again.
@@ -2031,10 +2297,20 @@ impl Server {
                 });
                 Outcome::default()
             }
-            (Some(method), None) => self.notification(method, &m["params"], notices),
+            (Some(method), None) => self.notification(method, &m["params"], now, notices, logged),
             (None, Some(id)) => {
                 let id = id.as_i64();
                 // Problems asked about one version: kept as a publication for exactly that text would be.
+                if id.is_some() && id == self.gems_request {
+                    self.gems_request = None;
+                    let paths = m["result"].as_array().map(|gems| gems.iter().filter_map(|g| g["path"].as_str()).map(PathBuf::from).collect()).unwrap_or_default();
+                    self.gems = Some(Arc::new(paths));
+                    return Outcome::default();
+                }
+                if id.is_some() && id == self.settling {
+                    self.settled();
+                    return Outcome { ready: true, repaint: true, ..Outcome::default() };
+                }
                 if let Some(doc) = id.and_then(|id| self.pulls.remove(&id)) {
                     if m["result"]["kind"] != "full" { return Outcome::default(); }
                     let params = json!({ "diagnostics": m["result"]["items"] });
@@ -2061,6 +2337,10 @@ impl Server {
                     }
                     self.encoding = Encoding::negotiated(&self.capabilities);
                     self.notify("initialized", json!({}));
+                    if let Some(method) = PROVIDERS[self.key.provider].dependencies {
+                        self.next_id += 1;
+                        if self.send(json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": {} })).is_ok() { self.gems_request = Some(self.next_id); }
+                    }
                     let provider = &PROVIDERS[self.key.provider];
                     for (method, params) in (provider.registrations)(&settings.initialization(provider, Some(&self.key.root))) {
                         self.notify(method, params);
@@ -2068,7 +2348,7 @@ impl Server {
                     // A server that reports its own status is busy until it first says otherwise.
                     self.busy = PROVIDERS[self.key.provider].reports_status;
                     self.status = Status::Indexing(String::new());
-                    self.update_status();
+                    self.update_status(now);
                     return Outcome { repaint: true, ready: true, ..Outcome::default() };
                 }
                 let Some(lane) = self.pending.iter().find(|(_, pending)| Some(pending.id) == id).map(|(l, _)| *l) else { return Outcome::default() };
@@ -2080,14 +2360,16 @@ impl Server {
                 };
                 // Still indexing, or (for a server that never says) just started.
                 let no_status = !PROVIDERS[self.key.provider].reports_status;
-                let indexing = matches!(self.status, Status::Indexing(_)) || no_status && self.initialized_at.is_some_and(|t| now.duration_since(t) < UNREPORTED_WARMUP);
+                // A ready server's brief indexing (jdtls validates documents around requests) is not loading.
+                let brief = self.reindexing.is_some_and(|t| now.duration_since(t) < REINDEX_QUIET);
+                let indexing = matches!(self.status, Status::Indexing(_)) && !brief || no_status && self.initialized_at.is_some_and(|t| now.duration_since(t) < UNREPORTED_WARMUP);
                 Outcome { repaint: true, replies: vec![Reply { lane, request, session: self.session, encoding: self.encoding, provider: name, result, indexing, sources }], ready: false, ..Outcome::default() }
             }
             (None, None) => Outcome::default(),
         }
     }
 
-    fn notification(&mut self, method: &str, params: &Value, notices: &mut Vec<String>) -> Outcome {
+    fn notification(&mut self, method: &str, params: &Value, now: std::time::Instant, notices: &mut Vec<String>, logged: &mut Vec<String>) -> Outcome {
         match method {
             "$/progress" => {
                 let token = match &params["token"] {
@@ -2113,6 +2395,14 @@ impl Server {
             // Kept only for the exact text the server was sent; a version it was not sent is dropped, not misplaced.
             "textDocument/publishDiagnostics" => {
                 let Some(path) = params["uri"].as_str().and_then(lsp::uri_path) else { return Outcome::default() };
+                // JDT LS 1.63: code "32" "X is not on the classpath of project P, only syntax errors are reported",
+                // code "16" "X is a non-project file, only syntax errors are reported" (source "Java", line 0).
+                let outside = params["diagnostics"].as_array().into_iter().flatten().find_map(|d| {
+                    let code = d["code"].as_str().or(None).map(str::to_owned).or_else(|| d["code"].as_u64().map(|c| c.to_string()))?;
+                    (d["source"].as_str() == Some("Java") && matches!(code.as_str(), "32" | "16"))
+                        .then(|| Outside { message: d["message"].as_str().unwrap_or_default().chars().take(300).collect(), no_project: code == "16" })
+                });
+                match outside { Some(o) => { self.outside.insert(path.clone(), o); } None => { self.outside.remove(&path); } }
                 // Its reply can be read before the writer reports the text written: the frame still in flight is it.
                 let version = params["version"].as_u64();
                 if params.get("version").filter(|v| !v.is_null()).is_some_and(|_| version.is_none()) { return Outcome::default(); }
@@ -2144,6 +2434,14 @@ impl Server {
             "language/status" => match params["type"].as_str() {
                 Some("ServiceReady" | "Started") => self.busy = false,
                 Some("Starting") => self.busy = true,
+                // "Updating demo configuration" / "Updating project configurations...": a re-import, which the next
+                // ProjectStatus OK ends (one also comes at every start, which reopens nothing).
+                Some("Message") if params["message"].as_str().is_some_and(|m| m.starts_with("Updating")) => { self.reimporting = true; return Outcome::default(); }
+                Some("ProjectStatus") if self.reimporting => {
+                    self.reimporting = false;
+                    self.reopen_documents();
+                    return Outcome { repaint: true, ..Outcome::default() };
+                }
                 Some("Error") => {
                     notices.push(format!("{}: {}", PROVIDERS[self.key.provider].name, params["message"].as_str().unwrap_or_default()));
                     return Outcome { repaint: true, ..Outcome::default() };
@@ -2152,12 +2450,16 @@ impl Server {
             },
             // An error it reports (Ruby LSP 0.26.11 logs a failed `initialized` and keeps running): kept to be shown.
             "window/logMessage" if params["type"].as_u64() == Some(1) => {
-                self.error = Some(error_text(params["message"].as_str().unwrap_or_default()));
+                let message = params["message"].as_str().unwrap_or_default();
+                self.error = Some(error_text(message));
+                logged.push(format!("{} error: {message}", PROVIDERS[self.key.provider].name));
                 return Outcome { repaint: true, ..Outcome::default() };
             }
             "window/showMessage" if params["type"].as_u64().is_some_and(|t| t <= 2) => {
                 if params["type"].as_u64() == Some(1) {
-                    self.error = Some(error_text(params["message"].as_str().unwrap_or_default()));
+                    let message = params["message"].as_str().unwrap_or_default();
+                    self.error = Some(error_text(message));
+                    logged.push(format!("{} error: {message}", PROVIDERS[self.key.provider].name));
                 }
                 notices.push(format!("{}: {}", PROVIDERS[self.key.provider].name, params["message"].as_str().unwrap_or_default()));
                 return Outcome { repaint: true, ..Outcome::default() };
@@ -2165,7 +2467,7 @@ impl Server {
             _ => return Outcome::default(),
         }
         let before = self.status.clone();
-        self.update_status();
+        self.update_status(now);
         if matches!(before, Status::Indexing(_)) && self.status == Status::Ready {
             // What was asked while loading may be empty (rust-analyzer) or refused (`ContentModified`): asked again
             // (the answer still to come is dropped).
@@ -2184,15 +2486,21 @@ impl Server {
 
     /// Initialization is not readiness: reported work in progress (or rust-analyzer's own status) keeps it
     /// indexing.
-    fn update_status(&mut self) {
+    fn update_status(&mut self, now: std::time::Instant) {
         if !self.initialized() {
             return;
         }
+        let was_ready = self.status == Status::Ready;
         self.status = match (self.progress.iter().min_by(|a, b| a.0.cmp(b.0)), self.busy) {
             (Some((_, w)), _) => Status::Indexing(w.summary()),
             (None, true) => Status::Indexing("loading the workspace".into()),
             (None, false) => Status::Ready,
         };
+        match &self.status {
+            Status::Indexing(_) if was_ready => self.reindexing = Some(now),
+            Status::Indexing(_) => {}
+            _ => self.reindexing = None,
+        }
     }
 
     fn stop(self) {
@@ -2293,7 +2601,7 @@ fn runtime_failure(key: &Key, provider: &Provider, exe: &Path) -> String {
     };
     let details = match runtime {
         Some(path) => {
-            let version = runtime::version_in(&path, flag, &key.launch.env, Some(&key.root)).unwrap_or_else(|e| format!("version unavailable: {e}"));
+            let version = runtime::version_in(&path, flag, &key.launch.env, Some(probe_dir(key))).unwrap_or_else(|e| format!("version unavailable: {e}"));
             let version = version.lines().collect::<Vec<_>>().join(" | ");
             format!("; {label}: {} ({version})", path.display())
         }
@@ -2309,27 +2617,51 @@ fn runtime_failure(key: &Key, provider: &Provider, exe: &Path) -> String {
     lenz_content::display::expand_tabs(&format!("{details}{}", requirement.map(|r| format!("; Pyright package engines.node: {r}")).unwrap_or_default())).0
 }
 
+/// A settings file's modification time and size (`None`: it cannot be read).
+fn stamp(file: &Path) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(file).ok().and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
+/// A provider's settings as server `key` receives them: Pyright's leave out a project's interpreter outside the folder
+/// where the project's own programs may run ([`python::sent`]).
+fn sent(key: &Key, settings: Value) -> Value {
+    if PROVIDERS[key.provider].id == "pyright" { python::sent(settings, &key.root, key.launch.trusted.as_deref()) } else { settings }
+}
+
+/// Where a server's version (and its runtime's) is asked: its workspace in a folder the user trusts, else outside any
+/// project, so that a version manager's shim does not read the project's toolchain files.
+fn probe_dir(key: &Key) -> &Path {
+    if key.launch.trusted.is_some() { &key.root } else { Path::new(runtime::NEUTRAL) }
+}
+
 /// Launch a server off the UI thread: check `--version`, start the process in its own process group, then pump
 /// its input from `inbox` and its output into `events` until it exits.
 #[allow(clippy::too_many_arguments)]
 fn spawn_server(key: Key, provider: &'static Provider, data: Option<(&'static str, PathBuf)>, cache: PathBuf, options: Value, session: u64, inbox: async_channel::Receiver<Outgoing>, process: Arc<Mutex<Process>>, events: async_channel::Sender<Completion>) {
     let send = move |e: Event| events.send_blocking(Completion::Semantic(e)).is_ok();
     let _ = std::thread::Builder::new().name(format!("reader-{}", provider.id)).spawn(move || {
+        // A project program it would run in a folder the user trusts (typescript-go's own `tsc`): the session asks.
+        if key.launch.trusted.is_none() && let Some(runs) = provider::untrusted_program(provider, &key.root) {
+            send(Event::Restricted { session, runs, held: false });
+        }
         // Not on PATH and not named in the settings: the server an installed VS Code ships, run with `node`.
         let mut args: Vec<String> = provider.fixed_args.iter().map(|a| a.to_string()).chain(key.launch.args.iter().cloned()).collect();
         let mut bundled_version = None;
         let fallback = provider.bundled.filter(|_| key.launch.executable == Path::new(provider.executable)).and_then(|s| provider::bundled_server(&provider::VSCODE_EXTENSIONS, s));
-        // Its own lookup for this workspace (typescript-go: the project's tsc) when the settings name none.
+        // Its own lookup for this workspace (typescript-go: the project's tsc, in a trusted folder) when the settings
+        // name none.
         let locate = provider.locate.filter(|_| key.launch.executable == Path::new(provider.executable));
         let found = match locate {
             // Its own lookup decides (it searches PATH too, for a version it can run).
-            Some(locate) => locate(&key.root, &key.launch),
+            Some(locate) => match locate(&key.root, &key.launch) {
+                Ok(found) => Some(found),
+                Err(why) => {
+                    send(Event::Detected { session, version: Err(why) });
+                    return;
+                }
+            },
             None => provider::find_executable(&key.launch.executable, key.launch.path()),
         };
-        if locate.is_some() && found.is_none() {
-            send(Event::Detected { session, version: Err(format!("no `{}` it can run was found in the project's node_modules/.bin or on PATH", provider.executable)) });
-            return;
-        }
         let found = found.or_else(|| {
             let (script, version) = fallback.clone()?;
             let node = provider::find_executable(Path::new("node"), key.launch.path())?;
@@ -2355,11 +2687,17 @@ fn spawn_server(key: Key, provider: &'static Provider, data: Option<(&'static st
             });
             return;
         };
+        // A server that runs the project's code starts only in a folder the user trusts: nothing of it runs, not even
+        // its version. (Not installed, it says so above, as anywhere.)
+        if !provider.runs.is_empty() && key.launch.trusted.is_none() {
+            send(Event::Restricted { session, runs: provider.runs, held: true });
+            return;
+        }
         // The version, as the provider says it can be found (else its `initialize` answer names it).
         // A version flag that fails means it cannot run; a version that cannot be read is only unknown.
         let version = match provider.version {
             _ if let Some(v) = &bundled_version => Ok(if v.is_empty() { String::new() } else { format!("{v} (its built-in server)") }),
-            provider::Version::Flag(args) => runtime::version_args_in(&exe, args, &key.launch.env, Some(&key.root))
+            provider::Version::Flag(args) => runtime::version_args_in(&exe, args, &key.launch.env, Some(probe_dir(&key)))
                 .map(|v| v.lines().next().unwrap_or_default().trim().to_owned())
                 .map_err(|e| lenz_content::display::expand_tabs(&format!("`{} {}` failed: {}", exe.display(), args.join(" "), e.lines().collect::<Vec<_>>().join(" | "))).0),
             provider::Version::Package(name) => Ok(provider::package_version(&exe, name).map(|v| format!("{name} {v}")).unwrap_or_default()),
@@ -2372,7 +2710,7 @@ fn spawn_server(key: Key, provider: &'static Provider, data: Option<(&'static st
         // The project environment it would analyse with: a configured one that is missing stops the launch, since
         // the server would otherwise use another without saying so.
         if let Some(environment) = provider.environment {
-            match environment(&key.root, &options, key.launch.path()) {
+            match environment(&key.root, &options, key.launch.path(), key.launch.trusted.as_deref()) {
                 Ok(line) => if !send(Event::Environment { session, line: Ok(lenz_content::display::expand_tabs(&line).0) }) { return; },
                 Err(reason) => {
                     let reason = lenz_content::display::expand_tabs(&reason).0;
@@ -2389,7 +2727,8 @@ fn spawn_server(key: Key, provider: &'static Provider, data: Option<(&'static st
             command.arg(flag).arg(folder);
         }
         // The provider's own variables for this root first; the user's `env` wins.
-        let root_env = match (provider.root_env)(&key.root, &cache, &exe, &key.launch.env) {
+        let within = key.launch.trusted.as_deref().unwrap_or(&key.root);
+        let root_env = match (provider.root_env)(&key.root, &cache, &exe, &key.launch.env, within) {
             Ok(env) => env,
             Err(reason) => {
                 send(Event::Exited { session, reason: lenz_content::display::expand_tabs(&reason).0 });
@@ -2404,7 +2743,7 @@ fn spawn_server(key: Key, provider: &'static Provider, data: Option<(&'static st
         let spawned = {
             let Ok(mut p) = process.lock() else { return };
             if p.stopped { return; }
-            command.spawn().map(|mut child| {
+            runtime::spawn(&mut command).map(|mut child| {
                 let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
                 p.child = Some(child);
                 pipes
@@ -2632,12 +2971,6 @@ pub fn sample_memory(groups: &[(u64, u32)]) -> Vec<(u64, u64, u64)> {
     groups.iter().filter_map(|&(session, pgid)| kib.get(&pgid).map(|&(s, h)| (session, s * 1024, h * 1024))).collect()
 }
 
-/// What to say about combined server memory: nothing up to [`MEMORY_NOTICE`]; above it, the total. The reader
-/// never stops servers for it.
-pub fn memory_notice(bytes: u64) -> Option<String> {
-    (bytes > MEMORY_NOTICE).then(|| format!("Language servers use {:.1} GiB (above 2 GiB); disable or restart ones you do not need", bytes as f64 / (1u64 << 30) as f64))
-}
-
 /// A document's symbols as outline rows, in source order with their nesting depth: from nested
 /// `DocumentSymbol`s or flat `SymbolInformation`s. Each row shows the source text at the symbol's name (so it
 /// is validated like a declaration); at most `limit`.
@@ -2735,9 +3068,9 @@ mod tests {
         assert!(!semantics.roots.contains_key(&key),"the obsolete choice cannot start a server");
         semantics.roots.insert(key.clone(),None);
         let root_epoch=semantics.root_epoch();
-        semantics.event(Event::Resolved{root_epoch,provider,dir:dir.path().to_owned(),root:None,serve:provider},&tx);
+        semantics.event(Event::Resolved{root_epoch,provider,dir:dir.path().to_owned(),root:None,serve:provider,real:None,trusted:None},&tx);
         assert!(matches!(semantics.roots.get(&key),Some(Some(None))),"the next lookup is accepted");
-        let outcome=semantics.event(Event::Resolved{root_epoch:old_epoch,provider,dir:dir.path().to_owned(),root:Some(dir.path().to_owned()),serve:provider},&tx);
+        let outcome=semantics.event(Event::Resolved{root_epoch:old_epoch,provider,dir:dir.path().to_owned(),root:Some(dir.path().to_owned()),serve:provider,real:None,trusted:None},&tx);
         assert!(!outcome.ready);
         assert!(matches!(semantics.roots.get(&key),Some(Some(None))),"an old answer arriving last cannot replace the new result");
     }
@@ -2750,7 +3083,7 @@ mod tests {
         let root_epoch=semantics.root_epoch();
         semantics.manifests_changed();
         let (tx,_rx)=async_channel::bounded(32);
-        semantics.event(Event::Resolved{root_epoch,provider:0,dir:dir.path().to_owned(),root:Some(dir.path().to_owned()),serve:0},&tx);
+        semantics.event(Event::Resolved{root_epoch,provider:0,dir:dir.path().to_owned(),root:Some(dir.path().to_owned()),serve:0,real:None,trusted:None},&tx);
         assert!(!semantics.roots.contains_key(&key),"a lookup invalidated by a manifest change cannot restore its old workspace");
     }
 
@@ -2783,7 +3116,7 @@ mod tests {
         for stopped_first in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut semantics = Semantics::new(dir.path().join("providers.json"), dir.path().join("cache"), IDLE, Arc::new(std::time::Instant::now));
-            semantics.queue(Key { provider: 0, root: dir.path().to_owned(), launch: Launch { executable: "unused".into(), args: vec![], env: vec![] } }, dir.path().join("file.rs"));
+            semantics.queue(Key { provider: 0, root: dir.path().to_owned(), launch: Launch { executable: "unused".into(), args: vec![], env: vec![], trusted: None } }, dir.path().join("file.rs"));
             let process = semantics.servers[0].process.clone();
             let mut command = Command::new("sleep"); command.arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
@@ -2804,7 +3137,7 @@ mod tests {
         let mut semantics = Semantics::new(dir.path().join("providers.json"), dir.path().join("cache"), IDLE, Arc::new(std::time::Instant::now));
         let root = dir.path().to_path_buf();
         let file = root.join("App space λ.java");
-        semantics.queue(Key { provider: 0, root, launch: Launch { executable: "/nonexistent".into(), args: vec![], env: vec![] } }, file.clone());
+        semantics.queue(Key { provider: 0, root, launch: Launch { executable: "/nonexistent".into(), args: vec![], env: vec![], trusted: None } }, file.clone());
         semantics.servers[0].status = Status::Ready;
         semantics.queued.clear();
         let session = semantics.servers[0].session;
@@ -2833,7 +3166,7 @@ mod tests {
         let mut semantics=Semantics::new(dir.path().join("providers.json"),dir.path().join("cache"),IDLE,Arc::new(std::time::Instant::now));
         let original=Document::decode("/project/diagnostics.rb".into(),1,b"bad_name\n");
         for provider in 0..2 {
-            semantics.queue(Key{provider,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![]}},original.source().to_path_buf());
+            semantics.queue(Key{provider,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![],trusted:None}},original.source().to_path_buf());
             semantics.servers[provider].status=Status::Ready;
         }
         for version in 1..=128 {
@@ -2854,7 +3187,7 @@ mod tests {
     fn closing_diagnostic_sources_releases_the_cached_merged_publication() {
         let dir=tempfile::tempdir().unwrap();let mut semantics=Semantics::new(dir.path().join("providers.json"),dir.path().join("cache"),IDLE,Arc::new(std::time::Instant::now));
         let doc=Arc::new(Document::decode("/project/diagnostics.rb".into(),1,b"bad_name\n"));
-        for provider in 0..2 { semantics.queue(Key{provider,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![]}},doc.source().to_path_buf());let server=&mut semantics.servers[provider];server.status=Status::Ready;server.open.insert(doc.source().to_owned(),doc.clone());server.diagnostics.insert(doc.source().to_owned(),Arc::new(diagnostics::FileDiagnostics::new(&doc,vec![]))); }
+        for provider in 0..2 { semantics.queue(Key{provider,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![],trusted:None}},doc.source().to_path_buf());let server=&mut semantics.servers[provider];server.status=Status::Ready;server.open.insert(doc.source().to_owned(),doc.clone());server.diagnostics.insert(doc.source().to_owned(),Arc::new(diagnostics::FileDiagnostics::new(&doc,vec![]))); }
         semantics.queued.clear();
         let published=semantics.diagnostics(doc.source()).unwrap();let observed=Arc::downgrade(&published);drop(published);
         let (tx,_rx)=async_channel::bounded(32);semantics.sync(&[],&[],&[],None,&mut|_,_,_,_,_|panic!("no documents to resolve"),&tx);
@@ -2867,7 +3200,7 @@ mod tests {
         let mut semantics=Semantics::new(dir.path().join("providers.json"),dir.path().join("cache"),IDLE,Arc::new(std::time::Instant::now));
         let old=Arc::new(Document::decode("/project/diagnostics.rb".into(),1,b"bad_name\n"));
         let new=Arc::new(Document::from_snapshot_parts(old.source_meta().clone(),2,old.text().clone()));
-        let session=semantics.queue(Key{provider:0,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![]}},old.source().to_path_buf());
+        let session=semantics.queue(Key{provider:0,root:"/project".into(),launch:Launch{executable:"/nonexistent".into(),args:vec![],env:vec![],trusted:None}},old.source().to_path_buf());
         let server=&mut semantics.servers[0];server.status=Status::Ready;server.written.insert(old.source().to_owned(),old.clone());
         server.flights.insert(1,TextFlight{path:new.source().to_owned(),document:new.clone(),epoch:1});
         semantics.queued.clear();
@@ -2912,7 +3245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut semantics = Semantics::new(dir.path().join("providers.json"), dir.path().join("cache"), IDLE, Arc::new(std::time::Instant::now));
         let doc = Arc::new(Document::decode(PathBuf::from("/project/b.rs"), 1, b"fn target() {}\n"));
-        let session = semantics.queue(Key { provider: 0, root: "/project".into(), launch: Launch { executable: "/nonexistent".into(), args: Vec::new(), env: Vec::new() } }, doc.source().to_path_buf());
+        let session = semantics.queue(Key { provider: 0, root: "/project".into(), launch: Launch { executable: "/nonexistent".into(), args: Vec::new(), env: Vec::new(), trusted: None } }, doc.source().to_path_buf());
         // the fixture is a running server: not launched by a later event, whose failed `/nonexistent` would close its
         // input mid-test (a race that load can lose)
         semantics.queued.clear();

@@ -1,6 +1,6 @@
 //! Only visible rows and columns become terminal cells. Source text is never ANSI.
 use std::ops::Range;
-use ratatui::{buffer::Buffer, layout::Rect, style::{Modifier, Style}, widgets::{Block, Borders, Clear, Paragraph}};
+use ratatui::{buffer::Buffer, layout::Rect, style::{Modifier, Style}, widgets::{Clear, Paragraph}};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use lenz::{document::Placeholder, view::{Content, Side}};
@@ -47,6 +47,7 @@ fn rich_source(palette:&lenz::theme::Palette,buf:&mut Buffer,area:Rect,text:&str
     let Decorations{inline,inline_color,hits,syntax,selection,caret}=decorations;
     if area.width == 0 { return; }
     let limit = lenz::document::LONG_LINE;
+    let full = text;
     let end = if text.len() <= limit { text.len() } else { text.char_indices().nth(limit).map_or(text.len(), |(i, _)| i) };
     let text = &text[..end];
     let mut column = 0;
@@ -75,6 +76,14 @@ fn rich_source(palette:&lenz::theme::Palette,buf:&mut Buffer,area:Rect,text:&str
     if caret == Some(text.len()) && column >= offset && column < offset + usize::from(area.width) {
         buf.set_string(area.x + (column - offset) as u16, area.y, "▏", style.fg(color(palette.accent)));
     }
+    // a cut line ends with how much it leaves out, as in the GUI
+    if column < offset + usize::from(area.width) && let Some(note) = lenz::document::cut_note(full, end) {
+        for ch in note.chars() {
+            if column >= offset + usize::from(area.width) { break; }
+            if column >= offset { buf.set_string(area.x + (column - offset) as u16, area.y, ch.to_string(), style.fg(color(palette.dim))); }
+            column += 1;
+        }
+    }
 }
 
 fn overlaps(ranges: &[Range<usize>], byte: usize, len: usize) -> bool {
@@ -87,6 +96,7 @@ fn label(palette:&lenz::theme::Palette,frame: &mut ratatui::Frame, area: Rect, t
 }
 
 pub fn draw(app: &mut App, frame: &mut ratatui::Frame) {
+    if let Some(picker) = &mut app.open_comparison { picker.draw(frame, &app.palette); return; }
     let palette=app.palette.clone();let palette=&*palette;
     let area = app.diff_area;
     app.size = (area.width, area.height);
@@ -208,7 +218,8 @@ pub fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         Placeholder::Large { bytes } => format!("Oversized comparison ({:.1} MiB). Enter to load.", *bytes as f64 / (1 << 20) as f64),
         Placeholder::Unreadable(e) => e.clone(),
     });
-    if let Some(message) = placeholder.as_deref().filter(|_|app.visual.image().is_none()).or_else(|| app.session.loading().then_some("Loading comparison…  q quits; file navigation remains available")).filter(|_|!summary) {
+    // a rendering is drawn while an SVG's source is still being diffed
+    if let Some(message) = placeholder.as_deref().or_else(|| app.session.loading().then_some("Loading comparison…  q quits; file navigation remains available")).filter(|_|!summary&&app.visual.image().is_none()) {
         label(palette,frame, Rect::new(area.x+1, area.y+3.min(area.height - 1), area.width.saturating_sub(2), 1), message, base(palette).fg(color(palette.accent)));
     }
     for (i,record) in app.session.applied().iter().rev().take(if summary{0}else{applied_rows}).collect::<Vec<_>>().into_iter().rev().enumerate(){
@@ -217,6 +228,13 @@ pub fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     // the separator only before a message
     let status=match status_text(app){text if text.is_empty()=>"F2 details".to_string(),text=>format!("F2 details · {text}")};
     label(palette,frame, Rect::new(area.x, area.y+area.height - 2, area.width, 1), &status, base(palette).fg(color(palette.accent)));
+    if let Some(kind @ (Prompt::Search | Prompt::Line)) = app.prompt {
+        let prefix=if kind==Prompt::Search {format!("Find {}: ",app.session.find().map_or_else(String::new,|f|f.counter()))} else {"Line: ".into()};let offset=(lenz::wrap::width(&prefix) as u16).min(area.width);
+        let row=Rect::new(area.x,area.y+area.height-2,area.width,1);
+        frame.render_widget(Clear,row);
+        label(palette,frame,row,&prefix,base(palette));
+        lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:&app.input,cursor:app.field_inputs.cursor(kind as u64,0).unwrap_or_default(),area:Rect::new(row.x+offset,row.y,row.width.saturating_sub(offset),1),active:true},base(palette),base(palette).bg(color(palette.selected_bg)));
+    }
     let lists=app.navigator.focused||app.repository.as_ref().is_some_and(|r|r.core.picker.shown&&r.core.picker.focus==lenz::repository_session::Pane::Log);
     let footer=if lists{" Type to find  ↑/↓ or F3 matches  Enter open  Esc cancel  F10 commands  Ctrl-Q quit"}else{" n/p changes  [/] files  / find  f files  F10 commands  ? help  q quit"};
     // a full-width bar under the side panels: the panel switches, glued, at the left and the keys at the right
@@ -281,6 +299,7 @@ pub(crate) fn status_text(app:&App)->String {
     else if !app.session.applied().is_empty(){format!("{} applied records · A history / Undo · Ctrl-Z undo · Alt-Shift-←/→ apply",app.session.applied().len())}
     else if let Some(doc) = app.session.document() {
         let mut notes = doc.notes().to_vec();
+        notes.extend(app.visual.syntax_note().map(str::to_owned));
         if let Some((l, r)) = doc.line_endings() { notes.push(format!("Line endings differ: {l:?} / {r:?}")); }
         if doc.widest() >= lenz::document::LONG_LINE { notes.push("Long lines show their first 10,000 characters".into()); }
         notes.join(" · ")
@@ -338,16 +357,20 @@ fn popup(app: &mut App, frame: &mut ratatui::Frame, prompt: Prompt) {
     let rect = Rect::new(area.x+(area.width - w) / 2, area.y+(area.height - h) / 2, w, h);
     app.popup_rect=rect;
     frame.render_widget(Clear, rect);
-    frame.render_widget(Block::default().borders(Borders::ALL).style(base(palette)), rect);
+    frame.render_widget(crate::chrome::pane("",palette,true).style(base(palette)), rect);
     let rows=popup_rows(app,prompt);
     let heading = format!(" {}{}", if prompt == Prompt::Files { "Files: " } else { "Applied history: " }, app.input);
     label(palette,frame, Rect::new(rect.x + 1, rect.y, rect.width - 2, 1), &heading, base(palette).fg(color(palette.accent)));
+    if prompt==Prompt::Files {
+        lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:&app.input,cursor:app.field_inputs.cursor(prompt as u64,0).unwrap_or_default(),area:Rect::new(rect.x+8.min(rect.width),rect.y,rect.width.saturating_sub(9),1),active:true},base(palette),base(palette).bg(color(palette.selected_bg)));
+    }
     let count = h.saturating_sub(2) as usize;
     let start = app.selected.saturating_sub(count.saturating_sub(1));
+    lenz_terminal_ui::scroll_thumb(frame.buffer_mut(), rect.right() - 1, rect.y + 1, count as u16, (rows.len(), start, count), base(palette));
     for (i, row) in rows.iter().enumerate().skip(start).take(count) {
         let line = Rect::new(rect.x + 1, rect.y + 1 + (i - start) as u16, rect.width - 2, 1);
         app.popup_hits.push((i,line));
-        let style = if i == app.selected && prompt != Prompt::Help { base(palette).bg(color(palette.selected_bg)) } else { base(palette) };
+        let style = if i == app.selected && prompt != Prompt::Help { base(palette).bg(color(palette.menu_selected(palette.bg))) } else { base(palette) };
         frame.render_widget(Paragraph::new(" ").style(style), line);
         label(palette,frame, line, row, style);
     }
@@ -369,7 +392,7 @@ pub(crate) fn source_width(lines:&[String])->usize{
         if text.is_ascii(){let text=&text[..text.len().min(lenz::document::LONG_LINE)];return text.len()+3*text.bytes().filter(|b|*b==b'\t').count();}
         let end=text.char_indices().nth(lenz::document::LONG_LINE).map_or(text.len(),|(i,_)|i);
         text[..end].graphemes(true).map(|g|if g=="\t"{4}else if g.chars().any(lenz::document::hides_text){1}else{g.width().max(1)}).sum()
-    }).max().unwrap_or(0)
+    }).zip(lines).map(|(width,text)|width+lenz::document::cut_note_columns(text)).max().unwrap_or(0)
 }
 
 
@@ -405,8 +428,9 @@ mod tests {
         let mut app = App::new(lenz::session::Session::open(request, dir.path().into()));
         ready(&mut app);
         assert_eq!(app.session.comparisons().len(), 2);
-        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
-        let header = |terminal: &Terminal<TestBackend>,y:u16| terminal.backend().buffer().content[160*usize::from(y)..160*usize::from(y+1)].iter().map(|cell| cell.symbol()).collect::<String>();
+        // wide enough for both titles beside the SVG's five modes (Source included) at the header's right end
+        let mut terminal = Terminal::new(TestBackend::new(170, 20)).unwrap();
+        let header = |terminal: &Terminal<TestBackend>,y:u16| terminal.backend().buffer().content[170*usize::from(y)..170*usize::from(y+1)].iter().map(|cell| cell.symbol()).collect::<String>();
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert!(app.visual.image().is_some());
         let (left, right) = app.session.labels();
@@ -458,6 +482,21 @@ mod tests {
                 assert!(!buf[(x,0)].modifier.contains(Modifier::UNDERLINED));
             }
         }
+    }
+
+    #[test]
+    fn a_cut_line_ends_with_its_note_and_scrolls_as_far_as_it() {
+        let long = format!("{}changed", "x".repeat(lenz::document::LONG_LINE));
+        let note = "  … 7 more characters";
+        let widest = source_width(std::slice::from_ref(&long));
+        assert_eq!(widest, lenz::document::LONG_LINE + note.chars().count());
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buffer = Buffer::empty(area);
+        let palette = crate::chrome::palette();
+        source(palette, &mut buffer, area, &long, widest - 30, base(palette), &[], &[]);
+        let row: String = (0..30).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(row.ends_with(note), "{row:?}");
+        assert!(row.starts_with("xxxxxxxxx"), "{row:?}");
     }
 
     #[test]

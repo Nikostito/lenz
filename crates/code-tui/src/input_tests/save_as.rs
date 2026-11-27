@@ -11,6 +11,31 @@ fn save_as_to(app: &mut App, path: &Path) {
 }
 
 #[test]
+fn save_as_keeps_exact_path_whitespace_and_first_pasted_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let sibling = dir.path().join("result");
+    std::fs::write(&sibling, b"keep sibling").unwrap();
+    let mut a = App::new(config(dir.path()), Some(dir.path().to_owned()));
+    a.enable_draft_input_for_test();
+    a.dispatch(Command::NewDocument);
+    a.handle(Event::Paste("draft contents".into()));
+    for name in ["result ", " result", " "] {
+        let target = dir.path().join(name);
+        key(&mut a, KeyCode::Char('S'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.modal.as_ref().is_some_and(|m| m.error.is_some()), "empty input must stay in the path prompt");
+        a.handle(Event::Paste(format!("{name}\nignored")));
+        assert_eq!(a.modal.as_ref().unwrap().input, name);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.session.save_as_prompt().is_none(), "the trimmed sibling must not request replacement");
+        settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.source() == target));
+        assert_eq!(std::fs::read(&target).unwrap(), b"draft contents");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"keep sibling");
+    }
+}
+
+#[test]
 fn new_file_and_save_as_use_terminal_keys_prompts_and_the_core_replace_decision() {
     let dir = tempfile::tempdir().unwrap();
     let existing = dir.path().join("existing.txt");
@@ -68,22 +93,27 @@ fn scratch_commands_and_tab_context_menu_use_real_terminal_input() {
     let d = tempfile::tempdir().unwrap();
     let mut a = App::new(config(d.path()), Some(d.path().to_owned()));
     draw(&mut a, 100, 18);
-    // The shared command menu opens the name prompt.
+    // The shared command menu opens the list of kinds: pinned ones first, typing filters, Enter creates the next one.
     key(&mut a, KeyCode::F(10), KeyModifiers::NONE);
     a.handle(Event::Paste("New Scratch File".into()));
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert!(matches!(a.modal.as_ref().map(|m| &m.kind), Some(Prompt::NewScratch)));
-    a.handle(Event::Paste("personal.rs".into()));
+    assert_eq!(a.choices().iter().take(4).map(|c| c.label.as_str()).collect::<Vec<_>>(), ["Plain text", "JSON", "Ruby", "PostgreSQL"]);
+    let screen = draw_screen(&mut a, 100, 18);
+    assert!(screen.contains("PostgreSQL") && screen.contains(".sql"), "{screen}");
+    for c in "rub".chars() { key(&mut a, KeyCode::Char(c), KeyModifiers::NONE); }
+    assert_eq!(a.choices().first().map(|c| c.label.as_str()), Some("Ruby"));
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     settle(&mut a, |a| a.session.state().current_source().is_some());
     let scratch = a.session.state().active().unwrap().source().to_owned();
     assert!(scratch.exists() && !scratch.starts_with(d.path().join("project")));
-    assert!(draw_screen(&mut a, 100, 18).contains("personal.rs"));
+    assert_eq!(scratch.file_name().and_then(|n| n.to_str()), Some("scratch_1.rb"));
+    assert!(draw_screen(&mut a, 100, 18).contains("scratch_1.rb"));
     a.run(CommandId::Close);
     key(&mut a, KeyCode::F(10), KeyModifiers::NONE);
     a.handle(Event::Paste("Scratch Files".into()));
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
-    assert!(draw_screen(&mut a, 100, 18).contains("personal.rs"));
+    assert!(draw_screen(&mut a, 100, 18).contains("scratch_1.rb"));
     for (w, h) in [(1, 1), (20, 5), (100, 18)] { draw(&mut a, w, h); key(&mut a, KeyCode::End, KeyModifiers::NONE); key(&mut a, KeyCode::Up, KeyModifiers::NONE); }
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.source() == scratch));
@@ -99,6 +129,59 @@ fn scratch_commands_and_tab_context_menu_use_real_terminal_input() {
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(a.session.state().tabs().len(), 1);
     assert_eq!(a.session.state().active().unwrap().source(), scratch);
+}
+
+#[test]
+fn creating_and_reopening_scratch_files_focuses_text_from_explorer_and_results() {
+    let focus = |a: &mut App, wanted| {
+        if wanted == Focus::Results {
+            a.run(CommandId::SearchProject);
+            a.handle(Event::Paste("needle".into()));
+            key(a, KeyCode::Enter, KeyModifiers::NONE);
+            settle(a, |a| a.session.state().results().is_some());
+        } else {
+            a.focus = wanted;
+        }
+        assert_eq!(a.focus, wanted);
+    };
+    for initial_focus in [Focus::Tree, Focus::Results] {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("find.txt"), b"needle\n").unwrap();
+        let mut a = App::new(config(d.path()), Some(project));
+        a.enable_draft_input_for_test();
+        settle(&mut a, |a| a.session.state().has_tree());
+        focus(&mut a, initial_focus);
+        draw(&mut a, 80, 18);
+        key(&mut a, KeyCode::F(10), KeyModifiers::NONE);
+        a.handle(Event::Paste("New Scratch File".into()));
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(prompt_kind(&a), Some(Prompt::NewScratch));
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        settle(&mut a, |a| a.session.state().current_source().is_some());
+        assert_eq!(a.focus, Focus::Text);
+        let scratch = a.session.state().active().unwrap().source().to_owned();
+        a.handle(Event::Paste("scratch λ".into()));
+        key(&mut a, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        settle(&mut a, |a| !a.session.state().tab_dirty(a.session.state().active().unwrap().id()));
+        assert_eq!(std::fs::read(&scratch).unwrap(), "scratch λ".as_bytes());
+        a.run(CommandId::Close);
+
+        focus(&mut a, initial_focus);
+        key(&mut a, KeyCode::F(10), KeyModifiers::NONE);
+        a.handle(Event::Paste("Scratch Files".into()));
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(prompt_kind(&a), Some(Prompt::ScratchFiles(_))));
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        settle(&mut a, |a| a.session.state().current_source().is_some());
+        assert_eq!(a.focus, Focus::Text);
+        key(&mut a, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        a.handle(Event::Paste("reopened β".into()));
+        key(&mut a, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        settle(&mut a, |a| !a.session.state().tab_dirty(a.session.state().active().unwrap().id()));
+        assert_eq!(std::fs::read(&scratch).unwrap(), "reopened β".as_bytes());
+    }
 }
 
 #[test]

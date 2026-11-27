@@ -10,7 +10,7 @@ impl Viewer {
         let surface=if self.merge.is_some(){Surface::Merge}else if self.picker_v.is_some(){Surface::VersionPicker}else{Surface::Comparison};
         // a loading file may still be Markdown: list View: Rendered, disabled with its reason
         let markdown=self.comparison.presentation_disabled(crate::markdown::PresentationMode::Rendered,self.doc().map(|d|&d.text))!=Some("Not a Markdown comparison");
-        Scope{surface,sticky:self.sticky_on,unified:self.comparison.view.unified(),repository:self.repo.is_some(),focused:self.layout.focused(self.repo.as_ref()),pr_tab:self.repo.as_ref().and_then(|r|r.pr.as_ref()).and_then(|p|p.details()).map(|d|d.tab),pr:self.repo.as_ref().is_some_and(|r|r.pr.is_some()),image:self.image_doc().is_some(),markdown,
+        Scope{surface,sticky:self.sticky_on,unified:self.comparison.view.unified(),repository:self.repo.is_some(),focused:self.layout.focused(self.repo.as_ref()),pr_tab:self.repo.as_ref().and_then(|r|r.pr.as_ref()).and_then(|p|p.details()).map(|d|d.tab),pr:self.repo.as_ref().is_some_and(|r|r.pr.is_some()),image:self.image_doc().is_some(),image_source:self.rendering_doc().is_some_and(|d|d.source),markdown,
               options:self.comparison.options,scroll:self.comparison.view.mode(),presentation:self.comparison.markdown_mode(),
               context_hidden:self.comparison.collapse,blame:self.blame_on,image_mode:self.iview.state().mode(),markdown_layout:self.comparison.markdown_layout(),find:self.find_open().then_some(self.comparison.find_options)}
     }
@@ -40,13 +40,17 @@ impl Viewer {
         use crate::repository_session::RepositoryCommand as R;
         self.command_palette=None;
         match action {
+            Action::NewComparison => {
+                let cwd = self.set.git_root().map(std::path::Path::to_path_buf).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                self.spawn_lenz(&["--new-comparison".into()], &cwd, cx);
+            }
             Action::Comparison(command@crate::commands::Command::SetDiffLayout(crate::commands::DiffLayout::Unified)) if let Some(why)=self.unified_disabled() => {let _=command;self.toast(why.into(),cx);}
             Action::Comparison(command)=>self.comparison_command(command,cx),
             Action::Interaction(command)=>self.interaction(command,cx),
             Action::Edit(command)=>self.edit_menu(command,cx),
             Action::Folder(action)=>self.folder_action(action,cx),
             Action::File(file)=>{let set=self.set.clone();self.file_action(file,self.comparison.current,&set,cx);},
-            Action::Image(index)=>if let Some(entry)=crate::image_session::image_commands().get(index){let viewport=self.image_viewport(window);if let Some(doc)=self.image_doc(){self.iview.command(&doc,entry.command,viewport);}},
+            Action::Image(index)=>if let Some(entry)=crate::image_session::image_commands().get(index){let viewport=self.image_viewport(window);if let Some(doc)=self.rendering_doc(){self.iview.command(&doc,entry.command,viewport);}},
             Action::Repository(RepoAction::Refresh)=>self.refresh_repository(cx),
             Action::Repository(RepoAction::Branches)=>self.branch_menu(self.panes.viewport[0]/3.,cx),
             Action::Repository(RepoAction::Filter)=>{
@@ -105,7 +109,7 @@ impl Viewer {
     }
 
     /// The ☰ menu under its button.
-    pub(super) fn open_app_menu(&mut self,x:f32,cx:&mut Context<Self>){self.open_entry_menu(catalog::app_menu(),x,cx);}
+    pub(super) fn open_app_menu(&mut self,x:f32,cx:&mut Context<Self>){let entries = if self.merge.is_none() && self.picker_v.is_none() { catalog::comparison_app_menu() } else { catalog::app_menu() }; self.open_entry_menu(entries,x,cx);}
 
     /// A toolbar dropdown of catalog entries under its button; again closes it.
     pub(super) fn open_entry_menu(&mut self,entries:Vec<catalog::Entry>,x:f32,cx:&mut Context<Self>){
@@ -146,6 +150,10 @@ impl Viewer {
         let (_,_,_,rows)=self.palette_layout();
         let Some(p)=self.command_palette.as_mut() else {return false};
         let ks=&ev.keystroke;
+        if let Some(command)=lenz_gpui::field::command(ev,cx) {
+            if let Some(text)=p.edit(command).copy {cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));}
+            cx.notify();return true;
+        }
         let page=rows.max(1) as isize;
         match ks.key.as_str() {
             "escape"=>self.command_palette=None,
@@ -186,10 +194,11 @@ impl Viewer {
         cx.notify();true
     }
 
-    /// Lines to paint: query, then (label, group and shortcut, dim, selected) per visible row, then the selected row's
-    /// disabled reason.
+    /// Lines to paint: query, then (label with the selected row's disabled reason, group, shortcut, dim, selected) per
+    /// visible row.
     pub(super) fn palette_paint(&mut self)->Option<PalettePaint>{
         let (x,y,width,rows)=self.palette_layout();
+        let active=self.modal()==Some(Modal::Palette);
         let p=self.command_palette.as_mut()?;
         let range=p.window(rows);let selected=p.selected();
         let lines=p.rows().enumerate().skip(range.start).take(range.len()).map(|(i,row)|{
@@ -197,19 +206,29 @@ impl Viewer {
             let reason=row.disabled.as_deref().filter(|_|selected==Some(i)).map_or(String::new(),|why|format!(" — {why}"));
             // macOS: the palette names the Command key the bindings accept
             let key=row.entry.shortcut.map(|k|if cfg!(target_os="macos") {k.replace("ctrl-","cmd-")} else {k.to_string()});
-            let right=[Some(row.entry.group.label().to_string()),key].into_iter().flatten().collect::<Vec<_>>().join("  ");
-            (format!("{mark}{}{reason}",row.entry.label),right,row.disabled.is_some(),selected==Some(i))
+            // the typed words, marked where the filter found them
+            let (mut in_label,in_group)=crate::palette::match_ranges(&row.entry.label,row.entry.group.label(),p.query());
+            for r in &mut in_label {*r=r.start+mark.len()..r.end+mark.len();}
+            PaletteLine{label:format!("{mark}{}{reason}",row.entry.label),group:row.entry.group.label().to_string(),key:key.unwrap_or_default(),disabled:row.disabled.is_some(),selected:selected==Some(i),in_label,in_group}
         }).collect();
         let empty=p.is_empty();
-        Some(PalettePaint{x,y,width,query:format!("› {}▏",p.query()),lines,empty})
+        let columns=(width/self.char_w.max(1.0)).max(0.0) as usize;
+        let snapshot=if active {self.field_native.snapshot(p.query(),p.input().cursor(),columns)}else{p.input().cursor().snapshot(p.query(),columns)};
+        Some(PalettePaint{x,y,width,query:snapshot.text,cursor:snapshot.cursor,lines,empty,first:range.start,total:p.len()})
     }
 }
 
-pub(super) struct PalettePaint { pub x:f32, pub y:f32, pub width:f32, pub query:String, pub lines:Vec<(String,String,bool,bool)>, pub empty:bool }
+pub(super) struct PalettePaint { pub x:f32, pub y:f32, pub width:f32, pub query:String, pub cursor:crate::field_edit::Cursor, pub lines:Vec<PaletteLine>, pub empty:bool,
+    /// The first row shown and the number of matching commands, for the scrollbar.
+    pub first:usize, pub total:usize }
+/// One palette row: its label (with the selected row's disabled reason), group and shortcut, and where the typed
+/// words sit in the label and the group.
+pub(super) struct PaletteLine { pub label:String, pub group:String, pub key:String, pub disabled:bool, pub selected:bool, pub in_label:Vec<std::ops::Range<usize>>, pub in_group:Vec<std::ops::Range<usize>> }
 
 impl Availability for Viewer {
     fn disabled(&self,action:Action)->Option<Cow<'static,str>>{
         match action {
+            Action::NewComparison => None,
             Action::Comparison(crate::commands::Command::SetPresentation(mode))=>self.comparison.presentation_disabled(mode,self.doc().map(|d|&d.text)).map(Cow::Borrowed),
             Action::Comparison(crate::commands::Command::Preview(_))=>self.comparison.presentation_disabled(crate::markdown::PresentationMode::Rendered,self.doc().map(|d|&d.text)).map(Cow::Borrowed),
             Action::Comparison(crate::commands::Command::SetDiffLayout(crate::commands::DiffLayout::Unified))=>self.unified_disabled().map(Cow::Borrowed),
@@ -221,7 +240,7 @@ impl Availability for Viewer {
                 let why=if file==crate::file_actions::FileAction::UndoLenz{self.comparison.markdown_edit_disabled().map(str::to_string)}else{None};
                 why.or_else(||self.file_disabled(file,self.comparison.current)).map(Cow::Owned)
             }
-            Action::Image(index)=>crate::image_session::image_commands().get(index).zip(self.image_doc()).and_then(|(e,doc)|e.disabled(&doc,self.iview.state())).map(Cow::Borrowed),
+            Action::Image(index)=>crate::image_session::image_commands().get(index).zip(self.rendering_doc()).and_then(|(e,doc)|e.disabled(&doc,self.iview.state())).map(Cow::Borrowed),
             Action::Repository(RepoAction::Refresh|RepoAction::Branches|RepoAction::NewBranch|RepoAction::CheckoutRevision)=>None,
             Action::Repository(RepoAction::Filter)=>None,
             Action::Repository(action @ (RepoAction::StagedChanges|RepoAction::CopyUrl|RepoAction::OpenUrl|RepoAction::LocalChanges|RepoAction::AllBranches

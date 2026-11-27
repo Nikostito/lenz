@@ -51,14 +51,23 @@ impl Session {
 
 /// Explicit formatting with the installed haml-lint and the project's .haml-lint.yml. The unsaved
 /// template travels only on stdin. Haml is compiled for syntax validation, never rendered or evaluated.
-/// Safe autocorrections are one draft transaction; haml-lint never writes the source file.
-pub(super) fn format(doc: &Document, organize: bool) -> format_work::ToolResult {
+/// Safe autocorrections are one draft transaction; haml-lint never writes the source file. Its configuration and bundle
+/// are looked for no higher than the opened folder (else the trusted folder holding the template, else its own folder),
+/// and it runs only in a folder the user trusts (it loads the project's bundle and RuboCop configuration), with its
+/// configuration and bundle found in the trusted folder deciding it; Bundler is named that bundle's Gemfile, so it
+/// does not look for one above.
+pub(super) fn format(doc: &Document, organize: bool, project: Option<&Path>, settings: &semantics::provider::Settings) -> format_work::ToolResult {
     use format_work::ToolResult;
     if organize { return ToolResult::Unavailable("Haml templates have no imports to organize".into()); }
     let cwd = doc.source().parent().unwrap_or(Path::new("/"));
-    if !cwd.ancestors().any(|d| d.join(".haml-lint.yml").is_file()) {
-        return ToolResult::Unavailable("no .haml-lint.yml configures this template; install haml-lint and configure it for the project to format Haml".into());
-    }
+    let within = semantics::provider::lookup_bound(doc.source(), project, settings).unwrap_or_else(|| cwd.to_owned());
+    let dirs = || cwd.ancestors().take_while(|d| d.starts_with(&within));
+    const UNCONFIGURED: &str = "no .haml-lint.yml configures this template; install haml-lint and configure it for the project to format Haml";
+    if !dirs().any(|d| d.join(".haml-lint.yml").is_file()) { return ToolResult::Unavailable(UNCONFIGURED.into()); }
+    // Trusted, only what is in the trusted folder deciding it: never an opened folder holding it that is not trusted.
+    let Some(within) = semantics::provider::trusted_bound(cwd, &within, settings) else { return format_work::restricted(doc.source(), format_work::HAML_RUNS) };
+    let dirs = || cwd.ancestors().take_while(|d| d.starts_with(&within));
+    if !dirs().any(|d| d.join(".haml-lint.yml").is_file()) { return ToolResult::Unavailable(UNCONFIGURED.into()); }
     let Some(ruby) = semantics::provider::find_executable(Path::new("ruby"), std::env::var_os("PATH").as_deref()) else {
         return ToolResult::Unavailable("Ruby with haml and haml_lint is required for Haml formatting; Lenz never installs gems".into());
     };
@@ -67,16 +76,16 @@ pub(super) fn format(doc: &Document, organize: bool) -> format_work::ToolResult 
     let script = "require 'haml_lint'; require 'haml_lint/cli'; require 'stringio'; text = STDIN.read; Haml::Engine.new.call(text); $stdin = StringIO.new(text); $stdout = StringIO.new; status = HamlLint::CLI.new.run(ARGV); out = $stdout.string; abort('haml-lint returned no source (the file may be excluded)') if !text.empty? && out.empty?; Haml::Engine.new.call(out); STDOUT.write(out); exit status";
     let mut args = vec!["-E".into(), "UTF-8:UTF-8".into(), "-e".into(), script.into(), "--".into(), "--stdin".into(), doc.source().display().to_string(),
         "--stderr".into(), "--auto-correct-only".into(), "--no-parallel".into()];
-    let bundled = cwd.ancestors().find_map(|d| std::fs::read_to_string(d.join("Gemfile.lock")).ok())
-        .is_some_and(|lock| lock.contains("\n    haml_lint ("));
-    let executable = if bundled {
+    let mut env = Vec::new();
+    let executable = if let Some(gemfile) = locked_gemfile(cwd, &within) {
         let Some(bundle) = semantics::provider::find_executable(Path::new("bundle"), std::env::var_os("PATH").as_deref()) else {
             return ToolResult::Failed("the project locks haml_lint but bundle is unavailable; no other formatter was run".into());
         };
         args.splice(0..0, ["exec".into(), ruby.display().to_string()]);
+        env.push(("BUNDLE_GEMFILE".to_owned(), gemfile.display().to_string()));
         bundle
     } else { ruby };
-    match semantics::runtime::run_accepting(&executable, &args, doc.text(), cwd, std::time::Duration::from_secs(20), &[0, 65]) {
+    match semantics::runtime::run_with_input_env(&executable, &args, doc.text(), cwd, std::time::Duration::from_secs(20), &[0, 65], &env) {
         Ok(text) => {
             // Autocorrection may normalize LF internally; each original line ending is preserved when
             // the line count stays equal. Otherwise use the document's first ending for new lines.
@@ -86,6 +95,13 @@ pub(super) fn format(doc: &Document, organize: bool) -> format_work::ToolResult 
         }
         Err(why) => ToolResult::Failed(format!("haml-lint: {why}")),
     }
+}
+
+/// The Gemfile of the nearest bundle at or above `cwd`, no higher than `within`, when its lock has haml_lint: the bundle
+/// haml-lint runs in, named to Bundler (`BUNDLE_GEMFILE`) so that it does not look for one above.
+fn locked_gemfile(cwd: &Path, within: &Path) -> Option<PathBuf> {
+    let dir = cwd.ancestors().take_while(|d| d.starts_with(within)).find(|d| d.join("Gemfile.lock").is_file())?;
+    std::fs::read_to_string(dir.join("Gemfile.lock")).ok().filter(|lock| lock.contains("\n    haml_lint (")).map(|_| dir.join("Gemfile"))
 }
 
 fn preserve_endings(old: &str, new: &str) -> String {
@@ -104,6 +120,49 @@ fn preserve_endings(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// haml-lint loads the project's bundle and RuboCop configuration: in a folder the user does not trust it never
+    /// runs (nothing is looked up on PATH either), and its configuration is never looked for above the opened folder.
+    #[test]
+    fn haml_lint_runs_only_in_a_trusted_folder_and_is_configured_within_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("app");
+        let file = root.join("views/a.html.haml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "%p a\n").unwrap();
+        std::fs::write(dir.path().join(".haml-lint.yml"), "linters: {}\n").unwrap();
+        let doc = Document::decode(file.clone(), 1, b"%p a\n");
+        let none = semantics::provider::Settings::default();
+        let unavailable = |r: format_work::ToolResult| matches!(r, format_work::ToolResult::Unavailable(why) if why.starts_with("no .haml-lint.yml"));
+        assert!(unavailable(format(&doc, false, Some(&root), &none)), "a configuration above the opened folder is not the project's");
+        assert!(unavailable(format(&doc, false, None, &none)), "nor, with no folder open, above the template's own folder");
+        std::fs::write(root.join(".haml-lint.yml"), "linters: {}\n").unwrap();
+        assert!(matches!(format(&doc, false, Some(&root), &none), format_work::ToolResult::Restricted(runs, _) if runs == format_work::HAML_RUNS));
+        let declined = semantics::provider::Settings { declined: [std::fs::canonicalize(&root).unwrap()].into(), ..Default::default() };
+        assert!(matches!(format(&doc, false, Some(&root), &declined), format_work::ToolResult::Restricted(..)));
+    }
+
+    /// A folder trusted inside an opened folder that is not: haml-lint's configuration and bundle come from the trusted
+    /// folder only, and Bundler is named that bundle's Gemfile (it would look above the template otherwise).
+    #[test]
+    fn haml_lint_in_a_trusted_folder_uses_nothing_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = std::fs::canonicalize(dir.path()).unwrap();
+        let svc = opened.join("svc");
+        let file = svc.join("views/a.html.haml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "%p a\n").unwrap();
+        std::fs::write(opened.join(".haml-lint.yml"), "linters: {}\n").unwrap();
+        let doc = Document::decode(file.clone(), 1, b"%p a\n");
+        let trusted = semantics::provider::Settings { trusted: [svc.clone()].into(), ..Default::default() };
+        let unconfigured = |r: format_work::ToolResult| matches!(r, format_work::ToolResult::Unavailable(why) if why.starts_with("no .haml-lint.yml"));
+        assert!(unconfigured(format(&doc, false, Some(&opened), &trusted)), "the opened folder's configuration is not the trusted folder's");
+        std::fs::write(opened.join("Gemfile.lock"), "GEM\n  specs:\n    haml_lint (0.1)\n").unwrap();
+        assert_eq!(locked_gemfile(file.parent().unwrap(), &svc), None, "a bundle above the trusted folder");
+        assert_eq!(locked_gemfile(file.parent().unwrap(), &opened), Some(opened.join("Gemfile")));
+        std::fs::write(svc.join("Gemfile.lock"), "GEM\n  specs:\n    rake (13)\n").unwrap();
+        assert_eq!(locked_gemfile(file.parent().unwrap(), &opened), None, "the nearest bundle does not lock haml_lint");
+    }
+
     #[test]
     fn mixed_line_endings_and_missing_final_newline_survive_haml_formatting() {
         assert_eq!(preserve_endings("%p a\r\n%p b\n%p c", "%p A\n%p B\n%p C\n"), "%p A\r\n%p B\n%p C");
@@ -118,16 +177,17 @@ mod tests {
         let config = dir.path().join(".haml-lint.yml");
         std::fs::write(&config, "linters:\n  FinalNewline:\n    enabled: false\n").unwrap();
         let doc = Document::decode(file.clone(), 1, text.as_bytes());
-        let format_work::ToolResult::Formatted { edit: Some(edit), .. } = format(&doc, false) else { panic!("haml-lint must format the fixture") };
+        let trusted = semantics::provider::Settings { trusted: [std::fs::canonicalize(dir.path()).unwrap()].into(), ..Default::default() };
+        let format_work::ToolResult::Formatted { edit: Some(edit), .. } = format(&doc, false, Some(dir.path()), &trusted) else { panic!("haml-lint must format the fixture") };
         assert!(edit.text.contains("1 + 2"));
         assert!(!edit.text.ends_with('\n'));
         assert!(!dir.path().join("sentinel").exists(), "template code never executes");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
         std::fs::write(&config, "exclude:\n  - '**/*.haml'\n").unwrap();
-        let excluded = format(&doc, false);
+        let excluded = format(&doc, false, Some(dir.path()), &trusted);
         println!("excluded result: {excluded:?}");
         assert!(!matches!(&excluded, format_work::ToolResult::Formatted { edit: Some(e), .. } if e.text.is_empty()), "an excluded file must not become an empty replacement");
         let bad = Document::decode(file, 2, b"%p{invalid\n");
-        assert!(matches!(format(&bad, false), format_work::ToolResult::Failed(_)));
+        assert!(matches!(format(&bad, false, Some(dir.path()), &trusted), format_work::ToolResult::Failed(_)));
     }
 }

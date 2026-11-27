@@ -56,6 +56,10 @@ mod close_work;
 mod external_work;
 #[path = "session/save_as.rs"]
 mod save_as_work;
+#[path = "session/archive_save.rs"]
+pub(crate) mod archive_save_work;
+#[path = "session/archive.rs"]
+mod archive_work;
 #[path = "session/scratch.rs"]
 mod scratch_work;
 #[path = "session/create.rs"]
@@ -72,6 +76,9 @@ pub use explorer_search::{ExplorerSearch, ExplorerSearchInput};
 mod explorer_history;
 #[path = "session/delete.rs"]
 mod delete_work;
+#[path = "session/trust.rs"]
+mod trust_work;
+pub use trust_work::{FocusMove, TrustChoice, TITLE as TRUST_TITLE};
 #[path = "session/recovery.rs"]
 mod recovery_work;
 #[path = "session/reconcile.rs"]
@@ -104,6 +111,9 @@ use lenz_content::{
 };
 
 mod project_search;
+#[path = "session/workspace_edit.rs"]
+mod workspace_edit;
+pub use workspace_edit::WorkspacePlan;
 #[path = "session/project_syntax.rs"]
 mod project_syntax;
 mod navigation_query;
@@ -139,6 +149,8 @@ pub const COMPLETIONS: usize = 64;
 pub const RECENT_ROOTS: usize = 10;
 /// How often idle language servers are checked and their memory sampled.
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a load runs before the status bar names it: switching files loads for milliseconds.
+pub const LOADING_QUIET: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long a symbol search waits for the slowest server it asked.
 pub const SYMBOLS_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -159,6 +171,15 @@ pub use crate::native::{NativeReveal, NativeViewport};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    PreviewProjectReplace(String),
+    RenameSymbol(String),
+    ApplyWorkspaceEdit,
+    CancelWorkspaceEdit,
+    ToggleWorkspaceFile(usize),
+    MoveWorkspaceFile(isize),
+    ToggleCurrentWorkspaceFile,
+    OpenArchiveEntry(crate::archive::Location),
+    ArchiveTreeParent { path: Arc<str> },
     Terminal(crate::terminal::Command),
     Csv(crate::csv::Command),
     /// A transient input-method display, validated against the captured authoritative source.
@@ -181,6 +202,9 @@ pub enum Command {
     MoveLines { down: bool },
     /// Copy the lines the selections touch directly below (or above) themselves.
     DuplicateLines { down: bool },
+    /// Delete every line the selections touch, endings included, as one transaction; each caret keeps its column on
+    /// the line that takes the deleted lines' place.
+    DeleteLines,
     SetReadOnly(bool),
     CompareSaved,
     CloseSavedComparison,
@@ -204,6 +228,9 @@ pub enum Command {
     NewDocument,
     /// Create a durable personal file in app-owned storage.
     NewScratch(String),
+    /// A new scratch file of [`crate::scratch::KINDS`]`[kind]`, named `scratch_N.<extension>` (the next free N), opened
+    /// with its SQL dialect when it has one.
+    NewScratchFile(usize),
     OpenScratch(PathBuf),
     /// Create `kind` named `name` in folder `dir` (project-relative, `""` the root) and open or select it.
     CreateEntry { kind: crate::create::Kind, dir: Arc<str>, name: String },
@@ -295,6 +322,19 @@ pub enum Command {
     /// Wrap long lines at the pane's width (remembered).
     SetSoftWrap(bool),
     SetRelativeLineNumbers(bool),
+    /// The caret line's commit, faint after the line's end (author, date and summary); remembered.
+    SetInlineBlame(bool),
+    /// The explorer follows the active file: whenever it changes, the explorer selects it; remembered.
+    SetAlwaysSelectOpenedFile(bool),
+    /// macOS-style word motion: Option+Left/Right move by word, and word stops cross the spaces between words; remembered.
+    SetMacWordMotion(bool),
+    /// Leaving a file (another tab, file or pane becomes active) saves its edits as Save does; remembered.
+    SetSaveOnLeave(bool),
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order; remembered.
+    SetNameLetterSearch(bool),
+    /// Search Everywhere ranks files near the open and recent ones higher (and a file named exactly as the query
+    /// first); remembered.
+    SetRankNearbyFiles(bool),
     SetVimEnabled(bool),
     VimKey(keymap::KeyPress),
     /// Show a project file or folder (project-relative) in the explorer, opening the folders above it.
@@ -393,6 +433,12 @@ pub enum Command {
     /// The popup with only the other worktrees, for Compare with Worktree….
     OpenWorktrees,
     CloseBranches,
+    /// The Git Branches popup's Show more row: list the rest of `section`.
+    ExpandBranches(&'static str),
+    /// Open or close one of the popup's branch folders (`feature` in Local branches).
+    ToggleBranchFolder(&'static str, String),
+    /// Star or unstar a branch (by full name) for this repository: it stays at the top of its section.
+    ToggleFavoriteBranch(String),
     /// Check out a branch, remote branch, tag or revision (local changes go along when git allows).
     Checkout(lenz_content::branches::Target),
     /// The checkout-problem dialog's answer.
@@ -515,6 +561,10 @@ pub enum Command {
     SetFileIcons(bool),
     /// Copy the active file's path (relative to the open folder), with `:line` of the caret when `line`.
     CopyPath { line: bool },
+    /// Copy the qualified name of the declaration at the caret (`Foo::Bar::Baz#foo_method`), else `path:line`.
+    CopyReference,
+    /// Open the active file's test, or the file the active test tests (see [`crate::relevant`]).
+    GoToTest,
     /// A message from the adapter (a launch it could not start), shown with the core's own.
     Notice(String),
     /// Mark the occurrences of the name at the caret (asked in the background; never cancels another request).
@@ -534,6 +584,17 @@ pub enum Command {
     RestartServer,
     /// Turn the active file's language server off (or on) for the browsing root, remembered.
     SetServerEnabled(bool),
+    /// Trust the browsing root's project tools (or stop trusting them: keep it restricted), remembered: servers that
+    /// run the project's code and the project's own programs (typescript-go's node_modules/.bin/tsc, a configured
+    /// Python environment's interpreter) may run.
+    SetProjectToolsTrusted(bool),
+    /// Open the folder-trust dialog for the open folder.
+    OpenFolderTrust,
+    /// The folder-trust dialog's answer.
+    TrustChoice(TrustChoice),
+    /// Move the folder-trust dialog's focus; Enter takes the focused choice, Stay Restricted unless Tab moved the focus
+    /// just before (any other input to the dialog moves it back).
+    TrustFocus(FocusMove),
     OpenServerInstall,
     StartServerInstall,
     CancelServerInstall,
@@ -541,6 +602,10 @@ pub enum Command {
     OpenServerRuntime,
     CloseServerRuntime,
     SetServerRuntime(Option<PathBuf>),
+    /// Activate these Maven profiles (typed as a list; empty: the project's defaults) for JDT LS's import, then restart it.
+    SetMavenProfiles(String),
+    /// Activate the Maven profile that adds the active file's folder (see `Session::maven_suggestion`).
+    IncludeInBuild,
     ExcludeRubyTooling,
     SetRubyToolingExclusions(bool),
     ResetProjectServerSettings,
@@ -626,6 +691,7 @@ pub enum Motion {
 /// The user-facing commands, as menus list them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
+    ProjectReplace, RenameSymbol, ApplyWorkspaceEdit, CancelWorkspaceEdit,
     ShowTerminal, NewTerminal, FocusTerminal, FocusEditor, SendSelectionToTerminal, PasteTerminalPath, CloseTerminal, StopTerminal, RenameTerminal, RestartTerminal, NextTerminal, PreviousTerminal, CopyTerminalSelection, FindTerminal,
     CsvTable, CsvHeader, CsvFilter, CsvSort, CsvClearFilter, CsvMoveLeft, CsvMoveRight, CsvDropColumn, CsvEditCell,
     Open,
@@ -654,6 +720,14 @@ pub enum CommandId {
     SoftWrap,
     RelativeLineNumbers,
     VimMode,
+    /// Option+Left/Right move by word (macOS), word stops crossing spaces; remembered, off by default.
+    MacWordMotion,
+    /// Save a file's edits, as Save does, when another tab, file or pane becomes active; remembered, off by default.
+    SaveOnLeave,
+    /// Search Everywhere's All tab finds files by letters in order in their name; remembered, off by default.
+    NameLetterSearch,
+    /// Search Everywhere and Find File rank files near the open and recent ones higher; remembered, off by default.
+    RankNearbyFiles,
     /// Pin the enclosing declarations at the top of each pane; remembered.
     StickyScroll,
     /// The path and declarations bar above each pane's text; remembered.
@@ -773,6 +847,8 @@ pub enum CommandId {
     DuplicateLinesUp,
     /// Copy the lines the selections touch directly below themselves.
     DuplicateLinesDown,
+    /// Delete the lines the selections touch (IntelliJ's Delete Line).
+    DeleteLine,
     ChooseTheme,
     /// The application's name, version, platform, licence and project page (the adapter shows it).
     About,
@@ -832,6 +908,10 @@ pub enum CommandId {
     /// The active file's path (relative to the open folder), and with the caret's line.
     CopyPath,
     CopyPathLine,
+    /// The qualified name of the declaration at the caret (IntelliJ's Copy Reference), else the path and line.
+    CopyReference,
+    /// Switch between the active file and its test (RubyMine's Navigate › Test).
+    GoToTest,
     /// The active file in the user's editor at the caret, or with the system's default app.
     OpenInEditor,
     OpenWithDefaultApp,
@@ -851,6 +931,8 @@ pub enum CommandId {
     StartServerInstall,
     CancelServerInstall,
     ServerRuntime,
+    MavenProfiles,
+    IncludeInBuild,
     RestartServer,
     ExcludeRubyTooling,
     ResetProjectServerSettings,
@@ -858,6 +940,10 @@ pub enum CommandId {
     RebuildIndex,
     DisableServer,
     EnableServer,
+    TrustProjectTools,
+    UntrustProjectTools,
+    /// Open the folder-trust dialog (also the status bar's Restricted item).
+    FolderTrust,
     ImageSource,
     MarkdownSource,
     /// The Markdown preview in the other pane, beside the source it follows.
@@ -872,6 +958,8 @@ pub enum CommandId {
     /// The tree's order: each folder's folders before its files, or everything by name.
     FoldersFirst,
     AllByName,
+    /// The explorer selects the active file whenever it changes (IntelliJ's Always Select Opened File); remembered.
+    AlwaysSelectOpenedFile,
     GitBranches,
     NewBranch,
     CheckoutRevision,
@@ -885,6 +973,8 @@ pub enum CommandId {
     CompareWithWorktree,
     ResolveConflicts,
     AnnotateBlame,
+    /// The caret line's last commit shown faintly after its end; remembered.
+    InlineBlame,
     CloseAnnotations,
     NarrowAnnotations,
     WidenAnnotations,
@@ -967,13 +1057,13 @@ impl Layout {
 }
 
 impl CommandId {
-    pub const ALL: [CommandId; 257] = [
+    pub const ALL: [CommandId; 275] = [
         Self::ShowTerminal, Self::NewTerminal, Self::FocusTerminal, Self::FocusEditor, Self::SendSelectionToTerminal, Self::PasteTerminalPath, Self::CloseTerminal, Self::StopTerminal, Self::RenameTerminal, Self::RestartTerminal, Self::NextTerminal, Self::PreviousTerminal, Self::CopyTerminalSelection, Self::FindTerminal,
         Self::Open,
         Self::OpenFolder,
         Self::OpenRecent,
         Self::FindFile,
-        Self::SearchProject,
+        Self::SearchProject, Self::ProjectReplace, Self::RenameSymbol, Self::ApplyWorkspaceEdit, Self::CancelWorkspaceEdit,
         Self::FindInFile,
         Self::NextMatch,
         Self::PreviousMatch,
@@ -988,6 +1078,10 @@ impl CommandId {
         Self::SoftWrap,
         Self::RelativeLineNumbers,
         Self::VimMode,
+        Self::MacWordMotion,
+        Self::SaveOnLeave,
+        Self::NameLetterSearch,
+        Self::RankNearbyFiles,
         Self::StickyScroll,
         Self::Breadcrumbs,
         Self::FocusBreadcrumbs,
@@ -1061,6 +1155,8 @@ impl CommandId {
         Self::ResolveExternalChange,
         Self::CopyPath,
         Self::CopyPathLine,
+        Self::CopyReference,
+        Self::GoToTest,
         Self::OpenInEditor,
         Self::OpenWithDefaultApp,
         Self::CompareWith,
@@ -1085,6 +1181,7 @@ impl CommandId {
         Self::MoveLinesDown,
         Self::DuplicateLinesUp,
         Self::DuplicateLinesDown,
+        Self::DeleteLine,
         Self::ChooseTheme,
         Self::About,
         Self::NewWindow,
@@ -1131,6 +1228,8 @@ impl CommandId {
         Self::StartServerInstall,
         Self::CancelServerInstall,
         Self::ServerRuntime,
+        Self::MavenProfiles,
+        Self::IncludeInBuild,
         Self::RestartServer,
         Self::ExcludeRubyTooling,
         Self::ResetProjectServerSettings,
@@ -1138,6 +1237,9 @@ impl CommandId {
         Self::RebuildIndex,
         Self::DisableServer,
         Self::EnableServer,
+        Self::TrustProjectTools,
+        Self::UntrustProjectTools,
+        Self::FolderTrust,
         Self::CsvTable, Self::CsvHeader, Self::CsvFilter, Self::CsvSort, Self::CsvClearFilter, Self::CsvMoveLeft, Self::CsvMoveRight, Self::CsvDropColumn, Self::CsvEditCell,
         Self::ImageSource,
         Self::MarkdownSource,
@@ -1148,6 +1250,7 @@ impl CommandId {
         Self::LocateFile,
         Self::FoldersFirst,
         Self::AllByName,
+        Self::AlwaysSelectOpenedFile,
         Self::GitBranches,
         Self::NewBranch,
         Self::CheckoutRevision,
@@ -1158,6 +1261,7 @@ impl CommandId {
         Self::CompareWithWorktree,
         Self::ResolveConflicts,
         Self::AnnotateBlame,
+        Self::InlineBlame,
         Self::CloseAnnotations,
         Self::NarrowAnnotations,
         Self::WidenAnnotations,
@@ -1246,6 +1350,10 @@ impl CommandId {
             Self::OpenRecent => "Open Recent Folder…",
             Self::FindFile => "Find File…",
             Self::SearchProject => "Search in Project…",
+            Self::ProjectReplace => "Replace in Project…",
+            Self::RenameSymbol => "Rename Symbol…",
+            Self::ApplyWorkspaceEdit => "Apply Previewed Edits",
+            Self::CancelWorkspaceEdit => "Cancel Edit Preview",
             Self::FindInFile => "Find in File…",
             Self::NextMatch => "Next Match",
             Self::PreviousMatch => "Previous Match",
@@ -1349,6 +1457,7 @@ impl CommandId {
             Self::MoveLinesDown => "Move Lines Down",
             Self::DuplicateLinesUp => "Duplicate Lines Up",
             Self::DuplicateLinesDown => "Duplicate Lines Down",
+            Self::DeleteLine => "Delete Line",
             Self::ChooseTheme => "Change theme",
             Self::About => crate::chrome::ABOUT_TITLE,
             Self::NewWindow => "New Window",
@@ -1404,6 +1513,11 @@ impl CommandId {
             Self::CompareWithWorktree => "Compare with Worktree…",
             Self::ResolveConflicts => "Resolve Conflicts in Lenz Diff",
             Self::AnnotateBlame => "Annotate with Git Blame",
+            Self::InlineBlame => "Inline Blame",
+            Self::MacWordMotion => "macOS Word Motion",
+            Self::SaveOnLeave => "Save When Leaving a File",
+            Self::NameLetterSearch => "Search Everywhere: Letters in File Names",
+            Self::RankNearbyFiles => "Search Everywhere: Rank by Open and Recent Files",
             Self::CloseAnnotations => "Close Annotations",
             Self::NarrowAnnotations => "Narrow Annotation Gutter",
             Self::WidenAnnotations => "Widen Annotation Gutter",
@@ -1416,6 +1530,8 @@ impl CommandId {
             Self::SemanticHighlighting => "Semantic Highlighting",
             Self::CopyPath => "Copy Path",
             Self::CopyPathLine => "Copy Path:Line",
+            Self::CopyReference => "Copy Reference",
+            Self::GoToTest => "Go to Test or Subject",
             Self::OpenInEditor => "Open in Editor",
             Self::OpenWithDefaultApp => "Open with Default App",
             Self::CompareWith => "Compare Saved Disk Inputs…",
@@ -1433,6 +1549,8 @@ impl CommandId {
             Self::StartServerInstall => "Start Installation",
             Self::CancelServerInstall => "Cancel Installation",
             Self::ServerRuntime => "Choose Language Server Runtime…",
+            Self::MavenProfiles => "Maven Profiles…",
+            Self::IncludeInBuild => "Activate the Maven Profile That Adds This File",
             Self::RestartServer => "Restart Language Server",
             Self::ExcludeRubyTooling => "Exclude Ruby Tooling Gems for This Project",
             Self::ResetProjectServerSettings => "Reset LSP Settings for This Project",
@@ -1440,6 +1558,9 @@ impl CommandId {
             Self::RebuildIndex => "Rebuild Project Index",
             Self::DisableServer => "Disable Language Server for This Folder",
             Self::EnableServer => "Enable Language Server for This Folder",
+            Self::TrustProjectTools => "Trust Project Tools in This Folder",
+            Self::UntrustProjectTools => "Stop Trusting Project Tools in This Folder",
+            Self::FolderTrust => "Folder Trust…",
             Self::ImageSource => "Image Source / Rendered",
             Self::MarkdownSource => "Markdown Source / Preview",
             Self::PreviewBeside => "Open Markdown Preview to the Side",
@@ -1448,6 +1569,7 @@ impl CommandId {
             Self::ToggleExplorer => "Show / Hide Explorer",
             Self::LocateFile => "Select Opened File in Explorer",
             Self::FoldersFirst => "Explorer: Folders First",
+            Self::AlwaysSelectOpenedFile => "Explorer: Always Select Opened File",
             Self::AllByName => "Explorer: All by Name",
             Self::SplitRight => "Split Right",
             Self::SplitDown => "Split Down",
@@ -1541,6 +1663,12 @@ pub struct Action {
 
 /// Results of background work, applied through [`Session::dispatch`].
 pub enum Completion {
+    WorkspacePrepared { request: u64, apply: bool, result: Result<WorkspacePlan, String> },
+    ArchiveListed(crate::archive_tree::Listed),
+    ArchiveLoaded(Box<archive_save_work::Loaded>),
+    ArchiveSaved(Box<archive_save_work::Saved>),
+    ArchiveRechecked(Box<archive_save_work::Rechecked>),
+    ArchiveRecovered { ticket: u64, result: Result<Document, String> },
     /// The recent projects' git branches, read off the UI thread.
     RecentBranches(Vec<(PathBuf, Option<String>)>),
     TerminalStarted { id: crate::terminal::Id, generation: u64, result: Result<crate::terminal::Process, String> },
@@ -1572,6 +1700,10 @@ pub enum Completion {
     ServerRuntimeSaved { request: u64, kind: semantics::runtime::Kind, result: Result<Option<PathBuf>, String> },
     ProviderSettingsSaved { ok: bool },
     ProjectProviderSaved { provider: usize, root: PathBuf, reset: bool, result: Result<(), String> },
+    /// Maven profiles saved for JDT LS's import of `root` (or why not).
+    MavenProfilesSaved { root: PathBuf, profiles: Vec<String>, result: Result<(), String> },
+    /// The class `this` names, from a parse made for Go to Definition (the tab held none): `class` is its name's bytes.
+    ThisClass { request: u64, tab: TabId, version: u64, class: Option<std::ops::Range<usize>> },
     /// The project's saved places read from `from` (or why not), for saving to `file` (a different file when `from`
     /// is its name before names were canonical).
     PlacesRead { generation: u64, file: PathBuf, from: PathBuf, result: Result<crate::places::Places, crate::places::ReadError> },
@@ -1606,7 +1738,7 @@ pub enum Completion {
     /// Filesystem changes, coalesced.
     Changed(Change),
     /// A tab's source was checked against the disk.
-    Refreshed { tab: TabId, token: u64, result: Refresh },
+    Refreshed { tab: TabId, token: u64, baseline: RefreshBaseline, result: Refresh },
     /// Results for search `id`.
     Found { id: u64, found: search::Found },
     ProjectSyntax(project_syntax::Reply),
@@ -1659,6 +1791,8 @@ pub enum Completion {
     GitStatus { request: u64, root: PathBuf, anchor: (PathBuf, PathBuf), result: Result<lenz_content::branches::Statuses, String> },
     /// The Git Branches popup's lists for the repository at `root`.
     Branches { request: u64, root: PathBuf, result: Result<(lenz_content::branches::Refs, Vec<lenz_content::branches::Worktree>), String> },
+    /// How far the local branches are from their upstreams, read after [`Completion::Branches`] for `request`.
+    BranchTracking { request: u64, root: PathBuf, result: Result<std::collections::BTreeMap<String, lenz_content::branches::Track>, String> },
     /// The details of the commit popup's commit, for request `request`.
     CommitLoaded { request: u64, result: Result<lenz_content::blame::CommitDetails, String> },
     /// The file on disk read for external-change dialog `ticket` (or why it cannot be read).
@@ -1686,6 +1820,10 @@ pub enum Refresh {
     Unstable,
 }
 
+/// Opaque identity of the confirmed content a disk check compared against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshBaseline(Option<SemanticSource>);
+
 pub enum Input {
     Command(Command),
     Completion(Completion),
@@ -1697,6 +1835,11 @@ impl Input {
         match self {
             Input::Command(_) => "command",
             Input::Completion(c) => match c {
+                Completion::ArchiveListed(..) => "archive-listed",
+                Completion::ArchiveLoaded(..) => "archive-loaded",
+                Completion::ArchiveSaved(..) => "archive-saved",
+                Completion::ArchiveRechecked(..) => "archive-rechecked",
+                Completion::ArchiveRecovered { .. } => "archive-recovered",
                 Completion::TerminalStarted { .. } | Completion::TerminalWake { .. } => "terminal",
                 Completion::RecentBranches(_) => "recent branches",
                 Completion::ExplorerCopied { .. } => "explorer copy",
@@ -1713,6 +1856,7 @@ impl Input {
                 Completion::PlacesMerged { .. } => "places merged",
                 Completion::PlacesChecked { .. } => "places checked",
                 Completion::Checked { .. } => "checked",
+                Completion::WorkspacePrepared { .. } => "workspace edits",
                 Completion::Loaded { .. } => "loaded",
                 Completion::Highlighted { .. } => "highlighted",
                 Completion::Decorated { .. } => "decorated",
@@ -1744,6 +1888,8 @@ impl Input {
                 Completion::ProjectFormatted { .. } => "project formatted",
                 Completion::Sql(_) | Completion::SqlMetadata { .. } => "SQL assistance",
                 Completion::ServerRuntimeSaved { .. } => "Server runtime saved",
+                Completion::MavenProfilesSaved { .. } => "Maven profiles saved",
+                Completion::ThisClass { .. } => "this class",
                 Completion::ProviderSettingsSaved { .. } => "provider settings saved",
                 Completion::ProjectProviderSaved { .. } => "project provider settings saved",
                 Completion::Watch { .. } => "watch",
@@ -1758,12 +1904,30 @@ impl Input {
                 Completion::CheckedOut { .. } => "checked out",
                 Completion::Head { .. } => "head",
                 Completion::Branches { .. } => "branches",
+                Completion::BranchTracking { .. } => "branch-tracking",
                 Completion::ReconcileRead { .. } | Completion::ReconcileChecked { .. } => "reconcile",
                 Completion::DocumentationReady { .. } => "documentation",
                 Completion::CompletionDocumentationReady { .. } => "completion documentation",
             },
         }
     }
+}
+
+/// The name of the innermost class, enum, record or interface around byte `at`. shortcut: an anonymous class's `this`
+/// lands on the named class around it; upgrade when declarations record anonymous classes.
+fn this_class(declarations: &lenz_content::highlight::Declarations, at: u32) -> Option<std::ops::Range<usize>> {
+    let class = declarations.enclosing(at).into_iter().rev().find(|d| matches!(d.kind, lenz_content::highlight::DeclKind::Type | lenz_content::highlight::DeclKind::Interface))?;
+    Some(class.name_range.start as usize..class.name_range.end as usize)
+}
+
+/// A Maven project JDT LS imports, for Maven Profiles…: its root, the profiles its pom.xml declares, those Lenz
+/// activates, and Lenz's settings file for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MavenProject {
+    pub root: PathBuf,
+    pub available: Vec<String>,
+    pub active: Vec<String>,
+    pub xml: PathBuf,
 }
 
 impl From<Command> for Input {
@@ -1808,14 +1972,20 @@ pub struct State {
     focused: u8,
     history: History,
     loading: Option<PathBuf>,
+    /// When the current load began: the status bar names a load only once it is slow.
+    loading_since: Option<std::time::Instant>,
     /// Messages about failed actions and settings, newest last.
     messages: activity::Messages,
     palette: Arc<Palette>,
     project: Option<Project>,
     libraries: crate::libraries::Libraries,
+    pub(crate) archive_tree: crate::archive_tree::Tree,
     tree_revision: u64,
     /// The explorer row the session asked the adapters to show and select, with its ticket.
     tree_reveal: Option<(Arc<str>, u64)>,
+    /// Always Select Opened File: the active file's row for the adapters to select (and scroll to, not show the
+    /// explorer for), once per ticket.
+    tree_follow: Option<(Arc<str>, u64)>,
     explorer: crate::workspace::Explorer,
     explorer_search: ExplorerSearch,
     workspace_revision: u64,
@@ -1872,11 +2042,15 @@ pub struct State {
     pub(crate) marker_sets: std::collections::HashMap<crate::text::BufferId, crate::markers::Markers>,
     /// The Git Branches popup's lists, while it is open.
     pub(crate) branches: Option<crate::branches::BranchesView>,
+    /// The popup's branch folders opened this run, by section and name (`feature`); kept while it is closed.
+    pub(crate) branch_folders: Vec<(&'static str, String)>,
     /// Explorer entries marked for Compare Selected (Ctrl+click), oldest first; at most two.
     pub(crate) tree_marks: Vec<Arc<str>>,
     /// The running checkout's request, the refused one's dialog, and the files a Smart Checkout left in conflict.
     pub(crate) checkout_running: Option<u64>,
     pub(crate) checkout_problem: Option<crate::branches::CheckoutProblem>,
+    /// The folder-trust dialog, while it is open.
+    pub(crate) trust_prompt: Option<trust_work::TrustPrompt>,
     pub(crate) stash_conflicts: Option<Vec<String>>,
     /// Files whose recovered drafts wait for Restore or Discard: their disk version is not edited meanwhile.
     pub(crate) undecided_recovery: Vec<PathBuf>,
@@ -1945,6 +2119,42 @@ struct Asking {
     retrieving: Option<semantics::VirtualTarget>,
     /// A call hierarchy's root, while its place is read.
     root: Option<Call>,
+}
+
+/// A Ruby definition's by-name search: declarations Ruby LSP's index misses (methods made by ActiveSupport's
+/// `cattr_accessor`, `class_attribute`, `delegate` and the like, in the project and its gems), added as candidates
+/// when the server found nothing (plain `def`s too) or only declarations outside the project (macros only), as
+/// RubyMine lists them. Run off the UI thread with the server's own targets. The project's files are read each time
+/// (they change); the gems' macro declarations are indexed once per server session.
+struct ByName { name: String, gems: Arc<Vec<PathBuf>>, index: crate::ruby_declarations::SharedIndex, files: Vec<PathBuf>, root: Option<PathBuf> }
+
+impl ByName {
+    fn add(&self, targets: &mut semantics::Targets, limit: usize, read: semantics::ReadFile, wanted: &dyn Fn() -> bool) {
+        let in_project = |p: &Path| self.root.as_ref().is_some_and(|r| p.starts_with(r));
+        if !targets.unavailable.is_empty() || targets.found.len() >= limit || targets.found.iter().any(|t| in_project(&t.path)) { return; }
+        let defs = targets.found.is_empty();
+        let mut paths = crate::ruby_declarations::search(&self.name, &self.files, defs, limit - targets.found.len(), wanted);
+        let gems = self.index.get_or_init(|| crate::ruby_declarations::GemIndex::build(&self.gems)).files_declaring(&self.name);
+        let first_gem = paths.len();
+        paths.extend(gems);
+        for (i, path) in paths.into_iter().enumerate() {
+            if !wanted() { return; }
+            // Only macros in gems: their plain `def`s are in the server's index.
+            let defs = defs && i < first_gem;
+            let Ok((stamp, doc)) = read(&path) else { continue };
+            let mut offset = 0;
+            for line in doc.text().split_inclusive('\n') {
+                if let Some(range) = crate::ruby_declarations::declares(line.trim_end_matches(['\n', '\r']), &self.name, defs) {
+                    let (start, end) = (offset + range.start, offset + range.end);
+                    let known = targets.found.iter().any(|t| t.path == path && t.doc.line_of(t.at) == doc.line_of(start));
+                    if !known && targets.found.len() < limit {
+                        targets.found.push(semantics::Target { path: path.clone(), stamp: Some(stamp), doc: doc.clone(), hit: semantics::hit_at(&path, &doc, start, end), at: start, decoded_digest: None });
+                    }
+                }
+                offset += line.len();
+            }
+        }
+    }
 }
 
 /// What the user asked a language server.
@@ -2050,6 +2260,7 @@ impl Sources {
         entry.saved = entry.snapshot.as_ref().map(|snapshot| SemanticSource::new(snapshot));
         entry.stamp = stamp;
         entry.save.read = doc.write_baseline.as_deref().cloned();
+        entry.save.archive = doc.archive_baseline.clone();
         entry.save.status = crate::save::Status::Ready;
         id
     }
@@ -2073,9 +2284,17 @@ impl<'a> View<'a> {
     pub fn dirty(&self) -> bool { self.draft.is_some_and(crate::draft::Draft::dirty) }
     pub fn can_undo(&self) -> bool { self.tab.read_only_side().is_none() && self.draft.is_some_and(crate::draft::Draft::can_undo) }
     pub fn can_redo(&self) -> bool { self.tab.read_only_side().is_none() && self.draft.is_some_and(crate::draft::Draft::can_redo) }
+    pub(super) fn intrinsic_export_disabled(&self) -> Option<&'static str> {
+        if let Some(side) = self.tab.read_only_side() { side.read_only() }
+        else if self.snapshot.image().is_some() { Some("Images are read-only") }
+        else if self.tab.retrieved.is_some() { Some("Retrieved sources are read-only") }
+        else if self.snapshot.source_meta().is_binary() { Some("Binary files are read-only") }
+        else if self.snapshot.source_meta().is_lossy() { Some("Lossy text is read-only") }
+        else { None }
+    }
     /// Existing confirmed ending preference; typing never normalizes the remaining source.
     pub fn input_newline(&self) -> &'static str {
-        if self.save.read.as_ref().is_some_and(|read| read.snapshot.crlf) { "\r\n" } else { "\n" }
+        if self.save.read.as_ref().is_some_and(|read| read.snapshot.crlf) || self.save.archive.as_ref().is_some_and(|read| read.crlf) { "\r\n" } else { "\n" }
     }
     pub fn read_only(&self) -> bool { self.read_only }
     pub fn edit_disabled(&self) -> Option<&'static str> {
@@ -2085,6 +2304,7 @@ impl<'a> View<'a> {
         if let Some(side) = self.tab.read_only_side() { side.read_only() }
         else if self.snapshot.image().is_some() { Some("Images are read-only") }
         else if self.tab.retrieved.is_some() { Some("Retrieved sources are read-only") }
+        else if self.snapshot.source_meta().archive_read_only_reason().is_some() && !self.tab.recovered { Some("This archive entry cannot be rewritten without losing information") }
         else if self.snapshot.source_meta().is_binary() { Some("Binary files are read-only") }
         else if self.snapshot.source_meta().is_lossy() { Some("Lossy text is read-only") }
         else { None }
@@ -2321,8 +2541,16 @@ impl State {
     }
     /// Whether an explorer row's file has unsaved changes in a tab.
     pub fn row_dirty(&self, row: &project::TreeRow) -> bool {
+        if self.archive_tree.is_virtual(&row.path) {
+            return self.tabs.iter().filter(|tab| tab.read_only_side().is_none() && self.tab_dirty(tab.id)).any(|tab|
+                std::iter::once(tab.source.as_path()).chain(tab.canonical.as_deref()).any(|path|
+                    crate::archive::Location::from_uri(path).is_some_and(|location| crate::archive_tree::row_contains_source(row, &location))));
+        }
         let Some(path) = self.project.as_ref().filter(|_| row.dir.is_none()).map(|p| p.root().join(&*row.path)) else { return false };
-        self.tabs.iter().any(|t| (t.source == path || t.canonical.as_deref() == Some(&path)) && t.read_only_side().is_none() && self.tab_dirty(t.id))
+        self.tabs.iter().filter(|tab| tab.read_only_side().is_none() && self.tab_dirty(tab.id)).any(|tab|
+            tab.source == path || tab.canonical.as_deref() == Some(&path)
+                || std::iter::once(tab.source.as_path()).chain(tab.canonical.as_deref()).any(|source|
+                    crate::archive::Location::from_uri(source).is_some_and(|location| location.container == path)))
     }
     /// Unsaved content is independent of repository status and remains visible for inactive tabs.
     pub fn tab_dirty(&self, id: TabId) -> bool {
@@ -2332,11 +2560,16 @@ impl State {
     pub fn view(&self, id: TabId) -> Option<View<'_>> {
         let tab = self.tabs.iter().find(|tab| tab.id == id)?;
         let buffer = tab.buffer?;
-        let snapshot = self.sources.buffers.get(&buffer)?.snapshot.as_ref()?;
+        let entry = self.sources.buffers.get(&buffer)?;
+        let snapshot = entry.snapshot.as_ref()?;
         if !tab.loaded { return None; }
+        Some(self.view_of_snapshot(tab, entry, snapshot))
+    }
+    /// The same editing guards for an inactive retained buffer or a validated reload candidate.
+    fn view_of_snapshot<'a>(&'a self, tab: &'a Tab, entry: &'a CurrentSource, snapshot: &'a Arc<crate::text::TextSnapshot>) -> View<'a> {
         let undecided = !self.undecided_recovery.is_empty() && tab.is_file()
             && self.undecided_recovery.iter().any(|path| *path == tab.source || tab.canonical.as_deref() == Some(path.as_path()));
-        Some(View { snapshot, tab, read_only: self.sources.buffers.get(&buffer)?.read_only, draft: self.sources.buffers.get(&buffer)?.draft.as_ref(), save: &self.sources.buffers.get(&buffer)?.save, undecided })
+        View { snapshot, tab, read_only: entry.read_only, draft: entry.draft.as_ref(), save: &entry.save, undecided }
     }
 
     fn admit_current(&mut self, id: TabId, doc: &Arc<Document>, stamp: Option<Stamp>) -> Vec<TabId> {
@@ -2390,7 +2623,7 @@ impl State {
     /// List `list`'s places matching `query` (fuzzy on the path, or a plain match in the line's text), in the list's
     /// order. Recent files lead with the file left last, the open one second.
     pub fn place_rows(&self, list: PlaceList, query: &str) -> Vec<PlaceRow> {
-        let rel = |p: &Path| self.project.as_ref().and_then(|pr| pr.relative(p)).map_or_else(|| p.display().to_string(), |r| r.to_string());
+        let rel = |p: &Path| crate::archive::Location::from_uri(p).map_or_else(|| self.project.as_ref().and_then(|pr| pr.relative(p)).map_or_else(|| p.display().to_string(), |r| r.to_string()), |location| location.display_path());
         let mark = |m: &crate::places::Mark, place: Place| {
             let key = m.mnemonic.map_or_else(|| "·".to_string(), String::from);
             let label = match list {
@@ -2433,7 +2666,7 @@ impl State {
     /// folder; empty once a file or folder is open
     /// (or opening); split panes show it in the first. Adapters resolve a chosen row by its index here at use time.
     pub fn start_items(&self) -> Vec<StartItem> {
-        if self.project.is_some() || !self.tabs.is_empty() || self.loading.is_some() {
+        if self.has_tree() || !self.tabs.is_empty() || self.loading.is_some() {
             return Vec::new();
         }
         [CommandId::OpenFolder, CommandId::OpenFolderInProjectTab, CommandId::Open, CommandId::NewDocument].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
@@ -2449,16 +2682,21 @@ impl State {
     }
     /// Cached project and library rows, with stable identities shared by both explorers.
     pub fn tree_rows(&self) -> impl DoubleEndedIterator<Item = &project::TreeRow> + Clone {
-        self.project.as_ref().map_or(&[][..], |p| p.rows()).iter().chain(self.libraries.rows())
+        self.project.as_ref().map_or(&[][..], |p| p.rows()).iter().chain(self.libraries.rows()).chain(self.archive_tree.rows().iter())
     }
-    pub fn has_tree(&self) -> bool { self.project.is_some() || !self.libraries.rows().is_empty() }
+    pub fn has_tree(&self) -> bool { self.project.is_some() || !self.libraries.rows().is_empty() || !self.archive_tree.rows().is_empty() }
+    pub fn archive_tree(&self) -> &crate::archive_tree::Tree { &self.archive_tree }
     /// Changes when navigation asks the adapters to reveal the active library file.
     pub fn tree_revision(&self) -> u64 { self.tree_revision }
     /// The explorer row the session asked the adapters to show and select, and its ticket:
     /// adapters apply it when the ticket changes, after any revision reset.
     pub fn tree_reveal(&self) -> Option<(Arc<str>, u64)> { self.tree_reveal.clone() }
+    /// Always Select Opened File's row to select (the active file's), and its ticket: a newer ticket asks again. The
+    /// explorer stays hidden if it is.
+    pub fn tree_follow(&self) -> Option<(Arc<str>, u64)> { self.tree_follow.clone() }
     pub fn active_in_tree(&self) -> Option<Arc<str>> {
         let t = self.active()?;
+        if self.archive_tree.contains_source(&t.source) { return Some(t.source.to_string_lossy().as_ref().into()); }
         if self.libraries.contains(&t.source) { return Some(t.source.to_string_lossy().as_ref().into()); }
         let p = self.project.as_ref()?;
         p.relative(&t.source).filter(|rel| p.has_file(rel))
@@ -2515,6 +2753,11 @@ impl State {
     pub fn loading(&self) -> Option<&Path> {
         self.loading.as_deref()
     }
+    /// The file loading for at least [`LOADING_QUIET`] (`None`: none, or not yet).
+    pub fn slow_loading(&self) -> Option<&Path> {
+        let since = self.loading_since?;
+        self.loading.as_deref().filter(|_| self.semantics.now().duration_since(since) >= LOADING_QUIET)
+    }
     /// The active tab's selected source text (`None` for a caret or no selection).
     pub fn selected_text(&self) -> Option<String> {
         self.view(self.active?)?.copy_selection()
@@ -2554,16 +2797,15 @@ impl State {
             false => format!("Read-only source retrieved from {}; its server session has ended ({})", v.provider, v.uri),
         });
         // Outside the browsing root, or a dependency inside it (node_modules, a project's virtualenv): its origin.
-        let origin = tab.filter(|t| t.is_file()).zip(self.project.as_ref()).and_then(|(t, p)| {
+        let origin = tab.filter(|t| t.is_file() && crate::archive::Location::from_uri(&t.source).is_none()).zip(self.project.as_ref()).and_then(|(t, p)| {
             let language = self.source(t.id).map_or(t.language.flatten(), |d| d.language());
             let origin = semantics::provider::origin(&t.source, language);
             let inside = t.source.starts_with(p.root());
-            (!inside || origin != semantics::provider::OUTSIDE).then(|| format!("Read-only source from {origin}"))
+            (!inside || origin != semantics::provider::OUTSIDE).then(|| format!("Source from {origin}"))
         });
         let read_only = tab.and_then(|t| self.view(t.id)).and_then(|view| view.edit_disabled().map(str::to_owned));
         let saving = tab.and_then(|t| self.view(t.id)).and_then(|v| v.save_status().message().map(str::to_owned));
         let preview = tab.and_then(|t| t.preview.as_ref()?.as_ref().err()).filter(|_| self.rendering().is_some()).map(|e| format!("Markdown preview unavailable: {e}; showing the source"));
-        let memory = semantics::memory_notice(self.semantics.memory());
         let comparison = self.comparison.as_ref().map(|c| match (c.kind(), c.failure(), c.pending()) {
             (ComparisonKind::Marked, Some(why), _) => format!("Change comparison failed: {why}"),
             (ComparisonKind::Marked, None, true) => format!("Comparing with {}…",c.baseline_label()),
@@ -2576,7 +2818,7 @@ impl State {
             (ComparisonKind::Conflict, None, false) => format!("External change comparison: {} changed blocks{}; disk and confirmed baseline are read-only", c.changes().len(), if c.line_endings_differ() { "; line endings differ" } else { "" }),
         });
         // The status line shows the last notice: a file changed under the draft outranks transient messages.
-        doc.into_iter().chain(comparison).chain(gone).chain(changing).chain(approximate).chain(retrieved).chain(origin).chain(preview).chain(memory).chain(self.messages.iter().cloned()).chain(read_only).chain(saving).chain(conflict).collect()
+        doc.into_iter().chain(comparison).chain(gone).chain(changing).chain(approximate).chain(retrieved).chain(origin).chain(preview).chain(self.messages.iter().cloned()).chain(read_only).chain(saving).chain(conflict).collect()
     }
     pub fn palette(&self) -> &Arc<Palette> {
         &self.palette
@@ -2584,10 +2826,26 @@ impl State {
     /// The semantic provider for the active document and what it is doing; `None` when its language has none.
     pub fn provider(&self) -> Option<ProviderView> {
         // Source a language server returned is not a document any server holds.
-        if !self.active()?.is_file() {
+        let tab = self.active()?;
+        if !tab.is_file() {
             return None;
         }
-        self.semantics.view_source(self.current_source()?.source_meta(), self.current_source()?.is_large())
+        match self.current_source() {
+            Some(d) => self.semantics.view_source(d.source_meta(), d.is_large()),
+            // Its text is still loading (a few milliseconds when switching files): from its path, so the status
+            // bar does not blink.
+            None if crate::archive::Location::from_uri(&tab.source).is_none() => self.semantics.view_at(&tab.source, Self::tab_language(tab), false),
+            None => None,
+        }
+    }
+    /// A tab's language as last loaded, else as its path suggests.
+    fn tab_language(tab: &Tab) -> Option<Language> {
+        tab.language.unwrap_or_else(|| highlight::detect(&tab.source, ""))
+    }
+    /// The branches starred in this repository's Git Branches popup, by full name.
+    pub fn favorite_branches(&self) -> std::collections::BTreeSet<String> {
+        let key = self.repo.as_ref().map(crate::branches::Repo::common_dir);
+        key.and_then(|k| self.settings.favorite_branches.get(&k).cloned()).unwrap_or_default()
     }
     /// The open project's own editing preferences (`None`: no folder is open).
     pub fn project_preferences(&self) -> Option<ProjectPreferences> {
@@ -2606,7 +2864,8 @@ impl State {
     }
     /// The active SQL file's dialect for a status bar (`None`: the file is not SQL). An unset dialect stays visible.
     pub fn sql_dialect_label(&self) -> Option<String> {
-        if self.current_source()?.language() != Some(Language::Sql) { return None; }
+        let language = match self.current_source() { Some(d) => d.language(), None => Self::tab_language(self.active()?) };
+        if language != Some(Language::Sql) { return None; }
         self.sql_dialect().map(|s| format!("SQL: {}", s.status()))
     }
     /// This file's own choice (`None`: it follows the project default).
@@ -2618,9 +2877,14 @@ impl State {
         let (provider, Some(Some(root))) = self.semantics.resolved_source(self.current_source()?.source_meta())? else { return None };
         Some((provider, root))
     }
+    /// The active file is outside its language server's build, which checks it for syntax only (JDT LS).
+    pub fn outside_build(&self) -> Option<&semantics::Outside> {
+        self.semantics.outside_build(self.current_source()?.source())
+    }
     /// Compact status shown before paths and other notices so setup failures remain visible.
     pub fn language_server_label(&self) -> String {
-        self.provider().map_or_else(|| if self.current_source().is_some() { "LSP unsupported" } else { "LSP no file" }.to_owned(), |v| v.status_label())
+        let open = self.current_source().is_some() || self.active().is_some_and(Tab::is_file);
+        self.provider().map_or_else(|| if open { "LSP unsupported" } else { "LSP no file" }.to_owned(), |v| v.status_label())
     }
     pub fn server_install(&self) -> Option<&semantics::installer::Install> { self.server_install.as_ref() }
     pub fn server_runtime(&self) -> Option<&semantics::runtime::Runtime> { self.server_runtime.as_ref() }
@@ -2683,7 +2947,13 @@ impl State {
             CommandId::DocumentationOnHover => Some(self.settings.documentation_on_hover),
             CommandId::AutoCompletion => Some(self.settings.auto_completion),
             CommandId::FileIcons => Some(self.settings.file_icons),
-            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.blame.is_some())),
+            CommandId::AnnotateBlame => Some(self.active().is_some_and(|t| t.annotating())),
+            CommandId::InlineBlame => Some(self.settings.inline_blame),
+            CommandId::AlwaysSelectOpenedFile => Some(self.settings.always_select_opened_file),
+            CommandId::MacWordMotion => Some(self.settings.mac_word_motion),
+            CommandId::SaveOnLeave => Some(self.settings.save_on_leave),
+            CommandId::NameLetterSearch => Some(self.settings.name_letter_search),
+            CommandId::RankNearbyFiles => Some(self.settings.rank_nearby_files),
             CommandId::IndentTabs | CommandId::IndentTwoSpaces | CommandId::IndentFourSpaces | CommandId::IndentInherit => {
                 let indent = self.project_preferences()?.indent;
                 Some(indent == match id { CommandId::IndentTabs => Some(Indent::Tabs), CommandId::IndentTwoSpaces => Some(Indent::Spaces(2)), CommandId::IndentFourSpaces => Some(Indent::Spaces(4)), _ => None })
@@ -2729,7 +2999,7 @@ impl State {
     /// What is inside crumb `crumb` of pane `pane`'s bar.
     pub fn siblings(&self, pane: u8, crumb: usize) -> Vec<Sibling> {
         let (Some(bar), Some(tab)) = (self.breadcrumbs_for(pane), self.shown(pane)) else { return Vec::new() };
-        crate::breadcrumbs::inside(&bar, crumb, tab, self.view(tab.id).as_ref(), self.project.as_ref())
+        crate::breadcrumbs::inside(&bar, crumb, tab, self.view(tab.id).as_ref(), self.project.as_ref(), &self.archive_tree)
     }
     /// Whether parses should find declarations (sticky scroll or breadcrumbs is on).
     fn wants_declarations(&self) -> bool {
@@ -2890,6 +3160,12 @@ struct LayoutIntent {
 }
 
 pub struct Session {
+    /// pom.xml profiles and Lenz's Maven settings, parsed once per file version (menus ask on every frame).
+    maven_files: semantics::maven::Cache<Vec<String>>,
+    /// Each pom.xml's profiles and the source folders they add, parsed once per file version.
+    maven_sources: semantics::maven::Cache<Vec<(String, Vec<String>)>>,
+    /// Each tab's file and caret position as the status bar last drew them, kept while its text reloads.
+    pub(crate) shown_position: std::cell::RefCell<std::collections::HashMap<TabId, (PathBuf, String)>>,
     terminals: terminal_work::Terminals,
     text_input_enabled: bool,
     vim_group_edit: bool,
@@ -2926,6 +3202,12 @@ pub struct Session {
     projections: crate::projection_jobs::Scheduler,
     layouts: crate::layout_jobs::Scheduler,
     layout_intents: [Option<LayoutIntent>; 2],
+    /// A navigation's landing (a definition, Back/Forward) whose caret line must end below the sticky headers: kept
+    /// until the tab's declarations, which make the headers, are known; any later user input gives it up.
+    band_goal: Option<TabId>,
+    /// Always Select Opened File: the active file it last revealed, and whether its row was selected (a library's
+    /// folders may still be read).
+    followed: Option<(Arc<str>, bool)>,
     native: crate::native::Reveals,
     jobs: Jobs,
     analysis: crate::analysis::Analysis,
@@ -2938,6 +3220,8 @@ pub struct Session {
     file_clipboard: explorer_work::ClipboardWork,
     navigation_query: Option<navigation_query::NavigationQuery>,
     save_seq: u64,
+    archive_saves: archive_save_work::Saves,
+    pub(crate) archive_browser: crate::archive_tree::Browser,
     /// Recoverable versions of unsaved work, offered at start and kept current off the UI thread.
     recovery: crate::recovery::Recovery,
     /// Names this session's New File identities, so another window's Untitled-1 is another document.
@@ -3010,6 +3294,10 @@ pub struct Session {
     /// The home trash deletions go to (none: only a mount's own trash), and what this session put there, last last.
     trash_home: Option<PathBuf>,
     trashed: Vec<crate::trash::Trashed>,
+    /// The open folder with its links resolved, which folder trust is decided on.
+    project_real: Option<PathBuf>,
+    /// The home folder, for which Trust Parent Folder is never offered.
+    home: Option<PathBuf>,
     watcher: Watcher,
     /// The project's folders to watch, for its root, walk and size (built once per inventory), and the tabs' folders
     /// outside them that were last added.
@@ -3036,11 +3324,14 @@ pub struct Session {
     find_options: lenz_content::find::FindOptions,
     /// What Replace and Replace All write instead of a match, while the reader runs.
     replace_text: String,
+    workspace_edit: workspace_edit::Work,
     find_seq: u64,
     /// Where to go once a source opened by [`Command::OpenAt`] or a place jump is shown.
     pending_goto: Option<(PathBuf, Goto)>,
     search_seq: u64,
     semantic_seq: u64,
+    /// The latest Go to Definition on `this` parsing its file: an older parse stops.
+    this_latest: Arc<std::sync::atomic::AtomicU64>,
     /// The documentation request: its id, and the tab, version, name and trigger it is about.
     pending_doc: Option<DocumentationRequest>,
     pending_completion: Option<completion::CompletionRequest>,
@@ -3051,7 +3342,7 @@ pub struct Session {
     /// What the server inserts after the character just typed (a closing tag), on its way.
     pending_auto_insert: Option<auto_insert::AutoInsertRequest>,
     /// The tab whose typed character its server inserts after: asked once the command is over.
-    auto_insert_due: Option<TabId>,
+    auto_insert_due: Option<(TabId, char)>,
     pending_code_action: Option<code_action::CodeActionRequest>,
     /// The server command running for the user's pick.
     pending_command: Option<server_command::CommandWait>,
@@ -3097,7 +3388,9 @@ pub struct Session {
     repo_requests: u64,
     /// What the running checkout does, to run again from its dialog when git refuses.
     pending_checkout: Option<crate::branches::Retry>,
-    branches_requests: u64,
+    branches_requests: Arc<AtomicU64>,
+    /// One repository's metadata, retained across popup dismissal; refreshed on every open.
+    branches_cache: Option<(PathBuf, lenz_content::branches::Refs, Vec<lenz_content::branches::Worktree>)>,
     /// The last file-status read asked for; a running read stops when it is no longer this one.
     git_status_requests: Arc<AtomicU64>,
     git_status_running: bool,
@@ -3170,6 +3463,9 @@ impl Session {
         let recovery_dir = config.cache.join("recovery");
         let recovery = crate::recovery::Recovery::open(recovery_dir.clone());
         let mut session = Self {
+            shown_position: Default::default(),
+            maven_files: Default::default(),
+            maven_sources: Default::default(),
             terminals: terminal_work::Terminals::default(),
             text_input_enabled,
             vim_group_edit: false,
@@ -3188,12 +3484,15 @@ impl Session {
                 focused: 0,
                 history: History::default(),
                 loading: None,
+                loading_since: None,
                 messages: messages.into(),
                 palette: themes.snapshot().palette,
                 project: None,
             libraries: Default::default(),
+            archive_tree: Default::default(),
             tree_revision: 0,
             tree_reveal: None,
+            tree_follow: None,
                 explorer: Default::default(), explorer_search: Default::default(), workspace_revision: 0,
                 recent,
                 recent_alone,
@@ -3227,9 +3526,11 @@ impl Session {
             git_status: None,
                 marker_sets: Default::default(),
                 branches: None,
+                branch_folders: Vec::new(),
                 tree_marks: Vec::new(),
                 checkout_running: None,
                 checkout_problem: None,
+                trust_prompt: None,
                 stash_conflicts: None,
                 undecided_recovery: recovery.undecided_paths(),
             },
@@ -3251,13 +3552,15 @@ impl Session {
             file_clipboard: Default::default(),
             navigation_query: None,
             save_seq: 0,
+            archive_saves: Default::default(),
+            archive_browser: Default::default(),
             recovery,
             recovery_token: format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())),
             untitled_seq: 0, replacing: None,
             semantic_wait: Default::default(),
             projections: Default::default(),
             layouts: Default::default(),
-            layout_intents: Default::default(), native: Default::default(),
+            layout_intents: Default::default(), band_goal: None, followed: None, native: Default::default(),
             themes,
             theme_preview: None,
             request: 0,
@@ -3301,6 +3604,8 @@ impl Session {
             interrupted: false,
             trash_home: crate::trash::home_trash(),
             trashed: Vec::new(),
+            project_real: None,
+            home: std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute()),
             watcher,
             watching: None,
             inventory_folders: None,
@@ -3315,10 +3620,12 @@ impl Session {
             results_forward: Vec::new(),
             find_options: Default::default(),
             replace_text: String::new(),
+            workspace_edit: Default::default(),
             find_seq: 0,
             pending_goto: None,
             search_seq: 0,
             semantic_seq: 0,
+            this_latest: Default::default(),
             pending_highlight: None,
             pending_doc: None,
             pending_completion: None,
@@ -3351,7 +3658,8 @@ impl Session {
             repo_git_seen: None,
             repo_requests: 0,
             pending_checkout: None,
-            branches_requests: 0,
+            branches_requests: Arc::new(AtomicU64::new(0)),
+            branches_cache: None,
             git_status_requests: Arc::new(AtomicU64::new(0)),
             git_status_running: false,
             git_status_again: false,
@@ -3430,7 +3738,16 @@ impl Session {
     }
 
     pub fn actions(&self) -> Vec<Action> {
-        CommandId::ALL.iter().map(|&id| Action { id, label: id.label(), disabled: self.disabled(id), on: self.on(id), shortcut: self.key_hint(id) }).collect()
+        CommandId::ALL.iter().map(|&id| self.menu_action(id)).collect()
+    }
+
+    /// The full command menu's rows in both adapters: every command, grouped ([`CommandId::grouped`]).
+    pub fn command_menu(&self) -> Vec<Action> {
+        CommandId::grouped().into_iter().map(|id| self.menu_action(id)).collect()
+    }
+
+    fn menu_action(&self, id: CommandId) -> Action {
+        Action { id, label: id.label(), disabled: self.disabled(id), on: self.on(id), shortcut: self.key_hint(id) }
     }
 
     /// Toggle `id`'s state for the menus (`None`: not a toggle): a setting, or a find option (the session's, which the
@@ -3451,11 +3768,21 @@ impl Session {
 
     pub fn disabled(&self, id: CommandId) -> Option<&'static str> {
         if self.closed {return Some("This reader view is closed");}
+        if self.state.explorer.selected.as_deref().is_some_and(|path| self.state.archive_tree.is_virtual(path)) && matches!(id,
+            CommandId::NewExplorerFile | CommandId::NewExplorerFolder | CommandId::RenameExplorerEntry | CommandId::MoveExplorerEntry
+            | CommandId::DeleteExplorerEntry | CommandId::DeleteExplorerPermanently | CommandId::CopyExplorerEntry | CommandId::PasteExplorerEntry) {
+            return Some("Archive entries support content editing; filesystem entry operations are unavailable inside an archive");
+        }
+        if self.state.current_source().is_some_and(|source| source.source_meta().archive().is_some()) && matches!(id,
+            CommandId::OpenInEditor | CommandId::OpenWithDefaultApp | CommandId::AnnotateBlame | CommandId::FormatDocument | CommandId::OrganizeImports | CommandId::QuickFix) {
+            return Some("This action requires a file on disk; the current document is an archive entry");
+        }
         if self.state.active().is_some_and(|tab| tab.csv.is_some()) && matches!(id,
-            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::Completion | CommandId::FormatDocument | CommandId::FormatSelection | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
+            CommandId::Cut | CommandId::Paste | CommandId::Delete | CommandId::SelectAll | CommandId::ExtendSelection | CommandId::ShrinkSelection | CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections | CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine | CommandId::Completion | CommandId::FormatDocument | CommandId::FormatSelection | CommandId::OrganizeImports | CommandId::QuickFix | CommandId::ReplaceMatch | CommandId::ReplaceAll) { return Some("Use CSV cell editing or switch to Source"); }
         if self.csv_pending() && id.project_action().is_none() && !matches!(id, CommandId::ChooseTheme | CommandId::About | CommandId::StatusDetails | CommandId::NewWindow | CommandId::LanguageServer | CommandId::ServerDetails | CommandId::CopyServerDetails | CommandId::Copy) { return Some(csv_work::PENDING_FIELD); }
         if (self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || self.install_running.is_some()) && matches!(id,
-            CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
+            CommandId::InstallServer | CommandId::StartServerInstall | CommandId::ServerRuntime | CommandId::MavenProfiles | CommandId::IncludeInBuild | CommandId::EnableServer | CommandId::DisableServer | CommandId::WorkspaceRoot
+            | CommandId::TrustProjectTools | CommandId::UntrustProjectTools | CommandId::FolderTrust
             | CommandId::RestartServer | CommandId::RebuildIndex | CommandId::ExcludeRubyTooling | CommandId::ResetProjectServerSettings) {
             return Some(if self.install_running.is_some() { "Waiting for the current installation to finish or stop" } else { "Waiting for language server settings to finish saving" });
         }
@@ -3467,7 +3794,7 @@ impl Session {
             CommandId::ShowTerminal | CommandId::NewTerminal | CommandId::FocusTerminal | CommandId::FocusEditor | CommandId::SendSelectionToTerminal | CommandId::PasteTerminalPath | CommandId::CloseTerminal | CommandId::StopTerminal | CommandId::RenameTerminal | CommandId::RestartTerminal | CommandId::NextTerminal | CommandId::PreviousTerminal | CommandId::CopyTerminalSelection | CommandId::FindTerminal => self.terminal_disabled(id),
 
             CommandId::CsvTable | CommandId::CsvHeader | CommandId::CsvFilter | CommandId::CsvSort | CommandId::CsvClearFilter | CommandId::CsvMoveLeft | CommandId::CsvMoveRight | CommandId::CsvDropColumn | CommandId::CsvEditCell => self.csv_disabled(id),
-            CommandId::RelativeLineNumbers | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
+            CommandId::RelativeLineNumbers | CommandId::InlineBlame | CommandId::AlwaysSelectOpenedFile | CommandId::MacWordMotion | CommandId::SaveOnLeave | CommandId::NameLetterSearch | CommandId::RankNearbyFiles | CommandId::VimMode | CommandId::StatusDetails | CommandId::FindFile | CommandId::SearchEverywhere | CommandId::FindSymbol | CommandId::FindAction | CommandId::Open | CommandId::OpenFolder | CommandId::ChooseTheme | CommandId::About | CommandId::NewWindow | CommandId::CloseWindow | CommandId::QuitAll => None,
             CommandId::SplitRight => (self.state.settings.split == Some(Split::Columns)).then_some("Already split side by side"),
             CommandId::SplitDown => (self.state.settings.split == Some(Split::Rows)).then_some("Already split one above the other"),
             CommandId::Unsplit | CommandId::FocusOtherPane | CommandId::EnlargeFirstPane | CommandId::EnlargeSecondPane => self.state.settings.split.is_none().then_some("The file panel is not split"),
@@ -3506,6 +3833,7 @@ impl Session {
             CommandId::CloseAllTabs | CommandId::CloseOtherTabs | CommandId::CloseTabsLeft | CommandId::CloseTabsRight => self.bulk_close_disabled(id),
             CommandId::NewScratch | CommandId::ScratchFiles => None,
             CommandId::OpenRecent => self.state.recent.is_empty().then_some("No recent folders"),
+            CommandId::ProjectReplace | CommandId::RenameSymbol | CommandId::ApplyWorkspaceEdit | CommandId::CancelWorkspaceEdit => self.workspace_disabled(id),
             CommandId::SearchProject => self.state.project.is_none().then_some("No folder is open"),
             CommandId::FindInFile => match self.state.active() {
                 _ if !open => Some("No file is open"),
@@ -3600,7 +3928,7 @@ impl Session {
             }
             CommandId::ResolveConflicts => self.state.stash_conflicts.is_none().then_some("Smart Checkout left no conflicts"),
             CommandId::NarrowAnnotations | CommandId::WidenAnnotations => {
-                if self.state.active().is_none_or(|t| t.blame.is_none()) { Some("Annotations are off") }
+                if self.state.active().is_none_or(|t| !t.annotating()) { Some("Annotations are off") }
                 else if id == CommandId::NarrowAnnotations && self.state.layout().annotation_cols() <= 12 { Some("Annotation gutter is at its minimum width") }
                 else if id == CommandId::WidenAnnotations && self.state.layout().annotation_cols() >= 80 { Some("Annotation gutter is at its maximum width") }
                 else { None }
@@ -3608,15 +3936,9 @@ impl Session {
             CommandId::AnnotateBlame | CommandId::CloseAnnotations => match self.state.active() {
                 None => Some("No file is open"),
                 // Turning annotations off always works, also once the file has gone.
-                Some(t) if t.blame.is_some() => None,
-                Some(t) if t.read_only_side().is_some() => Some("A comparison side has no live Git attribution"),
-                Some(t) if t.retrieved.is_some() => Some("Source from a language server has no Git history"),
-                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
-                Some(t) if t.unavailable.is_some() => Some("The file is unavailable"),
-                Some(t) if !t.loaded && self.state.loading().is_some() => Some("The file is still loading"),
-                // An SVG shown as its source is text.
-                Some(t) if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) => Some("Only text can be annotated"),
-                Some(t) if id == CommandId::CloseAnnotations && t.blame.is_none() => Some("Annotations are off"),
+                Some(t) if t.annotating() => None,
+                Some(t) if let Some(why) = self.blame_refused(t) => Some(why),
+                Some(t) if id == CommandId::CloseAnnotations && !t.annotating() => Some("Annotations are off"),
                 Some(_) => None,
             },
             // The explorer's selection, which only the adapter knows, is checked when it asks.
@@ -3625,7 +3947,13 @@ impl Session {
             CommandId::CloseSavedComparison => self.state.comparison.is_none().then_some("No saved comparison is open"),
             CommandId::CompareWith => (self.state.active().is_none() && self.state.project.is_none()).then_some("No file or folder is open"),
             CommandId::CompareSelected => (self.state.tree_marks.len() < 2).then_some(MARK_TWO),
-            CommandId::CopyPathLine => match self.state.active() {
+            CommandId::GoToTest => match self.state.active() {
+                None => Some("No file is open"),
+                Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
+                Some(t) if self.state.project.as_ref().and_then(|p| p.relative(&t.source)).is_none() => Some("Open the file's project folder first"),
+                Some(_) => None,
+            },
+            CommandId::CopyPathLine | CommandId::CopyReference => match self.state.active() {
                 None => Some("No file is open"),
                 Some(t) if t.untitled() => Some(UNTITLED_NO_FILE),
                 Some(t) if !t.loaded => Some("No text to point at"),
@@ -3656,7 +3984,7 @@ impl Session {
                     None => Some("No file is open"),
                     Some(view) if view.save_status().busy() => Some("A save operation is running"),
                     Some(view) if id == CommandId::ConfirmRecheckedSave => (!matches!(view.save_status(), crate::save::Status::Checked(crate::save::DiskMatch::Baseline | crate::save::DiskMatch::Attempted))).then_some("Recheck must match the baseline or attempted save first"),
-                    Some(view) => (!view.write_path_changed() && !matches!(view.save_status(), crate::save::Status::Uncertain(_) | crate::save::Status::Rejected(_) | crate::save::Status::Checked(_))).then_some("No save outcome needs rechecking"),
+                    Some(view) => (!view.write_path_changed() && !self.archive_requires_recheck(view.snapshot().key().buffer) && !matches!(view.save_status(), crate::save::Status::Uncertain(_) | crate::save::Status::Rejected(_) | crate::save::Status::Checked(_))).then_some("No save outcome needs rechecking"),
                 },
             },
             CommandId::Undo | CommandId::Redo => match self.state.active().and_then(|tab| self.state.view(tab.id)) {
@@ -3668,7 +3996,7 @@ impl Session {
             },
             CommandId::Cut | CommandId::Paste | CommandId::Delete => self.text_action_disabled(id),
             CommandId::IndentSelection | CommandId::OutdentSelection | CommandId::ToggleComment
-            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown => self.structural_action_disabled(id),
+            | CommandId::MoveLinesUp | CommandId::MoveLinesDown | CommandId::DuplicateLinesUp | CommandId::DuplicateLinesDown | CommandId::DeleteLine => self.structural_action_disabled(id),
             CommandId::AddCursorBelow | CommandId::AddCursorAbove | CommandId::SelectNextOccurrence | CommandId::CollapseSelections => self.selection_action_disabled(id),
             CommandId::ReadOnlyMode => self.state.active().and_then(|t| self.state.view(t.id)).map_or(Some("No loaded file is open"), |view| view.intrinsic_edit_disabled()),
             CommandId::Copy if self.state.active().and_then(|tab| tab.csv.as_ref()).is_some() => {
@@ -3713,8 +4041,14 @@ impl Session {
                 Some((p, root)) if id == CommandId::ResetProjectServerSettings && !self.state.semantics.settings().has_project(semantics::provider::PROVIDERS[p].id, &root) => Some("This project already inherits global language server settings"),
                 _ => None,
             },
+            CommandId::IncludeInBuild => self.maven_suggestion().is_none().then_some("This file's folder is not added by an inactive Maven profile"),
+            CommandId::MavenProfiles => match self.maven_project() {
+                Err(why) => Some(why),
+                Ok(project) if project.available.is_empty() => Some("This project's pom.xml declares no profiles"),
+                Ok(_) => None,
+            },
             CommandId::ServerRuntime => if self.state.provider_saves > 0 { Some("Waiting for provider settings to finish saving") }
-                else if self.runtime_kind().is_none() { Some("Open a Java or Python source file to choose its server runtime") } else { None },
+                else if self.runtime_kind().is_none() { Some("Open a Java or Node-based language source file to choose its server runtime") } else { None },
             CommandId::RestartServer => match self.state.provider() {
                 None => Some("No language server for this file"),
                 Some(v) if v.status == semantics::Status::Disabled => Some("Disabled for this folder"),
@@ -3734,6 +4068,13 @@ impl Session {
             // With well-formed JSON or XML selected, Format Document formats the selection (as IntelliJ's Reformat Code
             // does); any other selection leaves it formatting the file.
             CommandId::FormatDocument if self.format_selection_routes() => None,
+            CommandId::TrustProjectTools | CommandId::UntrustProjectTools | CommandId::FolderTrust => match self.folder_trust() {
+                None => Some("No folder is open: open the project's folder to trust its tools"),
+                Some(trust) if (trust == semantics::provider::Trust::Trusted) == (id != CommandId::UntrustProjectTools) => {
+                    Some(if id == CommandId::UntrustProjectTools { "This folder's project tools are not trusted" } else { "This folder's project tools are already trusted" })
+                }
+                _ => None,
+            },
             CommandId::Completion | CommandId::ParameterInfo | CommandId::QuickFix | CommandId::FormatDocument | CommandId::OrganizeImports if self.text_action_disabled(id).is_some() => self.text_action_disabled(id),
             CommandId::Completion | CommandId::ParameterInfo | CommandId::FormatDocument if current.as_ref().is_some_and(|d| d.language() == Some(Language::Sql)) => self.sql_action_disabled(id),
             CommandId::OrganizeImports if current.as_ref().is_some_and(|d| d.language() == Some(Language::Sql)) => Some("SQL files have no imports to organize"),
@@ -3817,8 +4158,7 @@ impl Session {
     fn runtime_kind(&self) -> Option<semantics::runtime::Kind> {
         match self.state.current()?.language()? {
             highlight::Language::Java => Some(semantics::runtime::Kind::Java),
-            highlight::Language::Python => Some(semantics::runtime::Kind::PyrightNode),
-            _ => None,
+            _ => self.install_provider().filter(|p| semantics::installer::node_package(p.id).is_some()).map(|p| semantics::runtime::Kind::Node(p.id)),
         }
     }
 
@@ -3840,16 +4180,38 @@ impl Session {
                 CommandId::DisableServer
             },
             CommandId::WorkspaceRoot,
+            if self.folder_trust() == Some(semantics::provider::Trust::Trusted) {
+                CommandId::UntrustProjectTools
+            } else {
+                CommandId::TrustProjectTools
+            },
             CommandId::ServerRuntime,
             CommandId::ExcludeRubyTooling,
             CommandId::ResetProjectServerSettings,
             CommandId::PersistentIndex,
             CommandId::RebuildIndex,
         ] {
-            let label = self.on(id).map_or_else(|| id.label().to_owned(), |on| format!("{}: {}", id.label(), if on { "On" } else { "Off" }));
-            rows.push((label, Some(id)));
+            rows.push((crate::chrome::toggle_text(id.label(), self.on(id)), Some(id)));
+        }
+        // The file is outside the build and a Maven profile adds its folder: the fix, right below Server Details.
+        if let Some((profile, _)) = self.maven_suggestion() {
+            rows.insert(1.min(rows.len()), (format!("Activate Maven Profile “{profile}” for This File"), Some(CommandId::IncludeInBuild)));
+        }
+        // Only in a Maven project JDT LS imports: elsewhere it would be one more disabled row.
+        if self.maven_project().is_ok_and(|p| !p.available.is_empty()) {
+            let at = rows.iter().position(|(_, id)| *id == Some(CommandId::ServerRuntime)).map_or(rows.len(), |i| i + 1);
+            rows.insert(at, (CommandId::MavenProfiles.label().to_owned(), Some(CommandId::MavenProfiles)));
         }
         rows
+    }
+
+    /// Where the server menu's sections start in [`Self::language_server_rows`]: Setup at enabling or disabling the
+    /// server, Indexing at the Ruby tooling exclusions (rows offered only sometimes shift them).
+    pub fn language_server_headings(&self) -> Vec<(usize, &'static str)> {
+        let rows = self.language_server_rows();
+        let at = |ids: &[CommandId]| rows.iter().position(|(_, id)| id.is_some_and(|id| ids.contains(&id)));
+        [(at(&[CommandId::EnableServer, CommandId::DisableServer]), "Setup"), (at(&[CommandId::ExcludeRubyTooling]), "Indexing")]
+            .into_iter().filter_map(|(row, title)| row.map(|r| (r, title))).collect()
     }
 
     /// The active file's editing preferences, each with its source, for either adapter. Paths and settings only:
@@ -3889,7 +4251,7 @@ impl Session {
             return rows.join("\n");
         }
         if crate::template::Kind::of(&file) == Some(crate::template::Kind::Haml) {
-            rows.push("Formatter: Ruby's installed haml_lint, enabled by .haml-lint.yml in the file's ancestors; safe autocorrections through stdin, never writes the file; Ruby with haml_lint must be on PATH".into());
+            rows.push("Formatter: Ruby's installed haml_lint, enabled by .haml-lint.yml in the file's folder or above it, never above the opened folder; it runs only in a folder you trust (it loads the project's bundle and RuboCop configuration); safe autocorrections through stdin, never writes the file; Ruby with haml_lint must be on PATH".into());
             return rows.join("\n");
         }
         let path = std::env::var_os("PATH");
@@ -4016,6 +4378,14 @@ impl Session {
 
     /// Full, unwrapped diagnostic snapshot for display and copying in either adapter.
     pub fn language_server_details(&self) -> String {
+        // One labelled line per fact, as Status Details lists them; the notices after a blank line.
+        let notices = self.state.notices();
+        let rows = self.server_detail_rows().join("\n");
+        if notices.is_empty() { rows } else { format!("{rows}\n\n{}", notices.join("\n")) }
+    }
+
+    /// Server Details without the notices, which Status Details already lists first.
+    pub(crate) fn server_detail_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
         let view = self.state.provider();
         let summary = match &view {
@@ -4024,16 +4394,36 @@ impl Session {
             None if self.state.current_source().is_some() => "No language server supports this document. Syntax highlighting and text search remain available.".into(),
             None => "Open a source file to start its language server automatically.".into(),
         };
-        rows.push(summary);
-        // Right below its status: the reason it may not be working.
-        if let Some(error) = view.as_ref().and_then(|v| v.error.as_ref()) {
-            rows.push(format!("Server error: {error}\nThe server may keep running with reduced results."));
+        // The server's own summary is labelled; a reason no server applies reads as text.
+        rows.push(if view.is_some() { format!("Server: {summary}") } else { summary });
+        // The file itself is outside the build: what the server said and how to bring it in.
+        let suggestion = self.maven_suggestion();
+        if let Some(outside) = self.state.outside_build() && let Some((profile, folder)) = &suggestion {
+            rows.push(format!("Build: {}.\nIts folder {folder} is added by the Maven profile {profile}, which is not active. Choose Activate Maven Profile “{profile}” for This File: Eclipse JDT LS restarts and imports the project with it.", outside.message.trim_end_matches('.')));
+        } else if let Some(outside) = self.state.outside_build() {
+            rows.push(format!("Build: {}.\n{}", outside.message.trim_end_matches('.'), if outside.no_project {
+                "Open the folder of the project that contains it, or add it to a project's build, for navigation, completion and full checks."
+            } else {
+                "Its folder is not a source folder of the build. Add it in pom.xml or build.gradle (or activate the Maven profile that adds it) for navigation, completion and full checks."
+            }));
+        }
+        // Right below its status: the reason it may not be working. Its first line (a stack trace's message); the
+        // whole text is in Logs.
+        // JDT LS's "… [in project] does not exist" for a file outside the build says what the row above explains.
+        let explained = |first: &str| self.state.outside_build().is_some() && first.ends_with("does not exist");
+        if let Some(error) = view.as_ref().and_then(|v| v.error.as_ref()).filter(|e| !explained(e.lines().next().unwrap_or_default())) {
+            let first = error.lines().next().unwrap_or_default();
+            let more = if error.lines().nth(1).is_some() { " Its full text is in Logs." } else { "" };
+            rows.push(format!("Server error: {first}\nThe server may keep running with reduced results.{more}"));
         }
         let template = self.template_rows();
         let unmapped = template.as_ref().is_some_and(|(_, unmapped)| *unmapped);
         rows.extend(template.map(|(rows, _)| rows).unwrap_or_default());
         if let Some((p, root)) = self.state.project_provider() {
-            rows.push(format!("Project settings for {}: {}", root.display(), if self.state.semantics.settings().has_project(semantics::provider::PROVIDERS[p].id, &root) { "project overrides global settings" } else { "inheriting global settings" }));
+            rows.push(format!("Project settings: {}", if self.state.semantics.settings().has_project(semantics::provider::PROVIDERS[p].id, &root) { "this project overrides the global ones" } else { "the global ones" }));
+            if let Some(maven) = self.maven_project().ok().filter(|m| !m.available.is_empty()) {
+                rows.push(format!("Maven profiles: {} (pom.xml declares {}; Maven Profiles… changes them)", if maven.active.is_empty() { "the defaults".to_owned() } else { maven.active.join(", ") }, maven.available.join(", ")));
+            }
             if semantics::provider::PROVIDERS[p].id == "ruby-lsp" {
                 rows.push(format!("Ruby tooling gem exclusions: {}. Exclusions reduce navigation into tooling gems; project files keep their normal coverage. A project .index.yml takes precedence over editor indexing settings.", if self.state.semantics.settings().ruby_tooling_excluded(&root) { "enabled" } else { "not applied" }));
             }
@@ -4041,9 +4431,9 @@ impl Session {
         if let Some(v) = view {
             let has_root = v.root.is_some();
             if let Some(root) = &v.root {
-                rows.push(format!("Workspace: {}", root.display()));
+                rows.push(format!("Workspace: {}", semantics::runtime::shown_path(root)));
             }
-            if let Some(Ok(environment)) = &v.environment {
+            if let Some(Ok(environment)) = v.environment.as_ref().filter(|e| e.as_ref().is_ok_and(|e| !e.is_empty())) {
                 rows.push(environment.clone());
             }
             if let Some(p) = semantics::provider::PROVIDERS
@@ -4071,27 +4461,28 @@ impl Session {
                 // Stopped for its project environment: the status says what to fix; the server itself is fine.
                 let environment = matches!(v.environment, Some(Err(_)));
                 if environment {
-                    rows.push("The language server was not started: correct the project environment named above, then choose Restart Language Server. Lenz never creates environments or installs packages.".into());
+                    rows.push("Help: The language server was not started: correct the project environment named above, then choose Restart Language Server. Lenz never creates environments or installs packages.".into());
                 } else if unmapped {
-                    rows.push("No language server is asked about this template until its embedded languages can be mapped (the template rows above say what is not).".into());
+                    rows.push("Help: No language server is asked about this template until its embedded languages can be mapped (the template rows above say what is not).".into());
                 } else if matches!(v.status, semantics::Status::Missing(_) | semantics::Status::Failed(_)) {
                     rows.push(format!("Setup: {}", p.setup));
                     if self.runtime_kind().is_some() {
-                        rows.push("Choose Language Server Runtime to select an existing installation, validate it and restart the server. The failure may be a runtime selection or version problem; an exit code alone does not prove incompatibility.".into());
+                        rows.push("Help: Choose Language Server Runtime to select an existing installation, validate it and restart the server. The failure may be a runtime selection or version problem; an exit code alone does not prove incompatibility.".into());
                     }
                 }
                 match v.status {
-                    semantics::Status::Disabled => rows.push("Disabled by your folder settings. Choose Enable Language Server for This Folder to activate it.".into()),
-                    semantics::Status::Missing(_) if self.state.current_source().is_some_and(|d| d.is_large()) => rows.push("Large files do not start a language server. Open a smaller source file to use semantic navigation.".into()),
+                    semantics::Status::Disabled => rows.push("Help: Disabled by your folder settings. Choose Enable Language Server for This Folder to activate it.".into()),
+                    semantics::Status::Restricted(runs) => rows.push(format!("Help: {}: {runs}. Lenz runs no code from a folder until you trust it: with its folder open, choose Restricted in the status bar, Folder Trust… or Trust Project Tools in This Folder.", semantics::provider::RESTRICTED)),
+                    semantics::Status::Missing(_) if self.state.current_source().is_some_and(|d| d.is_large()) => rows.push("Help: Large files do not start a language server. Open a smaller source file to use semantic navigation.".into()),
                     semantics::Status::Missing(_) if unmapped => {}
-                    semantics::Status::Missing(_) if !has_root => rows.push("No workspace was found. Choose Set Workspace Root, or open a file inside a supported project.".into()),
+                    semantics::Status::Missing(_) if !has_root => rows.push("Help: No workspace was found. Choose Set Workspace Root, or open a file inside a supported project.".into()),
                     semantics::Status::Failed(_) if environment => {}
                     semantics::Status::Missing(_) | semantics::Status::Failed(_) => {
-                        rows.push("Check the error above, the executable and its runtime/toolchain in the same environment as Lenz. Check executable, args, env and workspace root in your provider settings. After fixing setup, choose Restart Language Server; if no workspace was found, set its root first. Lenz never installs servers automatically.".into());
+                        rows.push("Help: Check the error above, the executable and its runtime/toolchain in the same environment as Lenz. Check executable, args, env and workspace root in your provider settings. After fixing setup, choose Restart Language Server; if no workspace was found, set its root first. Lenz never installs servers automatically.".into());
                     }
-                    semantics::Status::Queued | semantics::Status::Starting => rows.push("Starts automatically when you open a supported source file. Startup is limited to 120 seconds; a failure will be shown here.".into()),
-                    semantics::Status::Indexing(_) => rows.push("The server is still loading the project. Results may be incomplete until indexing finishes.".into()),
-                    semantics::Status::Ready => rows.push("The server is running. If navigation fails, check the workspace root and server capabilities, or restart it.".into()),
+                    semantics::Status::Queued | semantics::Status::Starting => rows.push("Help: Starts automatically when you open a supported source file. Startup is limited to 120 seconds; a failure will be shown here.".into()),
+                    semantics::Status::Indexing(_) => rows.push("Help: The server is still loading the project. Results may be incomplete until indexing finishes.".into()),
+                    semantics::Status::Ready => rows.push("Help: The server is running. If navigation fails, check the workspace root and server capabilities, or restart it.".into()),
                 }
                 rows.push(format!("Provider limits: {}", p.limits));
                 let script = self.state.current_source().is_some_and(|d| d.language() == Some(Language::Bash));
@@ -4109,11 +4500,10 @@ impl Session {
         rows.push(
             format!(
                 "Provider settings: {}",
-                self.state.semantics.settings_file().display()
+                semantics::runtime::shown_path(self.state.semantics.settings_file())
             ),
         );
-        rows.extend(self.state.notices());
-        rows.join("\n\n")
+        rows
     }
 
     /// The context menu for the active tab: navigation and copying for text; for an image or a Markdown preview
@@ -4127,9 +4517,9 @@ impl Session {
         let text = tab.is_some_and(|t| t.loaded) && !matches!(self.state.rendering(), Some(Rendering::Preview(_) | Rendering::Pending));
         let mut entries = Vec::new();
         if text {
-            entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation].map(C));
+            entries.extend([CommandId::Definition, CommandId::PeekDefinition, CommandId::TypeDefinition, CommandId::Implementation, CommandId::Usages, CommandId::CallHierarchy, CommandId::TypeHierarchy, CommandId::Documentation, CommandId::RenameSymbol].map(C));
             entries.extend([Separator, C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll)]);
-            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine)]);
+            entries.extend([Separator, C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode), C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference)]);
         } else {
             if matches!(self.state.rendering(), Some(Rendering::Preview(_))) {
                 entries.extend([C(CommandId::Copy), Separator, C(CommandId::ShowInSource), C(CommandId::FollowLink), Separator]);
@@ -4141,7 +4531,7 @@ impl Session {
         }
         entries.push(C(CommandId::LocateFile));
         if text {
-            match tab.is_some_and(|t| t.blame.is_some()) {
+            match tab.is_some_and(|t| t.annotating()) {
                 true => entries.extend([Separator, C(CommandId::ShowCommit), C(CommandId::ShowCommitDiff), C(CommandId::CopyRevision), C(CommandId::CloseAnnotations)]),
                 false => entries.extend([Separator, C(CommandId::AnnotateBlame)]),
             }
@@ -4171,7 +4561,42 @@ impl Session {
 
     /// Line `line`'s annotation in tab `tab`, while its annotations are on and git has reached it.
     pub fn annotation(&self, tab: TabId, line: usize) -> Option<crate::blame::Annotation<'_>> {
-        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref()?, line, self.state.layout().annotation_cols())
+        crate::blame::annotation(self.state.tabs.iter().find(|t| t.id == tab)?.blame.as_ref().filter(|b| b.column)?, line, self.state.layout().annotation_cols())
+    }
+
+    /// Why tab `t` cannot be attributed with Git blame, if it cannot.
+    fn blame_refused(&self, t: &crate::tabs::Tab) -> Option<&'static str> {
+        if t.read_only_side().is_some() { Some("A comparison side has no live Git attribution") }
+        else if t.retrieved.is_some() { Some("Source from a language server has no Git history") }
+        else if t.untitled() { Some(UNTITLED_NO_FILE) }
+        else if t.unavailable.is_some() { Some("The file is unavailable") }
+        else if !t.loaded && self.state.loading().is_some() { Some("The file is still loading") }
+        // An SVG shown as its source is text.
+        else if self.state.view(t.id).map(|view| view.snapshot()).is_none_or(|d| d.image().is_some() && !t.image_source) { Some("Only text can be annotated") }
+        else { None }
+    }
+
+    /// Inline blame keeps attribution for the shown tabs, without their annotation column, and drops it elsewhere.
+    /// A pass over the tabs; the blame itself runs only for content not yet attributed.
+    fn sync_inline_blame(&mut self) {
+        let on = self.state.settings.inline_blame;
+        let (mut start, mut stop) = (Vec::new(), Vec::new());
+        for t in &self.state.tabs {
+            let wanted = on && self.is_shown(t.id) && self.blame_refused(t).is_none();
+            match &t.blame {
+                None if wanted => start.push(t.id),
+                Some(b) if !b.column && !wanted => stop.push((t.id, t.buffer)),
+                _ => {}
+            }
+        }
+        for (id, buffer) in stop {
+            if let Some(t) = self.tab_mut(id) { t.blame = None; }
+            if let Some(buffer) = buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+        }
+        for id in start {
+            if let Some(t) = self.tab_mut(id) { t.blame = Some(crate::blame::Blame::inline()); }
+            self.annotate(id);
+        }
     }
 
     /// A new request for the checkout about to run (an older one's answer is then dropped).
@@ -4244,6 +4669,8 @@ impl Session {
         self.markers_epoch += 1;
         self.state.marker_sets.clear();
         self.state.branches = None;
+        self.branches_requests.fetch_add(1, Ordering::Relaxed);
+        self.branches_cache = None;
         self.state.checkout_problem = None;
         self.state.stash_conflicts = None;
         let Some(anchor) = anchor else { return };
@@ -4288,7 +4715,7 @@ impl Session {
             return Ok((c.sha.clone(), c.root.clone()));
         }
         let t = self.state.active().ok_or("No file is open")?;
-        let b = t.blame.as_ref().ok_or("Annotations are off")?;
+        let b = t.blame.as_ref().filter(|b| b.column).ok_or("Annotations are off")?;
         if b.error.is_some() { return Err("Blame failed"); }
         if !b.done { return Err("Blame pending"); }
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head)).ok_or("No line is selected")?;
@@ -4302,7 +4729,7 @@ impl Session {
     /// The caret line's annotation in the active tab (the status line's commit).
     pub fn caret_annotation(&self) -> Option<crate::blame::Annotation<'_>> {
         let t = self.state.active()?;
-        let b = t.blame.as_ref()?; // nothing more while annotations are off
+        let b = t.blame.as_ref().filter(|b| b.column)?; // nothing more while annotations are off
         let line = self.state.source(t.id).zip(t.selection()).map(|(d, s)| d.line_of(s.head))?;
         crate::blame::annotation(b, line, self.state.layout().annotation_cols())
     }
@@ -4329,6 +4756,7 @@ impl Session {
             None => Err("No file is open"),
             Some(t) if t.read_only_side().is_some() => Err("A comparison's read-only side is an immutable snapshot; open the current side externally"),
             Some(t) if t.retrieved.is_some() => Err("Source from a language server has no file to open"),
+            Some(t) if crate::archive::Location::from_uri(&t.source).is_some() => Err("An archive entry has no standalone file to open; use Save As to export it"),
             Some(t) if t.untitled() => Err(UNTITLED_NO_FILE),
             Some(t) if t.unavailable.is_some() => Err("The file is unavailable"),
             Some(t) => Ok(t),
@@ -4418,6 +4846,7 @@ impl Session {
         // (Home while an End seek is pending, for example). Adapter layout/metric feedback is not user input.
         if matches!(&input, Input::Command(command) if !matches!(command, Command::PrepareLayout { .. } | Command::PrepareProjection(_) | Command::CancelProjection { .. } | Command::ClampColumn { .. } | Command::SetTextSize { .. } | Command::SetNativeContext { .. } | Command::MeasuredReveal { .. } | Command::TakeExternal { .. })) {
             self.layout_intents = Default::default();
+            self.band_goal = None;
             self.native.cancel();
         }
         if !self.vim_group_edit && matches!(&input, Input::Command(command) if !matches!(command, Command::Edit { .. } | Command::Delete { .. } | Command::InsertText { .. }
@@ -4428,14 +4857,14 @@ impl Session {
             }
         }
         let laid_out = matches!(&input, Input::Completion(Completion::LaidOut(_)));
-        if matches!(&input, Input::Command(Command::CompareSaved | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
+        if matches!(&input, Input::Command(Command::CompareSaved | Command::OpenArchiveEntry(_) | Command::ArchiveTreeParent { .. } | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. } | Command::Pin(_) | Command::Back | Command::Forward | Command::Select(_) | Command::MoveCaret(_) | Command::SelectAll | Command::AddCursorBelow | Command::AddCursorAbove | Command::CollapseSelections | Command::Scroll(_) | Command::ScrollRows(_) | Command::ScrollColumn(_) | Command::GoToLine(_) | Command::GoToPlace(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_) | Command::ActivateTree { .. } | Command::SetLayout(_) | Command::ResizeAnnotations { .. } | Command::SetSoftWrap(_))) { self.restore_workspace = false; }
         let expansion_completion = match &input {
             Input::Completion(Completion::SelectionSteps { request, .. }) => Some(*request),
             Input::Completion(Completion::Analyzed { result, .. }) => match result.as_ref() { Completion::SelectionSteps { request, .. } => Some(*request), _ => None },
             Input::Command(_) | Input::Completion(_) => None,
         };
         let edit_reveal = matches!(&input, Input::Command(Command::Cut | Command::Paste(_) | Command::Delete { .. } | Command::InsertText { .. } | Command::AddCursorBelow | Command::AddCursorAbove
-            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
+            | Command::Indent { .. } | Command::ToggleComment | Command::MoveLines { .. } | Command::DuplicateLines { .. } | Command::DeleteLines | Command::InsertSnippet { .. })) || matches!(&input, Input::Command(Command::Edit { tab, .. } | Command::Undo { tab } | Command::Redo { tab }) if self.state.active == Some(*tab));
         let reveal_selection = (edit_reveal || matches!(&input, Input::Command(Command::VimKey(_) | Command::MoveCaret(_) | Command::Extend(_) | Command::ExtendSelection | Command::ShrinkSelection)) || expansion_completion.is_some())
             && !expansion_completion.is_some_and(|request| self.expanding.is_some_and(|e| e.3 == request && !e.4));
         let markers_due = matches!(input, Input::Completion(Completion::MarkersDue));
@@ -4443,7 +4872,7 @@ impl Session {
         let retire_messages = matches!(&input, Input::Command(_)) && (edit_reveal || reveal_selection) && !self.state.messages.is_empty();
         if retire_messages { self.state.messages.clear(); }
         // Tabs and layout, not each caret move: what an interrupted session reopens.
-        let arranged = matches!(&input, Input::Command(Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
+        let arranged = matches!(&input, Input::Command(Command::OpenArchiveEntry(_) | Command::ArchiveTreeParent { .. } | Command::ActivateTree { .. } | Command::Open(_) | Command::OpenRetained(_) | Command::NewScratch(_) | Command::NewScratchFile(_) | Command::OpenScratch(_) | Command::OpenAt { .. } | Command::ActivateTab(_) | Command::Close | Command::CloseTab(_) | Command::CloseTabs { .. }
             | Command::Pin(_) | Command::Split(_) | Command::Unsplit | Command::FocusPane(_) | Command::MoveTab { .. } | Command::SetExplorer(_) | Command::ToggleDir(_)
             | Command::SetLayout(_) | Command::ResizeAnnotations { commit: true, .. } | Command::SetSoftWrap(_) | Command::ChooseRecoveredDraft { .. }));
         let input = match input {
@@ -4466,7 +4895,7 @@ impl Session {
         }
         if arranged { self.checkpoint_workspace(); }
         if std::mem::take(&mut self.signature_due) { effect.repaint |= self.signature_at_caret(false).repaint; }
-        if let Some(tab) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab).repaint; }
+        if let Some((tab, typed)) = self.auto_insert_due.take() { effect.repaint |= self.auto_insert_at_caret(tab, typed).repaint; }
         if self.pending_auto_insert.as_ref().is_some_and(|p| !p.current(&self.state)) { self.cancel_auto_insert(); }
         if self.pending_doc.as_ref().is_some_and(|p| !self.is_shown(p.tab) || !self.state.view(p.tab).is_some_and(|v| p.source.matches(v.snapshot()))) { self.cancel_documentation(); }
         // A popup or request whose tab, version, caret or server is no longer current is gone, not hidden.
@@ -4488,6 +4917,9 @@ impl Session {
         }
         self.invalidate_result_analysis();
         self.sync_project_syntax();
+        effect.repaint |= self.settle_band_goal();
+        effect.repaint |= self.follow_active_file();
+        self.sync_inline_blame();
         self.refresh_blame();
         // A shown draft's change markers follow its text: only a version or baseline that changed is compared again.
         self.refresh_markers(markers_due);
@@ -4714,6 +5146,13 @@ impl Session {
 
         let repaint = Effect { repaint: true, copy: None, ..Effect::default() };
         match command {
+            Command::PreviewProjectReplace(text) => self.preview_project_replace(text),
+            Command::RenameSymbol(name) => self.rename_symbol(name),
+            Command::ApplyWorkspaceEdit => self.apply_workspace_edit(),
+            Command::CancelWorkspaceEdit => self.cancel_workspace_edit(),
+            Command::MoveWorkspaceFile(by) => self.move_workspace_file(by),
+            Command::ToggleCurrentWorkspaceFile => self.toggle_current_workspace_file(),
+            Command::ToggleWorkspaceFile(i) => self.toggle_workspace_file(i),
             Command::Terminal(command) => self.terminal_command(command),
             Command::Csv(command) => self.csv_command(command),
             Command::PresentText { tab, base, base_selection, edit, selected } => self.present_text(tab, base, base_selection, edit, selected),
@@ -4733,6 +5172,7 @@ impl Session {
             Command::ChooseReplace { ticket, choice } => self.choose_replace(ticket, choice),
             Command::NewDocument => self.new_document(),
             Command::NewScratch(name) => self.new_scratch(name),
+            Command::NewScratchFile(kind) => self.new_scratch_file(kind),
             Command::OpenScratch(path) => self.open_scratch(path),
             Command::CopyExplorerPath { kind } => self.copy_explorer_path(kind),
             Command::CopyExplorerEntry => self.copy_explorer_entry(),
@@ -4799,6 +5239,8 @@ impl Session {
                 if self.state.project.is_none() && !is_virtual(&path) { self.remember_alone(normalized(&path)); }
                 self.navigate(path, false, None, true)
             }
+            Command::OpenArchiveEntry(location) => if location.members.is_empty() { self.browse_archive(location) } else { self.navigate(location.to_uri(), true, None, true) },
+            Command::ArchiveTreeParent { path } => self.archive_tree_parent(&path).unwrap_or_default(),
             Command::OpenRetained(path) => self.navigate(path, true, None, true),
             Command::ActivateTab(id) => {
                 let Some(pane) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.pane) else { return Effect::default() };
@@ -4875,7 +5317,7 @@ impl Session {
                 let files: std::collections::BTreeSet<PathBuf> = p.bookmarks().iter().map(|m| m.source.to_path_buf()).chain(p.recent_files().iter().cloned()).chain(p.recent_locations().iter().map(|m| m.source.to_path_buf())).collect();
                 let (tx, generation) = (self.tx.clone(), self.project_generation.load(Ordering::Relaxed));
                 self.jobs.submit(Priority::Background, move || {
-                    let missing = files.into_iter().filter(|f| !f.exists()).collect();
+                    let missing = files.into_iter().filter(|f| !crate::archive::physical_path(f).exists()).collect();
                     let _ = tx.send_blocking(Completion::PlacesChecked { generation, missing });
                 });
                 Effect::default()
@@ -4919,13 +5361,15 @@ impl Session {
                 }
             }
             Command::Recheck => {
+                // Coming back to the window: another window may have changed folder trust.
+                let trust = self.trust_changed_elsewhere();
                 for id in self.state.tabs.iter().map(|t| t.id).collect::<Vec<_>>() {
                     self.refresh(id);
                 }
                 if !self.watcher.available() {
                     self.rescan();
                 }
-                Effect::default()
+                Effect { repaint: trust, ..Effect::default() }
             }
             Command::Search { query, scope } => {
                 let (scope, pattern) = match scope {
@@ -5012,6 +5456,38 @@ impl Session {
                 self.save_settings();
                 Effect { repaint: true, ..Effect::default() }
             }
+            Command::SetSaveOnLeave(on) => {
+                self.state.settings.save_on_leave = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetMacWordMotion(on) => {
+                self.state.settings.mac_word_motion = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetRankNearbyFiles(on) => {
+                self.state.settings.rank_nearby_files = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetNameLetterSearch(on) => {
+                self.state.settings.name_letter_search = on;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetAlwaysSelectOpenedFile(on) => {
+                self.state.settings.always_select_opened_file = on;
+                self.followed = None;
+                self.save_settings();
+                Effect { repaint: true, ..Effect::default() }
+            }
+            Command::SetInlineBlame(on) => {
+                self.state.settings.inline_blame = on;
+                self.save_settings();
+                self.sync_inline_blame();
+                Effect { repaint: true, ..Effect::default() }
+            }
             Command::SetVimEnabled(on) => self.set_vim_enabled(on),
             Command::VimKey(key) => self.vim_key(key),
             Command::SetSoftWrap(on) => {
@@ -5026,6 +5502,7 @@ impl Session {
                 Effect { repaint: true, copy: None, ..Effect::default() }
             }
             Command::RevealInTree(rel) => {
+                if let Some(effect) = self.archive_reveal(&rel) { return effect; }
                 let changed = self.state.project.as_mut().is_some_and(|p| p.reveal(&rel) || p.reveal_folder(&rel));
                 Effect { repaint: changed, copy: None, ..Effect::default() }
             }
@@ -5207,6 +5684,7 @@ impl Session {
             Command::ActivateTree { path, retain } => self.activate_tree(path, retain),
             Command::ExplorerSearch(input) => self.explorer_search(input),
             Command::ToggleDir(dir) => {
+                if let Some(effect) = self.activate_archive_tree(&dir, false) { return effect; }
                 self.state.explorer_search = Default::default();
                 if self.state.libraries.rows().iter().any(|r| r.path.as_ref() == dir) {
                     let requests = self.state.libraries.toggle(&dir, self.state.settings.folders_first);
@@ -5217,6 +5695,8 @@ impl Session {
                 Effect { repaint: changed, copy: None, ..Effect::default() }
             }
             Command::Locate => {
+                if let Some(path) = self.state.active().map(|tab| tab.source.to_string_lossy().into_owned())
+                    && let Some(effect) = self.archive_reveal(&path) { return effect; }
                 if let Some(path) = self.state.active().map(|t| t.source.clone()) && self.state.libraries.contains(&path) {
                     let requests = self.state.libraries.reveal(&path, self.state.settings.folders_first);
                     self.read_libraries(requests);
@@ -5308,27 +5788,66 @@ impl Session {
                     return Effect::default();
                 }
                 let Some(root) = self.state.repo.as_ref().map(|r| r.root.clone()) else { return Effect::default() };
-                self.state.branches = Some(crate::branches::BranchesView { loading: true, worktrees_only, revisions_only, ..Default::default() });
-                self.branches_requests += 1;
-                let (request, tx) = (self.branches_requests, self.tx.clone());
+                let mut view = crate::branches::BranchesView { loading: true, worktrees_only, revisions_only, ..Default::default() };
+                if let Some((_, refs, worktrees)) = self.branches_cache.as_ref().filter(|(cached, _, _)| *cached == root) {
+                    view.refs = refs.clone();
+                    view.refs.current = self.state.repo.as_ref().and_then(|r| r.head.branch.clone());
+                    view.worktrees = worktrees.clone();
+                    view.has_snapshot = true;
+                }
+                self.state.branches = Some(view);
+                let request = self.branches_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                let (latest, tx) = (self.branches_requests.clone(), self.tx.clone());
                 self.jobs.submit(Priority::Visible, move || {
-                    // Changed paths are counted only when the Worktrees section shows (more than one).
-                    // Compare with Worktree… shows neither the refs nor the current worktree.
+                    if latest.load(Ordering::Relaxed) != request { return; }
                     let refs = if worktrees_only { Ok(Default::default()) } else { lenz_content::branches::refs(&root) };
                     let result = refs.and_then(|r| {
-                        // Compare with Branch, Tag or Revision… lists no worktrees.
-                        let mut worktrees = if revisions_only { Vec::new() } else { lenz_content::branches::worktree_list(&root)? };
-                        match worktrees.len() > 1 {
-                            true => worktrees.iter_mut().filter(|w| !(worktrees_only && w.current)).for_each(|w| lenz_content::branches::count_changes(std::slice::from_mut(w))),
-                            false => worktrees.iter_mut().for_each(|w| w.dirty = None),
-                        }
+                        if latest.load(Ordering::Relaxed) != request { return Err("superseded".into()); }
+                        // This is a navigation inventory: do not enumerate changed/untracked files
+                        // in every worktree just to let the user choose a branch.
+                        let worktrees = if revisions_only { Vec::new() } else { lenz_content::branches::worktree_list(&root)? };
                         Ok((r, worktrees))
                     });
-                    let _ = tx.send_blocking(Completion::Branches { request, root, result });
+                    let listed = result.is_ok();
+                    if latest.load(Ordering::Relaxed) == request {
+                        let _ = tx.send_blocking(Completion::Branches { request, root: root.clone(), result });
+                    }
+                    // The lists show first; how far each branch is from its upstream follows (git walks history).
+                    if listed && !worktrees_only && latest.load(Ordering::Relaxed) == request {
+                        let result = lenz_content::branches::tracking(&root);
+                        if latest.load(Ordering::Relaxed) == request {
+                            let _ = tx.send_blocking(Completion::BranchTracking { request, root, result });
+                        }
+                    }
                 });
                 repaint
             }
-            Command::CloseBranches => Effect { repaint: self.state.branches.take().is_some(), copy: None, ..Effect::default() },
+            Command::CloseBranches => {
+                self.branches_requests.fetch_add(1, Ordering::Relaxed);
+                Effect { repaint: self.state.branches.take().is_some(), copy: None, ..Effect::default() }
+            }
+            Command::ToggleBranchFolder(section, name) => {
+                let folders = &mut self.state.branch_folders;
+                match folders.iter().position(|(s, n)| *s == section && *n == name) {
+                    Some(at) => { folders.remove(at); }
+                    None => folders.push((section, name)),
+                }
+                Effect { repaint: true, copy: None, ..Effect::default() }
+            }
+            Command::ToggleFavoriteBranch(name) => {
+                let Some(key) = self.state.repo.as_ref().map(crate::branches::Repo::common_dir) else { return Effect::default() };
+                let favorites = &mut self.state.settings.favorite_branches;
+                let set = favorites.entry(key.clone()).or_default();
+                if !set.remove(&name) { set.insert(name); }
+                if set.is_empty() { favorites.remove(&key); }
+                self.save_settings();
+                Effect { repaint: true, copy: None, ..Effect::default() }
+            }
+            Command::ExpandBranches(section) => {
+                let Some(v) = self.state.branches.as_mut().filter(|v| !v.expanded.contains(&section)) else { return Effect::default() };
+                v.expanded.push(section);
+                Effect { repaint: true, copy: None, ..Effect::default() }
+            }
             Command::MarkTreeRow { path, selected } => {
                 if path.contains("://") {
                     self.state.messages.push("Compare Selected: this entry has no file on disk".into());
@@ -5399,12 +5918,21 @@ impl Session {
                     return Effect::default();
                 }
                 let Some(t) = self.active_mut() else { return Effect::default() };
-                if on == t.blame.is_some() {
+                if on == t.annotating() {
                     return Effect::default();
                 }
-                t.blame = on.then(crate::blame::Blame::new);
+                // Inline blame's attribution becomes the column's, and stays when the column goes (it drops it
+                // itself once it is off).
+                match (on, t.blame.as_mut()) {
+                    (_, Some(b)) => b.column = on,
+                    (true, None) => t.blame = Some(crate::blame::Blame::new()),
+                    (false, None) => {}
+                }
                 let id = t.id;
-                if !on && let Some(buffer) = t.buffer { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                if !on && !self.state.settings.inline_blame {
+                    if let Some(t) = self.tab_mut(id) { t.blame = None; }
+                    if let Some(buffer) = self.tab_mut(id).and_then(|t| t.buffer) { self.analysis.cancel_consumer(buffer, crate::analysis::Consumer::Blame(id)); }
+                }
                 self.annotate(id);
                 repaint
             }
@@ -5465,6 +5993,7 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::MoveCaret(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 if doc.source_meta().image().is_some() && !t.image_source { return Effect::default(); }
                 let s = t.selection().unwrap_or_else(|| {
@@ -5479,8 +6008,8 @@ impl Session {
                     Motion::Right if s.anchor != s.head => s.anchor.max(s.head),
                     Motion::Left if s.head <= range.start && line > 0 => doc.reader_line_range(visible.step(line,-1)).end,
                     Motion::Right if s.head >= range.end && visible.step(line,1) > line => doc.reader_line_range(visible.step(line,1)).start,
-                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion)),
-                    _ => moved(&doc, &visible, s.head, motion),
+                    Motion::Up | Motion::Down => wrapped.unwrap_or_else(|| moved(&doc, &visible, s.head, motion, spaces)),
+                    _ => moved(&doc, &visible, s.head, motion, spaces),
                 };
                 let head = if visible.hidden(doc.line_of(head)) { doc.reader_line_range(visible.shown(doc.line_of(head))).end } else { head };
                 t.place_selection(Some(Selection {anchor:head,head}));
@@ -5499,12 +6028,13 @@ impl Session {
                         crate::layout::Query::Pending(work) => return self.defer_layout(view.tab().id(), work, LayoutPurpose::Command(Command::Extend(motion))),
                     }
                 } else { None };
+                let spaces = self.state.settings.mac_word_motion;
                 let Some(t) = self.active_mut() else { return Effect::default() };
                 let s = t.selection().unwrap_or_else(|| {
                     let origin = if wrap_cols.is_none() { doc.reader_line_range(t.top_line).start } else { 0 };
                     Selection { anchor: origin, head: origin }
                 });
-                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion));
+                let head = wrapped.unwrap_or_else(|| moved(&doc, &t.visible_for(&doc), s.head, motion, spaces));
                 let line = doc.line_of(head);
                 // Keep the head on screen as far as the core knows the view: at or below the top line, and below the
                 // sticky lines.
@@ -5574,6 +6104,46 @@ impl Session {
                 let at = self.state.view(t.id).map_or(0, |view| t.selection().map_or(0, |s| view.snapshot().line_of(s.head)) + 1);
                 Effect { repaint: false, copy: Some(if line { format!("{path}:{at}") } else { path }), ..Effect::default() }
             }
+            Command::CopyReference => {
+                let Some(t) = self.state.active().filter(|t| !t.untitled()) else { return Effect::default() };
+                let relative = self.state.project.as_ref().and_then(|p| t.source.strip_prefix(p.root()).ok())
+                    .map(|relative| relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+                let reference = self.state.view(t.id).and_then(|view| {
+                    let doc = view.snapshot();
+                    let at = t.selection().map_or_else(|| doc.reader_line_range(t.top_line).start, |s| s.head);
+                    match view.declarations() {
+                        Some(declarations) => crate::reference::qualified_name(doc, declarations, at, relative.as_deref()),
+                        // Right after an edit the declarations are still being extracted: this explicit action
+                        // extracts them once itself rather than copy a path where a name was asked for.
+                        None if !doc.is_large() => {
+                            let text: Arc<str> = doc.copy_range(0..doc.len_bytes())?.into();
+                            let declarations = lenz_content::highlight::declarations_while(doc.language()?, text, || true)?;
+                            crate::reference::qualified_name(doc, &declarations, at, relative.as_deref())
+                        }
+                        None => None,
+                    }
+                });
+                match reference {
+                    Some(name) => Effect { repaint: false, copy: Some(name), ..Effect::default() },
+                    None => self.command(Command::CopyPath { line: true }),
+                }
+            }
+            Command::GoToTest => {
+                let Some((root, rel, found)) = self.state.active().filter(|t| !t.untitled()).and_then(|t| {
+                    let project = self.state.project.as_ref()?;
+                    let rel = project.relative(&t.source)?;
+                    let paths = project.paths();
+                    Some((project.root().to_owned(), rel.clone(), crate::relevant::counterpart(&rel, paths.iter().map(|p| &**p))))
+                }) else { return Effect::default() };
+                match found {
+                    Ok(other) => self.command(Command::Open(root.join(other))),
+                    Err(why) => {
+                        let name = rel.rsplit('/').next().unwrap_or(&rel).to_owned();
+                        self.state.messages.push(format!("Go to Test: {why}: {name}"));
+                        Effect { repaint: true, ..Effect::default() }
+                    }
+                }
+            }
             Command::CopyText(text) => Effect { repaint: false, copy: (!text.is_empty()).then_some(text), ..Effect::default() },
             Command::Notice(text) => {
                 self.state.messages.push(text);
@@ -5584,6 +6154,7 @@ impl Session {
             Command::ToggleComment => self.toggle_comment(),
             Command::MoveLines { down } => self.move_lines(down),
             Command::DuplicateLines { down } => self.duplicate_lines(down),
+            Command::DeleteLines => self.delete_lines(),
             Command::InsertText { text, kind } => self.insert_text(text, kind),
             Command::AddCursorBelow => self.add_cursor(true),
             Command::AddCursorAbove => self.add_cursor(false),
@@ -5867,6 +6438,19 @@ impl Session {
                 self.synced = 0;
                 repaint
             }
+            Command::SetProjectToolsTrusted(trusted) => {
+                if self.state.runtime_saving.is_some() || self.state.provider_saves > 0 { return Effect::default(); }
+                let Some(real) = self.project_real.clone() else { return Effect::default() };
+                self.state.trust_prompt = None;
+                self.set_folder_trust(real, trusted, false)
+            }
+            Command::TrustChoice(choice) => self.choose_trust(choice),
+            Command::TrustFocus(to) => self.move_trust_focus(to),
+            Command::OpenFolderTrust => {
+                if self.disabled(CommandId::FolderTrust).is_some() { return Effect::default(); }
+                if self.state.trust_prompt.is_none() { self.open_trust_prompt(None); }
+                repaint
+            }
             Command::CancelSemantic => {
                 let asked = self.state.asking.take().is_some() | self.cancel_format_by_user();
                 self.state.semantics.cancel();
@@ -5885,6 +6469,14 @@ impl Session {
                 repaint
             }
             Command::ExcludeRubyTooling => self.save_project_provider(Some(true)),
+            Command::SetMavenProfiles(input) => self.save_maven_profiles(&input),
+            Command::IncludeInBuild => match (self.maven_suggestion(), self.maven_project()) {
+                (Some((profile, _)), Ok(project)) => {
+                    let list = project.active.iter().cloned().chain(std::iter::once(profile)).collect::<Vec<_>>().join(", ");
+                    self.save_maven_profiles(&list)
+                }
+                _ => Effect::default(),
+            },
             Command::SetRubyToolingExclusions(on) => self.save_project_provider(Some(on)),
             Command::ResetProjectServerSettings => self.save_project_provider(None),
             Command::SetPersistentIndex(on) => {
@@ -5929,6 +6521,9 @@ impl Session {
     /// Idle servers stop; running ones have their process groups' memory sampled off the UI thread.
     fn tick(&mut self) -> Effect {
         let mut repaint = self.state.semantics.expire();
+        // Folder trust changed in another window: only the settings file's time and size are checked here (never
+        // while this window's own save is being written).
+        repaint |= self.trust_changed_elsewhere();
         // No repository yet, but a `.git` appeared (git init, a clone): look again. A file check, no git process.
         if self.state.repo.is_none()
             && self.state.repo_checked()
@@ -6007,6 +6602,21 @@ impl Session {
         if let Some(pending) = self.pending_doc.take() { self.analysis.cancel_consumer(pending.source.key.buffer, crate::analysis::Consumer::Documentation); }
     }
 
+    /// Folder trust changed in another window: its servers stop and are chosen again, as after this window's own answer.
+    /// Only the settings file's time and size are checked (never while this window's own save is being written).
+    fn trust_changed_elsewhere(&mut self) -> bool {
+        let asked = self.state.trust_prompt.as_ref().map(|p| (p.real.clone(), self.state.semantics.settings().trust(&p.real)));
+        if self.state.runtime_saving.is_some() || self.state.provider_saves > 0 || !self.state.semantics.settings_changed() { return false; }
+        // An open dialog the other window's answer settled closes: answering it here would overwrite that answer.
+        if let Some((real, was)) = asked && self.state.semantics.settings().trust(&real) != was {
+            self.state.trust_prompt = None;
+        }
+        self.state.asking = None;
+        self.cancel_semantic_analysis();
+        self.synced = 0;
+        true
+    }
+
     fn cancel_semantic_analysis(&mut self) {
         for tab in &mut self.state.tabs { tab.tokens = None; tab.held_tokens = None; }
         self.decor_generation[Decor::Tokens as usize] += 1;
@@ -6040,13 +6650,13 @@ impl Session {
                 semantics::Lane::CodeAction => self.pending_code_action.as_ref().is_some_and(|p| p.request() == wait.request),
                 semantics::Lane::Format => self.state.formatting.as_ref().is_some_and(|f| f.request() == wait.request),
                 semantics::Lane::AutoInsert => self.pending_auto_insert.as_ref().is_some_and(|p| p.request() == wait.request),
-                semantics::Lane::CompletionDetail => false,
+                semantics::Lane::CompletionDetail | semantics::Lane::Rename => false,
             };
             if !current || !requested {
                 if requested { match lane { semantics::Lane::Foreground => { self.state.asking = None; repaint = true; }, semantics::Lane::Hover => self.cancel_documentation(), semantics::Lane::Highlight => self.pending_highlight = None, semantics::Lane::Completion => self.cancel_completion(), semantics::Lane::Signature => self.cancel_signature(), semantics::Lane::CodeAction => self.cancel_code_action(), semantics::Lane::Format => {
                     let why = if self.state.formatting.as_ref().is_some_and(|f| f.tool()) { "the file changed before the project's formatter could run" } else { "the file changed before the language server could be asked" };
                     repaint |= self.format_unavailable(why.into()).repaint;
-                } semantics::Lane::AutoInsert => self.cancel_auto_insert(), semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail => {} } }
+                } semantics::Lane::AutoInsert => self.cancel_auto_insert(), semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::Rename => {} } }
                 continue;
             }
             let Some(doc) = self.admitted_document(wait.tab, Priority::Visible) else { self.semantic_wait.insert(lane, wait); continue };
@@ -6067,7 +6677,7 @@ impl Session {
                     semantics::Lane::Signature => { let manual = self.pending_signature.as_ref().map(|p| p.manual()); if let Some(manual) = manual { repaint |= self.signature_unavailable(manual, why).repaint; } }
                     semantics::Lane::CodeAction => { if self.pending_code_action.is_some() { repaint |= self.code_action_unavailable(why).repaint; } }
                     semantics::Lane::Format => repaint |= self.format_unavailable(why).repaint,
-                    semantics::Lane::Foreground | semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::AutoInsert => {}
+                    semantics::Lane::Foreground | semantics::Lane::Hierarchy | semantics::Lane::CompletionDetail | semantics::Lane::AutoInsert | semantics::Lane::Rename => {}
                 }
             }
         }
@@ -6084,6 +6694,28 @@ impl Session {
     /// Ask about `offset` of `doc` (a snapshot a tab holds).
     fn ask_at(&mut self, tab: TabId, offset: usize, ask: Ask) -> Effect {
         if self.state.tabs.iter().any(|t| t.id == tab && t.read_only_side().is_some()) { return Effect::default(); }
+        // `this` names the class around it: land on that class's name, as IntelliJ does (JDT LS answers nothing).
+        // Before any wait for the server: a busy one may not hold this text yet.
+        // A newer ask supersedes a `this` parse still running.
+        self.this_latest.fetch_add(1, Ordering::Relaxed);
+        if ask == Ask::Definition && self.state.active == Some(tab) && let Some((at, language)) = self.this_at(tab, offset) {
+            if let Some(name) = self.state.view(tab).and_then(|v| v.declarations().and_then(|d| this_class(d, at))) { return self.select_in_active(name); }
+            // No parse held (breadcrumbs and sticky scroll off): one of its own, off the UI thread.
+            if let Some(view) = self.state.view(tab) {
+                let snapshot = view.snapshot();
+                let (version, text) = (snapshot.key().version, snapshot.copy_range(0..snapshot.len_bytes()).unwrap_or_default());
+                // Its own count: caret moves ask the server too (occurrences), and must not make this one stale.
+                let latest = self.this_latest.clone();
+                let request = latest.fetch_add(1, Ordering::Relaxed) + 1;
+                let tx = self.tx.clone();
+                self.jobs.submit(Priority::Visible, move || {
+                    let current = { let latest = latest.clone(); move || latest.load(Ordering::Relaxed) == request };
+                    let class = lenz_content::highlight::declarations_while(language, text.into(), current).and_then(|d| this_class(&d, at));
+                    let _ = tx.send_blocking(Completion::ThisClass { request, tab, version, class });
+                });
+                return Effect::default();
+            }
+        }
         self.semantic_seq += 1;
         let request = self.semantic_seq;
         self.semantic_wait.remove(&semantics::Lane::Foreground);
@@ -6117,6 +6749,38 @@ impl Session {
             }
         }
         Effect { repaint: true, copy: None, ..Effect::default() }
+    }
+
+    /// For `this` at `offset` (in a language where it names the enclosing class), that class's name, from the parse the
+    /// document's tab holds for this version (for breadcrumbs and sticky scroll, both on by default). `None`: not
+    /// `this`, or no current parse (the server is asked as for any name). shortcut: an anonymous class's `this` lands
+    /// on the named class around it; upgrade when declarations record anonymous classes.
+    fn this_at(&self, tab: TabId, offset: usize) -> Option<(u32, highlight::Language)> {
+        use highlight::Language as L;
+        let snapshot = self.state.view(tab)?.snapshot();
+        let language = snapshot.language()?;
+        if !matches!(language, L::Java | L::Kotlin | L::JavaScript | L::TypeScript | L::Tsx | L::CSharp | L::Cpp) { return None; }
+        let line = snapshot.line_range(snapshot.line_of(offset))?;
+        let text = snapshot.copy_range(line.clone())?;
+        let col = offset.checked_sub(line.start)?;
+        let word = crate::document::identifier(&text, col).or_else(|| col.checked_sub(1).filter(|c| text.is_char_boundary(*c)).and_then(|c| crate::document::identifier(&text, c)))?;
+        (text.get(word.clone()) == Some("this")).then_some(((line.start + word.start) as u32, language))
+    }
+
+    /// Select `range` of the active document and show it, as a jump Back returns from.
+    fn select_in_active(&mut self, range: std::ops::Range<usize>) -> Effect {
+        let from = self.here();
+        let Some(doc) = self.state.current() else { return Effect::default() };
+        let line = doc.line_of(range.start);
+        let byte = range.start - doc.line_range(line).map_or(range.start, |r| r.start);
+        let Some(t) = self.active_mut() else { return Effect::default() };
+        t.place_selection(Some(Selection { anchor: range.start, head: range.end }));
+        t.expansion = None;
+        t.reveal(line);
+        let id = t.id;
+        self.bring_into_view(id, line, byte);
+        if let Some(to) = self.here() { self.visit(from, to); }
+        Effect { repaint: true, ..Effect::default() }
     }
 
     /// A type hierarchy built from usages and syntax (the server offers none): the name at `offset` is the root.
@@ -6376,6 +7040,59 @@ impl Session {
         self.jobs.submit(Priority::Background, move || { let ok = settings.save(&file); let _ = tx.send_blocking(Completion::ProviderSettingsSaved { ok }); });
     }
 
+/// The active file's Maven project for JDT LS: its root, the profiles its pom.xml declares, and those Lenz activates
+    /// for the import (or why Maven Profiles… does not apply).
+    pub fn maven_project(&self) -> Result<MavenProject, &'static str> {
+        let doc = self.state.current_source().ok_or("No file is open")?;
+        let (provider, root) = self.state.project_provider().ok_or("Open a Java file in a Maven project")?;
+        if semantics::provider::PROVIDERS[provider].id != "jdtls" || doc.language() != Some(highlight::Language::Java) { return Err("Open a Java file in a Maven project"); }
+        let pom = root.join("pom.xml");
+        if !pom.is_file() { return Err("This Java project has no pom.xml"); }
+        let xml = semantics::maven::settings_path(self.state.semantics.settings_file(), &root);
+        let active = match semantics::provider::maven_settings_owner(self.state.semantics.settings(), &root, &xml) {
+            Some(false) => return Err(semantics::provider::OWN_MAVEN_SETTINGS),
+            Some(true) => self.maven_files.get(&xml, semantics::maven::active_in),
+            None => Vec::new(),
+        };
+        Ok(MavenProject { available: self.maven_files.get(&pom, semantics::maven::pom_profiles), active, root, xml })
+    }
+
+    /// The active file is outside the build, and an inactive Maven profile of its project adds its folder: that profile
+    /// and the folder as the pom.xml names it.
+    pub fn maven_suggestion(&self) -> Option<(String, String)> {
+        if self.state.outside_build().is_none_or(|o| o.no_project) { return None; }
+        let project = self.maven_project().ok()?;
+        let file = self.state.current_source()?.source();
+        let sources = self.maven_sources.get(&project.root.join("pom.xml"), semantics::maven::pom_profile_sources);
+        semantics::maven::profile_for(&sources, &project.root, file).filter(|(p, _)| !project.active.contains(p))
+    }
+
+    /// What Maven Profiles… asks for: the active profiles as a list, and the profiles the pom.xml declares.
+    pub fn maven_profiles_prompt(&self) -> String {
+        match self.maven_project() {
+            Ok(p) => format!("pom.xml declares: {}. Comma-separated; empty uses the project's defaults. Saving restarts Eclipse JDT LS, which re-imports the project.", p.available.join(", ")),
+            Err(why) => why.into(),
+        }
+    }
+
+    fn save_maven_profiles(&mut self, input: &str) -> Effect {
+        if self.disabled(CommandId::MavenProfiles).is_some() { return Effect::default(); }
+        let Ok(project) = self.maven_project() else { return Effect::default() };
+        let profiles = semantics::maven::parse_list(input);
+        if let Some(unknown) = profiles.iter().find(|p| !project.available.contains(p)) {
+            self.state.messages.push(format!("Maven profiles were not changed: {unknown} is not a profile of this pom.xml (it declares {})", project.available.join(", ")));
+            return Effect { repaint: true, ..Effect::default() };
+        }
+        if profiles == project.active { return Effect::default(); }
+        let (file, tx) = (self.state.semantics.settings_file().to_owned(), self.tx.clone());
+        self.state.provider_saves += 1;
+        self.jobs.submit(Priority::Visible, move || {
+            let result = semantics::provider::set_maven_profiles(&file, &project.root, &project.xml, &profiles);
+            let _ = tx.send_blocking(Completion::MavenProfilesSaved { root: project.root, profiles, result });
+        });
+        Effect { repaint: true, ..Effect::default() }
+    }
+
     fn save_project_provider(&mut self, excluded: Option<bool>) -> Effect {
         let reset = excluded.is_none();
         let id = if reset { CommandId::ResetProjectServerSettings } else { CommandId::ExcludeRubyTooling };
@@ -6420,9 +7137,15 @@ impl Session {
         let mut resolve = |provider: usize, dir: PathBuf, file: PathBuf, over: Option<PathBuf>, settings: semantics::provider::Settings| {
             let (tx, browse) = (tx.clone(), browse.clone());
             jobs.submit(Priority::Background, move || {
-                let root = over.or_else(|| (semantics::provider::PROVIDERS[provider].root)(&file, browse.as_deref()));
-                let serve = root.as_deref().map_or(provider, |r| semantics::provider::serving(provider, r, &settings));
-                let _ = tx.send_blocking(Completion::Semantic(semantics::Event::Resolved { root_epoch, provider, dir, root, serve }));
+                // No lookup above the opened folder (else the trusted folder holding the file, else its own folder).
+                let within = semantics::provider::lookup_bound(&file, browse.as_deref(), &settings);
+                let root = over.or_else(|| (semantics::provider::PROVIDERS[provider].root)(&file, browse.as_deref(), within.as_deref()));
+                // Trust is decided on the root with its links resolved; the project's own programs are found no higher
+                // than the trusted folder deciding it, nor than the opened folder.
+                let real = root.as_deref().and_then(|r| std::fs::canonicalize(r).ok());
+                let trusted = root.as_deref().and_then(|r| semantics::provider::trusted_bound(r, browse.as_deref().filter(|b| r.starts_with(b)).unwrap_or(r), &settings));
+                let serve = root.as_deref().map_or(provider, |r| semantics::provider::serving(provider, r, &settings, within.as_deref(), trusted.as_deref()));
+                let _ = tx.send_blocking(Completion::Semantic(semantics::Event::Resolved { root_epoch, provider, dir, root, serve, real, trusted }));
             });
         };
         // Only servers that run can be kept warm.
@@ -6431,13 +7154,13 @@ impl Session {
             true => {
                 let mut seen = std::collections::HashSet::new();
                 // A template keeps the servers of each of its embedded languages warm.
-                self.state.tabs.iter().filter(|t| t.is_file() && seen.insert(&t.source)).flat_map(|t| match crate::template::languages(&t.source) {
+                self.state.tabs.iter().filter(|t| t.is_file() && !is_virtual(&t.source) && seen.insert(&t.source)).flat_map(|t| match crate::template::languages(&t.source) {
                     [] => vec![(t.source.as_path(), t.language.unwrap_or_else(|| highlight::detect(&t.source, "")))],
                     languages => languages.iter().map(|l| (t.source.as_path(), Some(*l))).collect(),
                 }).collect()
             }
         };
-        let files: Vec<&Path> = self.state.tabs.iter().filter(|t| t.is_file()).map(|t| t.source.as_path()).collect();
+        let files: Vec<&Path> = self.state.tabs.iter().filter(|t| t.is_file() && !is_virtual(&t.source)).map(|t| t.source.as_path()).collect();
         self.state.semantics.sync(&docs, &held, &files, browse.as_deref(), &mut resolve, &self.tx);
     }
 
@@ -6472,7 +7195,7 @@ impl Session {
                     semantics::Lane::Foreground => state.asking.as_ref().is_some_and(|asking| asking.request == fence.request && asking.project == fence.project && asking.source == fence.source),
                     semantics::Lane::Hierarchy => state.results.as_ref().is_some_and(|r| Some(r.id) == fence.result_set && r.hierarchy.as_ref().is_some_and(|h| h.session == server && h.loading(fence.request) == fence.node
                         && fence.node.and_then(|node| h.nodes.get(node)).is_some_and(|node| Self::hierarchy_item_current(state, &node.call)))),
-                    semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert => false,
+                    semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert | semantics::Lane::Rename => false,
                 }
             }
         }
@@ -6587,7 +7310,7 @@ impl Session {
                         && let Some(node) = h.loading(fence.request).filter(|node| Some(*node) == fence.node)
                     { h.failed(node, fence.request, why); r.rebuild_hierarchy(); return Effect { repaint: true, copy: None, ..Effect::default() }; }
                 }
-                semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert => {}
+                semantics::Lane::Hover | semantics::Lane::Highlight | semantics::Lane::Completion | semantics::Lane::CompletionDetail | semantics::Lane::Signature | semantics::Lane::CodeAction | semantics::Lane::Format | semantics::Lane::AutoInsert | semantics::Lane::Rename => {}
             },
         }
         Effect::default()
@@ -6611,6 +7334,7 @@ impl Session {
             semantics::Lane::Signature => return self.signature_reply(reply),
             semantics::Lane::CodeAction => return self.code_action_reply(reply),
             semantics::Lane::Format => return self.format_reply(reply),
+            semantics::Lane::Rename => return self.rename_reply(reply),
             semantics::Lane::AutoInsert => return self.auto_insert_reply(reply),
         }
         let project = self.state.project.as_ref().map_or(0, |p| p.generation());
@@ -6670,6 +7394,7 @@ impl Session {
         let origin = self.state.semantics.origin(session).unwrap_or_else(|| provider.to_string());
         let limit = if ask.question() == semantics::Question::Definition { semantics::TARGET_LIMIT } else { semantics::USAGE_LIMIT };
         let asked_path = asking.at.as_ref().filter(|_| ask == Ask::FileSymbols).map(|(path, _, _)| path.clone());
+        let by_name = matches!(ask, Ask::Definition | Ask::Peek).then(|| self.ruby_by_name(session, asking.at.as_ref())).flatten();
         let fence = crate::analysis::ResultFence { slot: crate::analysis::ResultSlot::Semantic { server: session, lane: reply.lane }, project, request, stage: crate::analysis::ResultStage::Targets, result_set: None, node: None, source: asking.source.clone() };
         let semantics = &self.state.semantics;
         if self.analysis.request_result(fence.clone(), Priority::Visible, || {
@@ -6695,11 +7420,27 @@ impl Session {
                     (Ask::FileSymbols, None) => semantics::Targets { failed: vec!["the file is no longer open in the language server; ask again".into()], ..Default::default() },
                     _ => semantics::targets_while(&value, limit, encoding, provider, session, &open, &read, &|| lease.wanted()),
                 };
+                if let Some(by_name) = &by_name { by_name.add(&mut targets, limit, &read, &|| lease.wanted()); }
                 semantics::capture_target_digests(targets.found.iter_mut());
                 lease.send(Completion::Targets { request, session, provider, origin, indexing, targets });
             }
         }).is_err() { return self.result_failed(&fence, "semantic analysis capacity is full".into()); }
         Effect::default()
+    }
+
+    /// For a Ruby definition: the method name at the asked place, the project's Ruby files and the gem folders of the
+    /// bundle `session` serves (once it has listed them), for declarations its index misses (see [`ByName`]).
+    fn ruby_by_name(&self, session: u64, at: Option<&(PathBuf, usize, u64)>) -> Option<ByName> {
+        let (gems, index) = self.state.semantics.gem_roots(session)?;
+        let (path, offset, _) = at?;
+        let doc = self.state.current_source().filter(|d| d.source() == path.as_path() && d.language() == Some(lenz_content::highlight::Language::Ruby))?;
+        let line = doc.reader_line_range(doc.line_of(*offset));
+        let word = doc.word_at(*offset);
+        let text = doc.copy_range(line.start..line.end.min(line.start + 4096))?;
+        let name = crate::ruby_declarations::method_name(&text, word.start.checked_sub(line.start)?..word.end.checked_sub(line.start)?)?;
+        let project = self.state.project.as_ref().filter(|p| path.starts_with(p.root()));
+        let files = project.map(|p| p.paths().iter().filter(|r| r.ends_with(".rb")).map(|r| p.root().join(&**r)).collect()).unwrap_or_default();
+        Some(ByName { name, gems, index, files, root: project.map(|p| p.root().to_owned()) })
     }
 
     /// One server's answer to the current request arrived (or failed): the request ends with the last one.
@@ -6736,6 +7477,12 @@ impl Session {
 
     fn complete_source(&mut self, completion: Completion, buffer: Option<crate::text::BufferId>) -> Effect {
         match completion {
+            Completion::WorkspacePrepared { request, apply, result } => self.workspace_prepared(request, apply, result),
+            Completion::ArchiveListed(listed) => self.archive_listed(listed),
+            Completion::ArchiveLoaded(loaded) => self.archive_loaded(*loaded),
+            Completion::ArchiveSaved(saved) => self.archive_saved(*saved),
+            Completion::ArchiveRechecked(reply) => self.archive_rechecked(*reply),
+            Completion::ArchiveRecovered { ticket, result } => self.restore_archive_loaded(ticket, result),
             Completion::TerminalStarted { id, generation, result } => self.terminal_started(id, generation, result),
             Completion::TerminalWake { id, generation } => self.terminal_wake(id, generation),
             Completion::ExplorerCopied { request, result } => self.explorer_copied(request, result),
@@ -6792,6 +7539,32 @@ impl Session {
                 if !ok { self.state.messages.push("Could not save language server settings".into()); }
                 Effect { repaint: true, copy: None, ..Effect::default() }
             }
+            Completion::ThisClass { request, tab, version, class } => {
+                // Only the latest ask, about the text still shown.
+                if request != self.this_latest.load(Ordering::Relaxed) || self.state.active != Some(tab) || self.state.view(tab).is_none_or(|v| v.snapshot().key().version != version) { return Effect::default(); }
+                match class {
+                    Some(name) => self.select_in_active(name),
+                    None => { self.state.messages.push(format!("{}: no class around `this`", Ask::Definition.label())); Effect { repaint: true, ..Effect::default() } }
+                }
+            }
+            Completion::MavenProfilesSaved { root, profiles, result } => {
+                self.state.provider_saves = self.state.provider_saves.saturating_sub(1);
+                match result {
+                    Ok(()) => {
+                        if let Some((provider, _)) = semantics::provider::for_language(highlight::Language::Java) {
+                            self.cancel_semantic_analysis();
+                            self.state.semantics.reload_project(provider, &root);
+                            self.synced = 0;
+                        }
+                        let which = if profiles.is_empty() { "its default profiles only".to_owned() } else { profiles.join(", ") };
+                        // The folder's name: a status message never carries a full path.
+                        let project = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+                        self.state.messages.push(format!("Maven profiles for {project}: {which}. Eclipse JDT LS restarts and imports the project with them."));
+                    }
+                    Err(why) => self.state.messages.push(format!("Maven profiles were not changed: {why}")),
+                }
+                Effect { repaint: true, copy: None, ..Effect::default() }
+            }
             Completion::ProjectProviderSaved { provider, root, reset, result } => {
                 self.state.provider_saves = self.state.provider_saves.saturating_sub(1);
                 match result {
@@ -6819,7 +7592,7 @@ impl Session {
             Completion::ServerInstalled { request, result } => self.server_installed(request, result),
             Completion::ServerRuntimes { request, paths } => {
                 if request != self.runtime_request { return Effect::default(); }
-                if let Some(model) = &mut self.state.server_runtime { model.candidates = paths; model.message = format!("Enter {}, or choose an installed runtime below", model.kind.input_label()); }
+                if let Some(model) = &mut self.state.server_runtime { model.message = if paths.is_empty() { format!("No installed {} runtime was found. Type the path to its executable or install folder above.", model.kind.label()) } else { String::new() }; model.candidates = paths; }
                 Effect { repaint: true, copy: None, ..Effect::default() }
             }
             Completion::ProjectFormatted { request, result } => self.project_formatted(request, result),
@@ -6844,6 +7617,7 @@ impl Session {
                         self.state.semantics.reload_runtime(kind.provider());
                         self.synced = 0;
                         if let Some(model) = &mut self.state.server_runtime { model.configured = path; }
+                        self.refresh_install_runtime(kind.provider());
                         format!("{} runtime saved. Enabled {} language servers are restarting.", kind.label(), kind.provider())
                     }
                     Err(why) => format!("{} runtime was not changed: {why}", kind.label()),
@@ -7041,11 +7815,26 @@ impl Session {
             }
             Completion::ReconcileRead { ticket, result } => self.reconcile_read(ticket, result),
             Completion::ReconcileChecked { ticket, choice, result } => self.reconcile_checked(ticket, choice, result),
-            Completion::Branches { request, root, result } => match self.state.branches.as_mut().filter(|_| request == self.branches_requests && self.state.repo.as_ref().is_some_and(|r| r.root == root)) {
+            Completion::BranchTracking { request, root, result } => {
+                let current = request == self.branches_requests.load(Ordering::Relaxed) && self.state.repo.as_ref().is_some_and(|r| r.root == root);
+                let (Some(v), Ok(track)) = (self.state.branches.as_mut().filter(|_| current), result) else { return Effect::default() };
+                if let Some((cached, refs, _)) = self.branches_cache.as_mut().filter(|(cached, ..)| *cached == root) { let _ = cached; refs.track = track.clone(); }
+                v.refs.track = track;
+                Effect { repaint: true, copy: None, ..Effect::default() }
+            }
+            Completion::Branches { request, root, result } => match self.state.branches.as_mut().filter(|_| request == self.branches_requests.load(Ordering::Relaxed) && self.state.repo.as_ref().is_some_and(|r| r.root == root)) {
                 Some(v) => {
                     v.loading = false;
                     match result {
-                        Ok((refs, worktrees)) => (v.refs, v.worktrees) = (refs, worktrees),
+                        Ok((mut refs, worktrees)) => {
+                            // The last counts stay until the fresh ones are read, for the branches still there.
+                            refs.track = std::mem::take(&mut v.refs.track).into_iter().filter(|(b, _)| refs.upstream.contains_key(b)).collect();
+                            if !v.worktrees_only && !v.revisions_only {
+                                self.branches_cache = Some((root, refs.clone(), worktrees.clone()));
+                            }
+                            (v.refs, v.worktrees) = (refs, worktrees);
+                            v.has_snapshot = true;
+                        }
                         Err(e) => v.error = Some(e),
                     }
                     let none = v.worktrees_only && v.error.is_none() && self.state.branch_rows("").is_empty();
@@ -7105,11 +7894,10 @@ impl Session {
                         });
                         let f = t.find.as_mut().expect("checked above");
                         f.current = f.at_or_after(at.0, at.1);
-                        if f.reveal {
-                            self.show_match(tab)
-                        } else {
-                            Effect { repaint: true, ..Effect::default() }
-                        }
+                        let mut effect = if f.reveal { self.show_match(tab) } else { Effect::default() };
+                        // Completion changes the counter even when there is no match to reveal.
+                        effect.repaint = true;
+                        effect
                     }
                 }
             }
@@ -7581,7 +8369,7 @@ impl Session {
                 }
                 self.changed(change)
             }
-            Completion::Refreshed { tab, token, result } => self.refreshed(tab, token, result),
+            Completion::Refreshed { tab, token, baseline, result } => self.refreshed(tab, token, baseline, result),
             Completion::Watch { key, folders } => {
                 if self.watching.as_ref() == Some(&key) {
                     self.inventory_folders = Some((key.0.clone(), folders.clone()));
@@ -7597,8 +8385,11 @@ impl Session {
                 for d in std::mem::take(&mut outcome.decorations) {
                     self.decode(d);
                 }
+                // Held back in the open folder, on its own answer: the dialog asks once.
+                for (real, runs) in self.state.semantics.take_trust_wanted() { self.want_trust(&real, runs); }
                 let mut effect = Effect { repaint: outcome.repaint || !self.state.semantics.notices.is_empty(), copy: None, ..Effect::default() };
                 self.state.messages.append(&mut self.state.semantics.notices);
+                for row in std::mem::take(&mut self.state.semantics.logged) { self.state.messages.record(&row); }
                 if outcome.ready {
                     // Documents open in the server before a waiting request is sent about them.
                     self.synced = 0;
@@ -7625,6 +8416,7 @@ impl Session {
                     // waiting forever.
                     if let Some(why) = self.state.provider().and_then(|v| match v.status {
                         semantics::Status::Missing(w) | semantics::Status::Failed(w) => Some(w),
+                        semantics::Status::Restricted(_) => Some(semantics::provider::RESTRICTED.to_owned()),
                         _ => None,
                     }) && self.state.asking.as_ref().is_some_and(|a| a.ask != Ask::Symbols)
                     {
@@ -7879,7 +8671,6 @@ impl Session {
         if found.is_empty() {
             if targets.unavailable.is_empty() && targets.failed.is_empty() {
                 let note = if indexing { " (it may still be loading or indexing its workspace; try again shortly)" } else { "" };
-                let limits = semantics::provider::PROVIDERS.iter().find(|p| p.name == provider).map_or(String::new(), |p| format!(". Known limits: {}", p.limits));
                 let what = match ask {
                     Ask::Usages => "no usages",
                     Ask::FileSymbols => "no symbols in this file",
@@ -7887,7 +8678,14 @@ impl Session {
                     Ask::TypeDefinition => "no type definition here",
                     _ => "no definition here",
                 };
-                self.state.messages.push(format!("{label}: {provider} found {what}{note}{limits}"));
+                // Its known limits are in Server Details (F2), not repeated in every such notice. A file outside the build
+                // is the reason itself: the server checks only its syntax.
+                let note = match self.maven_suggestion() {
+                    Some((profile, _)) => format!(" (this file is outside the build; the Maven profile {profile} adds it: F2)"),
+                    None if self.state.outside_build().is_some() => " (this file is outside the build: only its syntax is checked)".into(),
+                    None => note.to_owned(),
+                };
+                self.state.messages.push(format!("{label}: {provider} found {what}{note}"));
             }
             return Effect { repaint: true, copy: None, ..Effect::default() };
         }
@@ -8137,6 +8935,7 @@ impl Session {
     /// Keep tree activation out of the dispatcher used by scrolling and startup.
     #[cold]
     fn activate_tree(&mut self, path: Arc<str>, retain: bool) -> Effect {
+        if let Some(effect) = self.activate_archive_tree(&path, retain) { return effect; }
         let Some(row) = self.state.tree_rows().find(|r| r.path == path).cloned() else { return Effect::default() };
         if row.dir.is_some() {
             return if retain { Effect::default() } else { self.command(Command::ToggleDir(path.to_string())) };
@@ -8481,13 +9280,22 @@ impl Session {
         self.check(id, None);
     }
 
+    fn refresh_baseline(&self, id: TabId) -> RefreshBaseline {
+        RefreshBaseline(self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer)
+            .and_then(|buffer| self.state.sources.buffers.get(&buffer))
+            .and_then(|entry| entry.draft.as_ref().map(|draft| &draft.baseline).or(entry.snapshot.as_ref()))
+            .map(|source| SemanticSource::new(source)))
+    }
+
     /// Check tab `id` off the UI thread. With `moved_to`, follow the rename when the file there is the same file
     /// (identity) and nothing new took its old place; otherwise check the old path like any refresh.
     fn check(&mut self, id: TabId, moved_to: Option<PathBuf>) {
+        if let Some(location) = self.state.tabs.iter().find(|tab| tab.id == id).and_then(|tab| crate::archive::Location::from_uri(&tab.source)) { self.check_archive(id, location); return; }
         let replacement = self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer).is_some_and(|buffer| self.replacement_current(buffer));
         let snapshot = self.state.tabs.iter().find(|t| t.id == id).and_then(|t| t.buffer)
             .and_then(|buffer| self.state.sources.buffers.get(&buffer))
             .and_then(|entry| entry.draft.as_ref().map(|draft| draft.baseline.clone()).or_else(|| entry.snapshot.clone()));
+        let baseline = RefreshBaseline(snapshot.as_deref().map(SemanticSource::new));
         let token = self.next_refresh();
         let Some(t) = self.tab_mut(id) else { return };
         t.refresh = token;
@@ -8515,7 +9323,7 @@ impl Session {
                     Err(ReadError::Failed(why)) => Refresh::Gone(why),
                 }
             } else { check(&path, stamp, shown.as_ref(), &versions) };
-            let _ = tx.send_blocking(Completion::Refreshed { tab: id, token, result });
+            let _ = tx.send_blocking(Completion::Refreshed { tab: id, token, baseline, result });
         });
     }
 
@@ -8524,8 +9332,15 @@ impl Session {
         self.refresh_seq
     }
 
-    fn refreshed(&mut self, id: TabId, token: u64, result: Refresh) -> Effect {
+    fn refreshed(&mut self, id: TabId, token: u64, baseline: RefreshBaseline, result: Refresh) -> Effect {
         let Some(tab) = self.state.tabs.iter().find(|t| t.id == id && t.refresh == token) else { return Effect::default(); };
+        if baseline != self.refresh_baseline(id) {
+            // Save (or another confirmed baseline change) overtook this read. Its result may
+            // describe our own write as external. Check the current disk against the new
+            // baseline instead, so a genuine later external write is still detected.
+            self.check(id, None);
+            return Effect::default();
+        }
         let buffer = tab.buffer;
         let replacement = buffer.is_some_and(|buffer| self.replacement_current(buffer));
         if let Some(buffer) = buffer {
@@ -8647,13 +9462,13 @@ impl Session {
     /// navigation must not pay for them.
     fn rewatch(&mut self) {
         // An opened file cannot wait for inventory discovery or delivery, even in an already-known folder.
-        let mut immediate: std::collections::BTreeSet<_> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| t.source.parent()).map(Path::to_path_buf).collect();
+        let mut immediate: std::collections::BTreeSet<_> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| crate::archive::physical_path(&t.source).parent().map(Path::to_path_buf)).collect();
         if let Some(p) = &self.state.project { immediate.insert(p.root().to_owned()); }
         let _ = self.watcher.include(immediate);
         let project = self.state.project.as_ref().map(|p| (p.root().to_owned(), p.walk, p.files(), !p.refreshing() && !matches!(p.coverage(), project::Coverage::Scanning(_))));
         // Tabs inside the inventory's folders add nothing: opening one of the project's files costs no rebuild.
         let inside = |d: &Path| self.state.project.as_ref().is_some_and(|p| d == p.root() || d.strip_prefix(p.root()).is_ok_and(|r| p.has_dir(&r.to_string_lossy())));
-        let extra: std::collections::BTreeSet<PathBuf> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| t.source.parent()).filter(|d| !inside(d)).map(Path::to_path_buf).collect();
+        let extra: std::collections::BTreeSet<PathBuf> = self.state.tabs.iter().filter(|t| t.is_file()).filter_map(|t| crate::archive::physical_path(&t.source).parent().map(Path::to_path_buf)).filter(|d| !inside(d)).collect();
         let key: WatchKey = (project, extra);
         if self.watching.as_ref() == Some(&key) {
             return;
@@ -8736,6 +9551,9 @@ impl Session {
         self.restore_workspace = self.state.tabs.is_empty();
         self.state.explorer = Default::default(); self.state.explorer_search = Default::default(); self.state.workspace_revision += 1;
         self.state.libraries = Default::default();
+        self.archive_browser = Default::default();
+        self.state.archive_tree = Default::default();
+        self.state.tree_reveal = None;
         let root = normalized(&root);
         self.pending_goto = None;
         let generation = self.root_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8751,8 +9569,9 @@ impl Session {
         }
         self.results_back.clear();
         self.results_forward.clear();
-        // Project closure stops its language servers now.
+        // Project closure stops its language servers now, and a formatter's late answer is not this folder's.
         self.state.asking = None;
+        self.cancel_format();
         self.cancel_semantic_analysis();
         self.state.semantics.stop_all();
         self.synced = 0;
@@ -8761,6 +9580,10 @@ impl Session {
         self.state.missing.clear();
         self.places_file = None;
         self.state.project = Some(Project::new(root.clone(), generation, self.state.settings.folders_first));
+        // Trust is decided on the folder with its links resolved (one lookup as it opens); a dialog about the folder
+        // before it does not apply.
+        self.project_real = Some(std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone()));
+        self.state.trust_prompt = None;
         self.project_generation.store(generation, Ordering::Relaxed);
         self.state.index = DeclIndex::new(index::INDEX_BYTES);
         self.index_batch = None;
@@ -8839,7 +9662,7 @@ impl Session {
         }
         if n.scope == S::Symbols && n.query.is_empty() { parts.push("Type a symbol name".into()); }
         if let Some(message) = &n.message { parts.push(message.clone()); }
-        if n.scope == S::Recent { parts.push("Recent files · Delete forgets".into()); }
+        if n.scope == S::Recent { parts.push("Recent files · F6 forgets".into()); }
         parts.join(" · ")
     }
 
@@ -8861,6 +9684,8 @@ impl Session {
             symbols: if !query.is_empty() && matches!(scope, navigation::Scope::All | navigation::Scope::Symbols) { self.state.index.snapshot() } else { Vec::new() },
             recent,
             actions: if matches!(scope, navigation::Scope::All | navigation::Scope::Actions) { self.actions() } else { Vec::new() },
+            name_letters: self.state.settings.name_letter_search,
+            nearby: self.state.settings.rank_nearby_files,
         };
         // Recent files are bounded to fifty entries; populate immediately for Ctrl-E followed by Enter.
         if scope == navigation::Scope::Recent {
@@ -9175,6 +10000,50 @@ impl Session {
         self.native.issue(&self.state, tab, source);
     }
 
+    /// Save When Leaving a File: the tab another one replaces as the active tab is saved, while its draft is still
+    /// shown, if it is an edited file that can be saved. Its exact text is written (no format on save: a server's
+    /// answer would come for a tab no longer shown). Untitled documents and read-only, busy or blocked files are
+    /// left for the user; closing a tab is the close prompt's, not this.
+    fn save_on_leave(&mut self, tab: TabId) {
+        let saveable = self.state.tabs.iter().any(|t| t.id == tab && t.is_file() && !t.untitled()) && self.state.tab_dirty(tab) && self.save_disabled(tab).is_none();
+        if saveable { self.save(tab); }
+    }
+
+    /// Always Select Opened File: when the active file changes, its folders open (as the explorer's target button
+    /// does) and its row is offered to the adapters to select. A library's row waits for its folder to be read.
+    fn follow_active_file(&mut self) -> bool {
+        if !self.state.settings.always_select_opened_file { return false; }
+        let Some(rel) = self.state.active_in_tree() else { return false };
+        let mut repaint = false;
+        if self.followed.as_ref().is_none_or(|(path, _)| *path != rel) {
+            self.followed = Some((rel.clone(), false));
+            repaint |= self.command(Command::Locate).repaint;
+        }
+        if self.followed.as_ref().is_some_and(|(_, selected)| !selected) && self.state.tree_rows().any(|row| row.path == rel) {
+            let ticket = self.state.tree_follow.as_ref().map_or(1, |(_, t)| t + 1);
+            self.state.tree_follow = Some((rel.clone(), ticket));
+            self.followed = Some((rel, true));
+            repaint = true;
+        }
+        repaint
+    }
+
+    /// A navigation's landing kept clear of the sticky band ([`Session::band_goal`]): done once the tab shows its
+    /// placed caret with its declarations parsed and a laid-out pane; given up when sticky scroll is off. Whether the
+    /// view moved.
+    fn settle_band_goal(&mut self) -> bool {
+        let Some(id) = self.band_goal else { return false };
+        if !self.state.settings.sticky_scroll || !self.is_shown(id) { self.band_goal = None; return false; }
+        let Some(view) = self.state.view(id) else { return false };
+        let pane = view.tab().pane() as usize;
+        if view.tab().restore.is_some() || view.declarations().is_none() || self.state.text_size[pane].1 == 0 { return false; }
+        let Some(line) = view.tab().selection().map(|s| view.snapshot().line_of(s.head)) else { self.band_goal = None; return false };
+        self.band_goal = None;
+        let top = (view.tab().top_line(), view.tab().top_row());
+        self.clear_of_band(id, line, 0);
+        self.state.view(id).is_some_and(|v| (v.tab().top_line(), v.tab().top_row()) != top)
+    }
+
     /// Keep a known exact row below the sticky band. Cold layout resumes through the same bounded lane.
     fn clear_of_band(&mut self, tab: TabId, line: usize, row: usize) {
         use crate::layout::Query;
@@ -9227,6 +10096,12 @@ impl Session {
     /// [`Session::navigate`], optionally to source a language server returned (`retrieved`): its tab holds that
     /// snapshot and never reads the disk.
     fn navigate_to(&mut self, requested: PathBuf, retain: bool, restore: Option<Location>, record: bool, retrieved: Option<(RetrievedContent, semantics::VirtualSource)>) -> Effect {
+        if !is_virtual(&requested) && self.save_as_destination_reserved(&normalized(&requested)) {
+            self.state.messages.push("This destination is reserved by Save As; finish that operation before opening it.".into());
+            return Effect { repaint: true, copy: None, ..Effect::default() };
+        }
+        if !is_virtual(&requested) && lenz_archive::Kind::of(&requested.to_string_lossy()).is_some()
+            && let Ok(location) = crate::archive::Location::new(normalized(&requested), Vec::new()) { return self.browse_archive(location); }
         self.close_saved_comparison();
         self.open_seq += 1; // a result still being checked must not move the view after this
         // A jump to another file that has not landed is given up: it must not fire on that file's next open.
@@ -9238,7 +10113,7 @@ impl Session {
         }
         // Retrieved source is identified by its opaque URI, never a path; once its tab is gone it is not held.
         let virtual_source = is_virtual(&requested);
-        if virtual_source && retrieved.is_none() && !self.state.tabs.iter().any(|t| t.source == requested) {
+        if virtual_source && crate::archive::Location::from_uri(&requested).is_none() && retrieved.is_none() && !self.state.tabs.iter().any(|t| t.source == requested) {
             if requested.to_str().is_some_and(|p| p.starts_with(crate::tabs::UNTITLED)) {
                 self.state.messages.push("That untitled document was closed without a file".into());
                 return Effect { repaint: true, copy: None, ..Effect::default() };
@@ -9312,8 +10187,12 @@ impl Session {
                 Some(snapshot) => t.restore_to(to, &snapshot),
                 None => { t.restore = Some(to.clone()); t.top_line = to.top_line; }
             }
+            // Its line goes below the sticky headers of the declarations around it, once they are known.
+            self.band_goal = Some(id);
         }
-        if record && !same && let Some(to) = self.here() {
+        // A step for another tab, or for another line of this one (a definition in the same file, as Go to Line).
+        let moved = !same || from.as_ref().zip(restore.as_ref()).is_some_and(|(from, to)| from.line != to.line);
+        if record && moved && let Some(to) = self.here() {
             self.visit(from, to);
         }
         self.rewatch();
@@ -9464,6 +10343,7 @@ impl Session {
                 self.state.semantics.cancel();
             }
             if let Some(old) = self.state.active {
+                if self.state.settings.save_on_leave { self.save_on_leave(old); }
                 self.release(old);
             }
             self.state.active = Some(id);
@@ -9486,7 +10366,7 @@ impl Session {
                     // Check the kept snapshot is current off the UI thread before reusing it.
                     let (request, tx) = (self.next_request(), self.tx.clone());
                     self.pending = Some((id, false));
-                    self.state.loading = Some(path.clone());
+                    self.start_loading(path.clone());
                     self.jobs.submit(Priority::Visible, move || {
                         let stamp = Stamp::of(&path);
                         let _ = tx.send_blocking(Completion::Checked { request, tab: id, path, stamp });
@@ -9514,6 +10394,7 @@ impl Session {
             active: index(self.state.active), other: index(self.state.other), focused: self.state.focused,
             split: self.state.settings.split, layout: self.state.settings.layout, soft_wrap: self.state.settings.soft_wrap,
             expanded: project.expanded(), explorer: self.state.explorer.clone(),
+            archives: self.state.archive_tree.roots().to_vec(),
             tabs: tabs.into_iter().map(|t| crate::workspace::SavedTab { path: t.source.clone(), selection: t.selection(), top_line: t.top_line, top_row: t.top_row(), column: t.column, pane: t.pane, retained: t.retained, markdown_source: t.markdown_source, image_source: t.image_source }).collect(),
             missing: Vec::new(),
         };
@@ -9523,6 +10404,9 @@ impl Session {
 
     fn apply_workspace(&mut self, mut saved: crate::workspace::Workspace) {
         let missing = std::mem::take(&mut saved.missing);
+        let archives = std::mem::take(&mut saved.archives);
+        self.archive_browser = Default::default();
+        self.state.archive_tree = Default::default();
         self.state.settings.split = saved.split; self.state.settings.layout = saved.layout; self.state.settings.soft_wrap = saved.soft_wrap;
         self.state.explorer = saved.explorer; self.state.workspace_revision += 1;
         if let Some(project) = &mut self.state.project { project.restore_expanded(saved.expanded); }
@@ -9541,6 +10425,11 @@ impl Session {
         self.state.active = None;
         if let Some(active) = active { self.activate(active); }
         self.load_other();
+        let explorer = self.state.explorer.clone();
+        for location in archives { self.browse_archive(location); }
+        self.state.explorer = explorer;
+        self.state.tree_reveal = None;
+        self.state.archive_tree.clear_reveal();
         self.rewatch();
         // After activation, which clears messages.
         if !missing.is_empty() {
@@ -9604,6 +10493,13 @@ impl Session {
             let last = !self.state.tabs.iter().any(|tab| tab.id != id && tab.buffer == Some(buffer) && self.is_shown(tab.id));
             let dirty = self.state.sources.buffers.get(&buffer).and_then(|entry| entry.draft.as_ref()).is_some_and(crate::draft::Draft::dirty);
             self.analysis.release_view(buffer, id, last && !dirty);
+            // An edited draft stays analysed, but this tab drops what was derived from it (below): with no other view
+            // holding them, those results must run again when it is shown, or it stays without syntax and semantic
+            // colours (each request would match the one already delivered).
+            if last && dirty { self.analysis.release_derived(buffer); }
+            // The semantic colours and hints go with the content below; with no other view of the file shown, they are
+            // asked again when it is: a version already asked about would otherwise never be asked again.
+            if last && let Some(source) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.source.clone()) { self.state.semantics.forget_path(&source); }
         }
         if let Some(t) = self.state.tabs.iter().find(|t| t.id == id).filter(|t| t.is_file() && !t.before_root) {
             let (source, at) = (t.source.clone(), shows_text(&self.state, t).then(|| self.state.location(t)));
@@ -10061,13 +10957,25 @@ impl Session {
         });
     }
 
+    /// Note a load of `path`, and wake once [`LOADING_QUIET`] has passed, when a still running load gets named.
+    pub(crate) fn start_loading(&mut self, path: PathBuf) {
+        self.state.loading = Some(path);
+        self.state.loading_since = Some(self.state.semantics.now());
+        let tx = self.tx.clone();
+        let _ = std::thread::Builder::new().name("reader-loading".into()).spawn(move || {
+            std::thread::sleep(LOADING_QUIET);
+            let _ = tx.send_blocking(Completion::Semantic(semantics::Event::Quiet));
+        });
+    }
+
     /// Read and decode tab `id`'s source off the UI thread; a load superseded before it starts reads nothing.
     fn load(&mut self, id: TabId, reload: bool) {
         let Some(path) = self.state.tabs.iter().find(|t| t.id == id).map(|t| t.source.clone()) else { return };
+        if let Some(location) = crate::archive::Location::from_uri(&path) { self.load_archive_entry(id, reload, location); return; }
         let request = self.next_request();
         self.pending = Some((id, reload));
         self.reload_source = reload.then(|| self.state.source(id).map(|source| SemanticSource::new(source))).flatten();
-        self.state.loading = Some(path.clone());
+        self.start_loading(path.clone());
         let (latest, versions, tx) = (self.latest.clone(), self.versions.clone(), self.tx.clone());
         self.jobs.submit(Priority::Visible, move || {
             if latest.load(Ordering::Relaxed) != request {
@@ -10097,6 +11005,13 @@ impl Session {
     fn show_snapshot(&mut self, id: TabId, snapshot: Arc<crate::text::TextSnapshot>, stamp: Option<Stamp>, reload: bool) {
         let buffer = snapshot.key().buffer;
         let retained = !reload && self.state.sources.buffers.get(&buffer).is_some_and(CurrentSource::pinned);
+        // Another split may still own this version's delivered analysis. The scheduler
+        // deduplicates those requests, so restoring a view must reuse the current result.
+        let peer = self.state.tabs.iter().find(|tab| tab.id != id && tab.loaded && tab.buffer == Some(buffer));
+        let syntax = peer.filter(|tab| tab.parsed_source.as_ref().is_some_and(|source| source.matches(&snapshot)))
+            .map(|tab| (tab.highlights.clone(), tab.parsed_source.clone(), tab.folds.clone(), tab.declarations.clone()));
+        let semantic = peer.filter(|tab| tab.decor_source.as_ref().is_some_and(|source| source.matches(&snapshot)))
+            .map(|tab| (tab.hints.clone(), tab.decor_source.clone(), tab.tokens.clone()));
         if let Some(entry) = self.state.sources.buffers.get_mut(&buffer) { entry.snapshot = Some(snapshot.clone()); }
         let token = self.next_refresh();
         let Some(t) = self.tab_mut(id) else { return };
@@ -10111,6 +11026,12 @@ impl Session {
         }
         t.language = Some(snapshot.language());
         t.new_content();
+        if let Some((highlights, source, folds, declarations)) = syntax {
+            t.highlights = highlights; t.parsed_source = source; t.folds = folds; t.declarations = declarations;
+        }
+        if let Some((hints, source, tokens)) = semantic {
+            t.hints = hints; t.decor_source = source; t.tokens = tokens;
+        }
         let clamped = t.selection().map(|s| Selection { anchor: snapshot.floor_char_boundary(s.anchor), head: snapshot.floor_char_boundary(s.head) });
         t.place_selection(clamped);
         t.top_line = t.top_line.min(snapshot.line_count() - 1);
@@ -10340,7 +11261,9 @@ impl Drop for Session {
         self.projections.cancel_all();
         self.rx.close();
         self.navigation_latest.fetch_add(1, Ordering::Relaxed);
+        self.branches_requests.fetch_add(1, Ordering::Relaxed);
         self.root_generation.fetch_add(1, Ordering::Relaxed);
+        self.git_status_requests.fetch_add(1, Ordering::Relaxed);
         self.query_latest.fetch_add(1, Ordering::Relaxed);
         self.latest.fetch_add(1, Ordering::Relaxed);
         self.search_latest.fetch_add(1, Ordering::Relaxed);
@@ -10390,10 +11313,8 @@ fn repoint(dir: &Path, old: &Path, new: &Path) {
             // Saved state is small; anything larger than 4 MiB is not Lenz Code's and is left alone.
             let Some(text) = entry.metadata().ok().filter(|m| m.len() <= 4 << 20).and_then(|_| std::fs::read_to_string(&path).ok()) else { continue };
             if text.contains(&from) {
-                let temp = path.with_extension("json.moving");
-                if std::fs::write(&temp, text.replace(&from, &to)).and_then(|()| std::fs::rename(&temp, &path)).is_err() {
-                    let _ = std::fs::remove_file(&temp);
-                }
+                // Private like provider settings, keeping the file's own permissions.
+                let _ = semantics::provider::write_private(&path, text.replace(&from, &to).as_bytes(), || Ok(()));
             }
         }
     }
@@ -10432,6 +11353,18 @@ struct Settings {
     /// Long lines wrap at the pane's width.
     soft_wrap: bool,
     relative_line_numbers: bool,
+    /// The explorer selects the active file whenever it changes.
+    always_select_opened_file: bool,
+    /// The caret line's commit shows faintly after the line's end.
+    inline_blame: bool,
+    /// Option+Left/Right move by word (macOS) and word stops cross the spaces between words.
+    mac_word_motion: bool,
+    /// Leaving a file saves its edits as Save does.
+    save_on_leave: bool,
+    /// Search Everywhere's All tab also lists files whose name holds the query's letters in order.
+    name_letter_search: bool,
+    /// Search Everywhere ranks files near the open and recent ones higher.
+    rank_nearby_files: bool,
     vim_enabled: bool,
     /// The enclosing declarations stay pinned at the top of each pane.
     sticky_scroll: bool,
@@ -10451,6 +11384,10 @@ struct Settings {
     /// File → the SQL dialect chosen for that file, above its project's default (never in the file).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     sql_dialects: std::collections::BTreeMap<PathBuf, crate::sql_dialect::Dialect>,
+    /// Repository (its shared git folder) → the branches starred in its Git Branches popup, by full name
+    /// (`refs/heads/main`, `refs/remotes/origin/main`); kept outside the checkout.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) favorite_branches: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duckdb_executable: Option<PathBuf>,
     /// The keyboard language menus and bare keys follow.
@@ -10462,7 +11399,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
+        Self { favorite_branches: Default::default(), persistent_index: true, folders_first: true, documentation_on_hover: true, auto_completion: true, file_icons: true, soft_wrap: false, relative_line_numbers: false, always_select_opened_file: false, inline_blame: false, mac_word_motion: false, save_on_leave: false, name_letter_search: false, rank_nearby_files: false, vim_enabled: false, sticky_scroll: true, breadcrumbs: true, inlay_types: true, inlay_parameters: true, semantic_highlighting: true, split: None, layout: Layout::default(), projects: Default::default(), sql_dialects: Default::default(), duckdb_executable: None, keymap: KeymapPreset::IntelliJ, keybindings: Default::default() }
     }
 }
 
@@ -10585,6 +11522,7 @@ pub fn launch_target(arg: Option<PathBuf>, cwd: Option<PathBuf>, home: Option<Pa
 }
 
 fn normalized(path: &Path) -> PathBuf {
+    if is_virtual(path) { return path.to_path_buf(); }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
     let mut out = PathBuf::new();
     for c in absolute.components() {
@@ -10618,7 +11556,8 @@ fn projection_current(state: &State, request: &crate::projection::Request) -> bo
         && state.projection_view(request).is_some()
 }
 
-fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion) -> usize {
+/// `spaces`: word stops cross the spaces between words (macOS Word Motion).
+fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize, motion: Motion, spaces: bool) -> usize {
     let line = doc.line_of(head);
     let range = doc.reader_line_range(line);
     let column = |l: usize| {
@@ -10645,8 +11584,8 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
         Motion::Down => range.end,
         Motion::WordLeft if head <= range.start => if line > 0 { doc.reader_line_range(v.step(line, -1)).end } else { 0 },
         Motion::WordRight if head >= range.end => if v.step(line, 1) > line { doc.reader_line_range(v.step(line, 1)).start } else { head },
-        Motion::WordLeft => word_stop(doc, head, true),
-        Motion::WordRight => word_stop(doc, head, false),
+        Motion::WordLeft => word_stop(doc, head, true, spaces),
+        Motion::WordRight => word_stop(doc, head, false, spaces),
         // Home goes to the line's first non-blank character, and from there to its start, as in IntelliJ.
         Motion::LineStart => {
             let text = skip_on(doc, range.start, range.end, |c| c == ' ' || c == '\t');
@@ -10659,23 +11598,11 @@ fn moved(doc: &crate::text::TextSnapshot, v: &crate::folds::Visible, head: usize
 }
 
 /// The previous (`backward`) or next word stop within the head's line: the far end of the run of spaces, word
-/// characters or other symbols beside the head. At the line's edge the head stays.
-pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool) -> usize {
-    let range = doc.reader_line_range(doc.line_of(head));
-    if backward {
-        if head <= range.start { return head; }
-        let kind = doc.range(doc.previous_char_boundary(head)..head).and_then(|t| t.chars().next()).map_or(0, word_class);
-        skip_back(doc, head, range.start, |c| word_class(c) == kind)
-    } else {
-        if head >= range.end { return head; }
-        let kind = doc.range(head..doc.next_char_boundary(head)).and_then(|t| t.chars().next()).map_or(0, word_class);
-        skip_on(doc, head, range.end, |c| word_class(c) == kind)
-    }
-}
-
-/// Spaces, word characters (as [`crate::document`]'s word at a position) and other symbols: a word motion crosses one run.
-fn word_class(c: char) -> u8 {
-    if c.is_whitespace() { 0 } else if c.is_alphanumeric() || c == '_' { 1 } else { 2 }
+/// characters or other symbols beside the head. With `spaces` (macOS Word Motion) the spaces between words are crossed
+/// too, as macOS's Option+arrows go: from the end of `width: 80` the stops are `80`, `:` and `width`. At the line's
+/// edge the head stays; spaces running to it end there.
+pub(crate) fn word_stop(doc: &crate::text::TextSnapshot, head: usize, backward: bool, spaces: bool) -> usize {
+    doc.word_stop(head, backward, spaces)
 }
 
 /// The first byte at or after `at` (before `end`) whose character fails `keep`, scanning a bounded window at a time.
@@ -10686,16 +11613,6 @@ fn skip_on(doc: &crate::text::TextSnapshot, mut at: usize, end: usize, keep: imp
         match text.char_indices().find(|&(_, c)| !keep(c)) { Some((i, _)) => return at + i, None => at = to }
     }
     end
-}
-
-/// The byte after the last character before `at` (from `start`) that fails `keep`: [`skip_on`] backwards.
-fn skip_back(doc: &crate::text::TextSnapshot, mut at: usize, start: usize, keep: impl Fn(char) -> bool) -> usize {
-    while at > start {
-        let from = doc.floor_char_boundary(at.saturating_sub(4096).max(start));
-        let Some(text) = doc.range(from..at) else { return at };
-        match text.char_indices().rev().find(|&(_, c)| !keep(c)) { Some((i, c)) => return from + i + c.len_utf8(), None => at = from }
-    }
-    start
 }
 
 /// The head moved one visual row up or down, keeping its display column (collapsed lines skipped).

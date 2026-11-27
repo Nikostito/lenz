@@ -1,11 +1,12 @@
 //! The command palette over the shared catalog (`:` and F10): scope, availability, dispatch, drawing and input.
+use unicode_width::UnicodeWidthStr;
 use crate::app::{App, Prompt};
 use crate::chrome::color;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use lenz::catalog::{self, Action, Availability, HelpAction, PrAction, RepoAction, Scope, Surface};
 use lenz::palette::{Outcome, Palette, PaletteCommand};
 use lenz::repository_session::RepositoryCommand as R;
-use ratatui::{layout::Rect, style::Modifier, widgets::Clear};
+use ratatui::{layout::Rect, widgets::Clear};
 use std::borrow::Cow;
 
 impl App {
@@ -13,7 +14,7 @@ impl App {
     pub(crate) fn scope(&self) -> Scope {
         let markdown = self.session.disabled(lenz::commands::Command::SetPresentation(lenz::markdown::PresentationMode::Rendered)) != Some("Not a Markdown comparison");
         Scope { surface: Surface::Comparison, sticky: self.visual.sticky, unified: self.session.view().unified(), repository: self.repository.is_some(), focused: self.layout.focused(self.repository.as_ref().map(|r| &r.core)), pr_tab: self.repository.as_ref().and_then(|r| r.core.pr.as_ref()).and_then(|p| p.details()).map(|d| d.tab), pr: self.repository.as_ref().is_some_and(|r| r.core.pr.is_some()),
-                image: self.visual.image().is_some(), markdown, options: self.session.options(), scroll: self.session.view().mode(),
+                image: self.visual.image().is_some(), image_source: self.visual.rendering().is_some_and(|d| d.source), markdown, options: self.session.options(), scroll: self.session.view().mode(),
                 presentation: self.session.markdown_mode(), context_hidden: self.session.context_hidden(), blame: self.blame[self.focus as usize],
                 image_mode: self.visual.image_state().mode(), markdown_layout: self.session.markdown_layout(), find: self.find_open().then(|| self.session.find_options()) }
     }
@@ -40,6 +41,7 @@ impl App {
     fn run_action_inner(&mut self, action: Action) {
         self.command_palette = None;
         match action {
+            Action::NewComparison => self.open_comparison = Some(crate::repo_picker::View::new(lenz::repo_picker::RepoPicker::new(self.session.cwd().into()).with_comparisons(true))),
             Action::Comparison(lenz::commands::Command::SetDiffLayout(lenz::commands::DiffLayout::Unified)) if let Some(why) = self.unified_disabled() => self.session.set_notice(why),
             Action::Comparison(command) => { if let Some(why) = self.session.disabled(command) { self.session.set_notice(why); } else { self.comparison_command(command); } }
             // as Ctrl-F: the focused Files, Branches or History pane's own search, else Find in the comparison
@@ -164,6 +166,7 @@ impl App {
 impl Availability for App {
     fn disabled(&self, action: Action) -> Option<Cow<'static, str>> {
         match action {
+            Action::NewComparison => None,
             Action::Comparison(lenz::commands::Command::SetDiffLayout(lenz::commands::DiffLayout::Unified)) => self.unified_disabled().map(Cow::Borrowed),
             Action::Comparison(command) => self.session.disabled(command).map(Cow::Borrowed),
             Action::Interaction(command) => self.interaction_disabled(command).map(Cow::Borrowed),
@@ -173,7 +176,7 @@ impl Availability for App {
                 let why = if file == lenz::file_actions::FileAction::UndoLenz { self.session.markdown_edit_disabled() } else { None };
                 why.or_else(|| self.file_disabled(file, self.session.current())).map(Cow::Borrowed)
             }
-            Action::Image(index) => lenz::image_session::image_commands().get(index).zip(self.visual.image()).and_then(|(e, doc)| e.disabled(doc, self.visual.image_state())).map(Cow::Borrowed),
+            Action::Image(index) => lenz::image_session::image_commands().get(index).zip(self.visual.rendering()).and_then(|(e, doc)| e.disabled(doc, self.visual.image_state())).map(Cow::Borrowed),
             Action::Repository(RepoAction::Refresh | RepoAction::Branches | RepoAction::NewBranch | RepoAction::CheckoutRevision) => None,
             Action::Repository(RepoAction::Filter) => None,
             Action::Repository(action @ (RepoAction::StagedChanges | RepoAction::CopyUrl | RepoAction::OpenUrl | RepoAction::LocalChanges
@@ -225,35 +228,68 @@ pub(crate) fn rect(area: Rect, p: &Palette) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + 1.min(area.height), w, h)
 }
 
-/// Query line, then one row per matching entry; disabled rows dim with their reason.
+/// Query line, then one row per matching entry; disabled rows dim with their reason. Each row's group and shortcut
+/// sit in two right-aligned columns.
 pub(crate) fn paint(p: &mut Palette, frame: &mut ratatui::Frame, rect: Rect, palette: &lenz::theme::Palette) {
     if rect.width < 4 || rect.height < 3 { return; }
-    let base = crate::chrome::style_with(palette);
+    let base = crate::chrome::style_with(palette).bg(color(palette.status_bg));
     frame.render_widget(Clear, rect);
     frame.render_widget(crate::chrome::pane("",palette,true).style(base), rect);
     let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
     let buf = frame.buffer_mut();
-    crate::visual::safe_text(buf, Rect { height: 1, ..inner }, &crate::visual::input_line("Commands: ", p.query(), usize::from(inner.width)), base.fg(color(palette.accent)));
+    crate::visual::safe_text(buf,Rect{height:1,..inner},"Commands: ",base.fg(color(palette.accent)));
     let range = p.window(usize::from(inner.height.saturating_sub(1)));
     let selected = p.selected();
-    if p.is_empty() && inner.height > 1 { crate::visual::safe_text(buf, Rect::new(inner.x, inner.y + 1, inner.width, 1), "No matching commands", base.add_modifier(Modifier::DIM)); }
-    for (row, (i, entry)) in p.rows().enumerate().skip(range.start).take(range.len()).enumerate() {
+    if p.is_empty() && inner.height > 1 { crate::visual::safe_text(buf, Rect::new(inner.x, inner.y + 1, inner.width, 1), "No matching commands", base.fg(color(palette.dim))); }
+    let query = p.query().to_string();
+    let rows: Vec<_> = p.rows().enumerate().skip(range.start).take(range.len()).collect();
+    let key_w = rows.iter().filter_map(|(_, e)| e.entry.shortcut).map(UnicodeWidthStr::width).max().unwrap_or(0) as u16;
+    for (row, (i, entry)) in rows.into_iter().enumerate() {
         let line = Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1);
-        let mut style = if selected == Some(i) { base.bg(color(palette.selected_bg)) } else { base };
-        if entry.disabled.is_some() { style = style.add_modifier(Modifier::DIM); }
+        let style = if selected == Some(i) { base.bg(color(palette.menu_selected(palette.status_bg))) } else { base };
+        let fg = |c: u32| style.fg(color(c));
         let mark = if entry.entry.current { "✓ " } else { "  " };
         let reason = entry.disabled.as_deref().map_or(String::new(), |why| format!(" ({why})"));
-        let right = [Some(entry.entry.group.label()), entry.entry.shortcut].into_iter().flatten().collect::<Vec<_>>().join("  ");
         buf.set_style(line, style);
-        crate::visual::safe_text(buf, line, &format!("{mark}{}{reason}  · {right}", entry.entry.label), style);
+        // right to left: a one-cell margin, the shortcut column, two cells, the group
+        let group = entry.entry.group.label();
+        let text = format!("{mark}{}{reason}", entry.entry.label);
+        let key_x = line.right().saturating_sub(1 + key_w);
+        let group_x = key_x.saturating_sub(group.width() as u16 + if key_w > 0 { 2 } else { 0 });
+        // a disabled row's reason outranks its group and shortcut: it takes the whole row when they would cut it
+        let columns = group_x > line.x + 1 && (entry.disabled.is_none() || (text.width() as u16) < group_x - line.x);
+        let label_w = if columns { group_x - line.x - 1 } else { line.width };
+        crate::visual::safe_text(buf, Rect { width: label_w, ..line }, &text, fg(if entry.disabled.is_some() { palette.dim } else { palette.fg }));
+        // the typed words, marked where the filter found them
+        let (in_label, in_group) = lenz::palette::match_ranges(&entry.entry.label, group, &query);
+        let fill = if selected == Some(i) { palette.menu_selected(palette.status_bg) } else { palette.status_bg };
+        let matched = ratatui::style::Style::default().fg(color(palette.readable_on(palette.accent, fill))).add_modifier(ratatui::style::Modifier::BOLD);
+        let mark_at = |buf: &mut ratatui::buffer::Buffer, from: u16, limit: u16, text: &str, range: std::ops::Range<usize>| {
+            let (Some(before), Some(hit)) = (text.get(..range.start), text.get(range)) else { return };
+            let x = from + before.width() as u16;
+            let w = (hit.width() as u16).min(limit.saturating_sub(x));
+            if x < limit { buf.set_style(Rect::new(x, line.y, w, 1), matched); }
+        };
+        for r in in_label { mark_at(buf, line.x + mark.width() as u16, line.x + label_w, &entry.entry.label, r); }
+        if columns {
+            crate::visual::safe_text(buf, Rect::new(group_x, line.y, line.right() - group_x, 1), group, fg(palette.dim));
+            for r in in_group { mark_at(buf, group_x, line.right(), group, r); }
+            if let Some(key) = entry.entry.shortcut { crate::visual::safe_text(buf, Rect::new(line.right().saturating_sub(1 + key.width() as u16), line.y, key.width() as u16, 1), key, fg(palette.dim)); }
+        }
     }
+    lenz_terminal_ui::scroll_thumb(buf, rect.right() - 1, inner.y + 1, inner.height.saturating_sub(1), (p.len(), range.start, range.len()), ratatui::style::Style::default().fg(crate::chrome::color(palette.fg)).bg(crate::chrome::color(palette.status_bg)));
+    let offset=10.min(inner.width);
+    lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:p.query(),cursor:p.input().cursor(),area:Rect::new(inner.x+offset,inner.y,inner.width.saturating_sub(offset),1),active:true},base,base.bg(color(palette.selected_bg)));
 }
 
 /// What an event did to an open palette.
-pub(crate) enum Input { Ignored, Handled, Close, Done(Outcome) }
+pub(crate) enum Input { Ignored, Handled, Close, Copy(String), Done(Outcome) }
 
 /// Keys, wheel, clicks and paste while the palette in `rect` is open; it takes every key and click (it is modal).
 pub(crate) fn handle(p: &mut Palette, event: &Event, rect: Rect) -> Input {
+    if let Event::Key(key)=event && key.kind!=KeyEventKind::Release && let Some(command)=lenz_terminal_ui::command(*key) {
+        return p.edit(command).copy.map_or(Input::Handled,Input::Copy);
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
             KeyCode::Esc => return Input::Close,
@@ -301,6 +337,7 @@ pub(crate) fn input(app: &mut App, event: &Event) -> bool {
     match handle(p, event, rect(area, p)) {
         Input::Ignored => return false,
         Input::Handled => {}
+        Input::Copy(text) => app.copy(&text),
         Input::Close => app.command_palette = None,
         Input::Done(Outcome::Run(action)) => app.run_action(action),
         Input::Done(Outcome::Disabled(why)) => app.session.set_notice(why.into_owned()),

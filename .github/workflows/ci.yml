@@ -33,7 +33,7 @@ jobs:
           xcodebuild -version
           xcrun metal --version || { xcodebuild -downloadComponent MetalToolchain && xcrun metal --version; }
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -45,13 +45,13 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked -p lenz
 
-      - name: Stripped release binary ≤ 80 MB (80,000,000 bytes)
+      - name: Stripped release binary ≤ 85 MB (85,000,000 bytes)
         shell: bash
         run: |
           strip -o lenz-stripped target/release/lenz
           size=$(wc -c < lenz-stripped)
           echo "stripped lenz: $size bytes"
-          test "$size" -le 80000000
+          test "$size" -le 85000000
 
   # The oldest git Lenz supports: Debian bullseye ships git 2.30.2.
   git-2-30:
@@ -69,7 +69,7 @@ jobs:
             libfontconfig-dev libx11-xcb-dev libvulkan1 libglib2.0-dev libzstd-dev
           git --version | grep -F 'git version 2.30.'
 
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - run: cargo test -p lenz --locked

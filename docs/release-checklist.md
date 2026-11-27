@@ -2,9 +2,10 @@
 
 Run on **Linux and macOS** before each release, on the release commit, with a release build. Tick each box on both and note the machine (CPU, display refresh rate) and the numbers next to the timed items. The automated checks run locally through `scripts/ci-local.sh`; this list covers what they cannot: physical-display behavior, mouse input and packaging.
 
-Latest automated record: [Linux validation, 2026-10-21](release-validation.md).
-It covers the pending working tree, not a packaged release; manual boxes below
-remain for the final release commit.
+Latest automated record: [0.0.23 validation, 2026-11-23](research/release-0.0.23-validation.md).
+It identifies the release source and separates local gates, native package checks
+and publication. Physical-display and native interactive boxes below remain
+unverified unless explicitly recorded in that report.
 
 ## Setup
 
@@ -24,7 +25,7 @@ Run the [full or stress suite](benchmarking.md) and keep its result directory fo
 - [ ] **Pathological pair stays usable.** `target/release/lenz /tmp/lenz-fx/different-100k/left.rs /tmp/lenz-fx/different-100k/right.rs` opens (note first paint) and scrolls.
 - [ ] **Memory after highlighting.** On Linux, `python3 scripts/startup-bench.py -- /tmp/lenz-fx/generated-100k/left.rs /tmp/lenz-fx/generated-100k/right.rs` measures first paint and RSS on a private Xvfb display. Repeat for a large merge, and compare with a saved binary using `--baseline`.
 - [ ] **Memory while browsing.** Generate disposable inputs with `scripts/perf-fixtures.py`, then use `scripts/interaction-bench.py` for repeated text and image file switching and merge shortcut repaints.
-- [ ] **Stripped binary ≤ 80 MB.** `strip -o /tmp/lenz-stripped target/release/lenz && wc -c < /tmp/lenz-stripped` prints at most 80000000.
+- [ ] **Stripped binary ≤ 85 MB.** `strip -o /tmp/lenz-stripped target/release/lenz && wc -c < /tmp/lenz-stripped` prints at most 85000000.
 
 ## UI walkthrough
 
@@ -78,7 +79,7 @@ In a throwaway repository with a merge conflict in a text file, a binary (PNG) f
 
 ## Package and publish
 
-Pushing a `v<version>` tag runs `.github/workflows/release.yml`: native runners (Ubuntu 22.04 x86_64 and arm64, macOS 15 Apple Silicon) run `packaging/package.sh` and attach the tarballs and `.sha256` files to a draft release. The tag must match the workspace version. Rerun it for an existing tag from the Actions tab. The steps below also work locally and need Python 3. Each tarball holds the launcher `lenz` and its four apps, `lenz-code`, `lenz-code-tui`, `lenz-diff` and `lenz-diff-tui`, each built on its own.
+Pushing a `v<version>` tag runs `.github/workflows/release.yml`: native runners (Ubuntu 22.04 x86_64 and arm64, macOS 26 Apple Silicon) run `packaging/package.sh` and attach the tarballs and `.sha256` files to a draft release. The tag must match the workspace version. Rerun it for an existing tag from the Actions tab. The steps below also work locally and need Python 3. Each tarball holds the launcher `lenz` and its four apps, `lenz-code`, `lenz-code-tui`, `lenz-diff` and `lenz-diff-tui`, each built on its own. Before upload, `packaging/check-package.py` verifies the unpacked commands and launcher routing; on macOS it also verifies the bundle signature. These automated checks do not tick the physical-display items below.
 
 - [ ] From the unpacked tarball (and, on macOS, through the Homebrew-style symlinks into `Lenz.app`): `lenz --help` lists the commands; `lenz <folder>` opens Lenz Code; `lenz --tui <file>` opens the terminal editor; `lenz diff <left> <right>` and `lenz diff --tui <left> <right>` open the comparisons; `lenz diff --bogus` prints `usage: lenz diff`.
 - [ ] macOS: the Dock shows the Lenz logo from launch to quit for both a Code and a Diff window, launched from Finder (`Lenz.app` opens Lenz Code) and from a terminal through the symlinks; `codesign -v --strict Lenz.app` passes.

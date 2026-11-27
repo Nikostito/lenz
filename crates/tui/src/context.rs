@@ -8,7 +8,7 @@ use lenz::{
 };
 use ratatui::{
     layout::Rect,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
 };
 use std::sync::Arc;
 enum Action {
@@ -31,6 +31,7 @@ struct Item {
     reason: Option<String>,
     action: Action,
 }
+const MENU_HINT: &str = "F2 details · Enter selects · Esc closes";
 #[derive(Default)]
 pub(crate) struct Menu {
     items: Vec<Item>,
@@ -39,13 +40,15 @@ pub(crate) struct Menu {
     area: Rect,
     question_scroll: u16,
     commit: Option<String>,
+    /// The cell a right click opened the menu at; `None` (Shift-F10) centres it.
+    anchor: Option<(u16, u16)>,
 }
 impl App {
     pub(crate) fn clear_context(&mut self){self.context.items.clear();self.session.cancel_discard();}
     pub(crate) fn modal_input(&self)->bool{self.prompt.is_some()||self.modal_except_prompt()}
     /// A modal other than a prompt takes the input.
     pub(crate) fn modal_except_prompt(&self)->bool{
-        !self.context.items.is_empty()||self.command_palette.is_some()||self.session.file_actions().busy()||self.session.file_actions().confirmation().is_some()||self.about.is_some()||self.message.is_some()||self.visual.commit_visible()||self.repository.as_ref().is_some_and(|r|r.modal())||self.set_search.as_ref().is_some_and(|s|s.model.editing())
+        self.open_comparison.is_some()||!self.context.items.is_empty()||self.command_palette.is_some()||self.session.file_actions().busy()||self.session.file_actions().confirmation().is_some()||self.about.is_some()||self.message.is_some()||self.visual.commit_visible()||self.repository.as_ref().is_some_and(|r|r.modal())||self.set_search.as_ref().is_some_and(|s|s.model.editing())
     }
     pub(crate) fn context_details(&self)->Option<String> {
         self.session.file_actions().confirmation().or_else(||self.context.items.get(self.context.selected).map(|item|item.reason.as_ref().map_or_else(||item.label.clone(),|reason|format!("{} — {reason}",item.label))))
@@ -312,6 +315,7 @@ impl App {
         self.context.selected = 0;
         self.context.first = 0;
         self.context.commit = None;
+        self.context.anchor = point;
         let commit = point.zip(self.repository.as_ref()).and_then(|((x, y), r)| self.commit_panel.commit_at(x, y, &r.core));
         // over a PR tab: only its card's copy menu; the diff under it is hidden
         let pane = self.pr_pane();
@@ -433,28 +437,26 @@ impl App {
         if question.is_none() && self.context.items.is_empty() {
             return;
         }
-        let width = bounds.width.min(70);
+        use unicode_width::UnicodeWidthStr;
+        // A menu is as wide as its rows, their reasons and its key hint, and opens at the pointer; a question and a
+        // menu opened from the keyboard sit in the middle.
+        let content = self.context.items.iter().flat_map(|i| [i.label.width(), i.reason.as_deref().map_or(0, str::width)]).max().unwrap_or(0).max(MENU_HINT.width());
+        let width = if question.is_some() { bounds.width.min(70) } else { bounds.width.min(content.min(68) as u16 + 2) };
         let height = if question.is_some() {
             bounds.height.min(14)
         } else {
             bounds.height.min(self.context.items.len() as u16 + 3)
         };
-        let area = Rect::new(
-            bounds.x + (bounds.width - width) / 2,
-            bounds.y + (bounds.height - height) / 2,
-            width,
-            height,
-        );
+        let (x, y) = match self.context.anchor.filter(|_| question.is_none()) {
+            Some((x, y)) => (x.min(bounds.right() - width), y.min(bounds.bottom() - height)),
+            None => (bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - height) / 2),
+        };
+        let area = Rect::new(x, y, width, height);
         self.context.area = area;
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(if question.is_some() {
-                    "F2 details · Discard"
-                } else {
-                    "F2 details · Actions"
-                })
+            // the footer names F2 details; the title names the box
+            crate::chrome::pane(if question.is_some() { " Discard " } else { " Actions " }, palette, true)
                 .style(
                     crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg)),
                 ),
@@ -472,8 +474,8 @@ impl App {
             crate::visual::safe_text(
                 frame.buffer_mut(),
                 Rect::new(area.x + 1, area.bottom() - 2, width - 2, 1),
-                "Cancel (Esc)          Discard (Enter)",
-                crate::chrome::style_with(palette),
+                "Cancel (Esc)          Discard (Enter) · F2 details",
+                crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg)),
             );
         } else {
             let visible = usize::from(inner.height);
@@ -508,24 +510,27 @@ impl App {
                         palette.fg
                     }))
                     .bg(crate::chrome::color(if i == self.context.selected {
-                        palette.selected_bg
+                        palette.menu_selected(palette.status_bg)
                     } else {
                         palette.status_bg
                     }));
                 frame.buffer_mut().set_style(rect, style);
                 crate::visual::safe_text(frame.buffer_mut(), rect, &item.label, style);
             }
+            lenz_terminal_ui::scroll_thumb(frame.buffer_mut(), area.right() - 1, inner.y, inner.height, (self.context.items.len(), self.context.first, visible), ratatui::style::Style::default().fg(crate::chrome::color(palette.fg)).bg(crate::chrome::color(palette.status_bg)));
             let reason = self
                 .context
                 .items
                 .get(self.context.selected)
                 .and_then(|i| i.reason.as_deref())
-                .unwrap_or("F2 details · Enter selects · Esc closes");
+                .unwrap_or(MENU_HINT);
             crate::visual::safe_text(
                 frame.buffer_mut(),
                 Rect::new(area.x + 1, area.bottom() - 2, width - 2, 1),
                 reason,
-                crate::chrome::style_with(palette),
+                crate::chrome::style_with(palette)
+                    .bg(crate::chrome::color(palette.status_bg))
+                    .fg(crate::chrome::color(palette.dim)),
             );
         }
     }

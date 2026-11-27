@@ -76,6 +76,52 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 cargo test -p lenz --features gui-test gui_
 ```
 
+The focused Find scanner probe uses the normal release profile and retains the
+exact `6f7a186` matcher as a test-only reference:
+
+```sh
+cargo test --locked --release -p lenz-content --lib find::perf::find_release_probe -- --exact --ignored --nocapture
+```
+
+Its `FIND_PROBE` workload version 2 reports hot scans, exact results and at least
+20 seconds of sustained work. These timings exclude document materialization and
+frontends. For a change comparison, build the same probe in a separate baseline
+checkout/target and compare public root-path samples across executables. The
+private reference can have different compiler output even for identical code;
+it is a correctness oracle, not sufficient evidence of baseline preservation.
+
+The Lenz Diff archive probe loads a plain Change Set of two archives that differ in one member,
+for zip, gzip tar and stored-block Zstd tar, with 5,000 × 2 KiB and 32 × 2 MiB text members:
+
+```sh
+cargo test --locked --release -p lenz --no-default-features --lib archive_change_set_release_probe -- --ignored --nocapture
+```
+
+`LENZ_ARCHIVE_PROBE` version 2 records eleven `ChangeSet::load` wall times per case after one warm-up,
+the per-load RSS growth above the RSS before it and that peak itself (`peak_rss_mib`; `VmHWM` reset through
+`/proc/self/clear_refs`, Linux only),
+and the load average. It excludes frontends, member reads and Folder Summary counts. Compare builds by
+copying each test executable and alternating them. Version 2 adds `repacked.zip`: the same zip pair with the
+new side deflated at level 1, so no unchanged member keeps its stored bytes and every member is decompressed
+(the worst case for zip). Version 1's cases are unchanged.
+
+`archive_large_zip_pair_probe` (same command, that test name) prints `LENZ_ARCHIVE_LARGE_PROBE` version 1: a Change
+Set load of two ~200 MiB zips of 100 stored 2 MiB members that differ in one, five loads after a warm-up, with each
+load's time, peak RSS growth and absolute peak (`VmHWM`, Linux only).
+
+`scripts/code-launch-bench.py` schema 2 focuses each newly mapped top-level window on its private Xvfb display, as a
+desktop's window manager does, from a separate agent process stopped before the display. GPUI 1.29 paces every
+frame of an inactive window at 30 fps, and a window on a display without a window manager is never active, so schema
+1's launch-to-readable included up to 33 ms of pacing a desktop launch would not have. Do not compare schema 1 and 2
+launch samples; recollect both executables with schema 2.
+
+`scripts/code-editor-gui-bench.py` schema 2 drains preceding XDamage events before
+rearming the NonEmpty damage region. Older versions could discard a late paint
+notification after rearming, leaving the region nonempty and suppressing the
+next input's notification. Repeat both executables with schema 2 when comparing
+GUI feedback. First XDamage is feedback, not completion or physical presentation;
+the separate exact-byte Save/Undo/Redo oracles remain required.
+
 Output directories must be new or empty; a timestamped directory under `perf-results/` is used when `--output` is omitted. Keep the directory to retain fixtures, per-case stdout and stderr, exact commands, executable hashes, a source manifest, machine and build metadata, raw samples (`results.json`) and a readable report (`summary.md`). `fixtures.json` identifies generated inputs by SHA-256. Results are written after each case and on interruption.
 
 Build time is recorded separately. Tests run as prebuilt executables, sequentially, so compilation and competing benchmark processes do not enter component measurements. Quick runs usually take tens of seconds after building; full runs take several minutes; stress adds its configured sustained duration and longer browsing runs. Large fixtures require a few hundred MiB of disk space, and pathological workloads can use several GiB of RAM. Use `--profile quick` first on smaller machines.
@@ -154,6 +200,56 @@ pending background repaints can contribute that notification, so it cannot alway
 be attributed to completion of the requested action. Correctness checks separately
 verify saved/undone merge bytes; completed model-work timings have separate metric
 names. Preserve this boundary when interpreting sub-frame input numbers.
+
+## Validation process cleanup
+
+On Linux, `scripts/ci-local.sh` automatically uses `scripts/reap-children.py`.
+Run individual test or benchmark commands under it too when a container's PID 1
+does not reap orphaned children:
+
+```sh
+python3 scripts/reap-children.py -- cargo test -p lenz-content --locked
+```
+
+The supervisor adopts and collects only its command's orphaned descendants,
+including children that start separate sessions. It forwards interruption to the
+command's process group. After the command exits, descendants have two seconds
+to finish; remaining children receive TERM and then KILL. Forced cleanup changes
+an otherwise successful result to failure. The `VALIDATION_CHILDREN` stderr
+record reports the command status, collected orphan count, cleanup and elapsed
+time. Other platforms execute the command directly without Linux adoption.
+An outer supervisor's elapsed time includes cleanup and is not a latency metric;
+the benchmark's own samples and endpoint definitions remain authoritative.
+The optional `--old-git` container uses `--init` as well: its processes belong to
+the container runtime and cannot be collected by the host command's supervisor.
+
+Fixture Git commands set `maintenance.autoDetach=false` and `gc.autoDetach=false`
+per invocation. This keeps automatic maintenance owned by the command rather than
+creating an orphan after commits; production Git commands and user configuration
+are unchanged. First run a small batch, compare process counts before and after,
+then repeat before starting long workloads. Unexpected growth or forced cleanup
+needs investigation. The supervisor cannot collect zombies already adopted by
+PID 1, so a polluted environment still needs recreation or a full restart.
+A supervisor also cannot clean up after its own uncatchable SIGKILL; a proper
+reaping container init remains the preferred outer boundary.
+
+The project replacement acceptance probe runs alone after a normal release test
+build (build the standalone terminal binaries separately from GUI features):
+
+```sh
+python3 scripts/reap-children.py -- cargo test --locked --release -p code-core \
+  workspace_edit_release_probe --no-run
+LENZ_WORKSPACE_PROBE_SECONDS=120 python3 scripts/reap-children.py -- \
+  cargo test --locked --release -p code-core workspace_edit_release_probe -- --ignored --nocapture
+```
+
+`WORKSPACE_PROBE` workload version 2 retains every cycle's completed preview/apply
+wall time, elapsed timestamp and process memory sample. Each cycle replaces 4,000
+matches across 40 files, verifies every draft and its independent Undo, and checks
+all 40 disk files remain byte-identical. Timing includes completion polling;
+it excludes frontend rendering, language-server requests and Save. RSS includes
+the probe's retained samples and allocator residency, and does not prove leak
+freedom. Keep the actual duration, raw samples and test executable/source identity.
 
 ## Linux and macOS
 
@@ -241,7 +337,7 @@ readiness message before closing its pipe. A single pipe read can return only th
 can terminate Xvfb while it writes the newline. The helper has a deadline and rejects incomplete or
 invalid messages. This setup fix leaves application timing endpoints and workload version unchanged.
 
-The runner's `WORKLOAD_VERSION` is currently **6**. `--compare` refuses results saved with a different workload version; save a new baseline instead of comparing across versions. Version 3 requires the commit inspection modal's author/email line before reporting readiness, and uses the outside-Git merge fixture described above. Version 4 cycles all four Scroll Modes in the GUI diff scenario, so its find phases run in Shared again (version 3 left them in Independent). Version 5 reports the physical footprint instead of the `ps` resident size on macOS, and samples the terminal independent-views `initial` memory before its 4K fixtures are encoded; Linux metrics are unchanged except that `initial`. Version 6 runs the `syntax/*` and `decode/*` workloads from the `lenz-content` test binary, which on macOS uses the system allocator rather than the binaries' `LargeBlocks`; Linux workloads are unchanged.
+The runner's `WORKLOAD_VERSION` is currently **7**. `--compare` refuses results saved with a different workload version; save a new baseline instead of comparing across versions. Version 3 requires the commit inspection modal's author/email line before reporting readiness, and uses the outside-Git merge fixture described above. Version 4 cycles all four Scroll Modes in the GUI diff scenario, so its find phases run in Shared again (version 3 left them in Independent). Version 5 reports the physical footprint instead of the `ps` resident size on macOS, and samples the terminal independent-views `initial` memory before its 4K fixtures are encoded; Linux metrics are unchanged except that `initial`. Version 6 runs the `syntax/*` and `decode/*` workloads from the `lenz-content` test binary, which on macOS uses the system allocator rather than the binaries' `LargeBlocks`; Linux workloads are unchanged. Version 7 recognizes editable TUI prompt headings and editing controls; search cancellation requires both the prompt and result panel to disappear. Recollect both binaries before comparing those workflow timings.
 
 
 ### Lenz Code editor batch: actual-scroll workload v2

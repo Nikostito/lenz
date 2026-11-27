@@ -222,6 +222,7 @@ impl Viewer {
                 chooser.scroll = at + 1 - visible;
             }
         }
+        let scrolled = lenz_gpui::popup::Scrolled { total: content.len(), first: chooser.scroll, visible: visible.min(content.len()) };
         chooser.hits.clear();
         let rows = content
             .into_iter()
@@ -260,7 +261,7 @@ impl Viewer {
                     canvas(
                         |_, _, _| {},
                         move |_, _, window, cx| {
-                            fill(window, x, y, w, h, palette.status_bg);
+                            lenz_gpui::popup::surface(window, x, y, w, h, &palette);
                             let mask = ContentMask {
                                 bounds: Bounds {
                                     origin: point(px(x), px(y)),
@@ -271,13 +272,14 @@ impl Viewer {
                                 for (label, r, selected, heading) in &rows {
                                     let yy = f32::from(r.origin.y);
                                     if *selected {
-                                        fill(
+                                        // the row's hit box is x + 8 wide of each side; the row inset makes up 4
+                                        lenz_gpui::popup::row(
                                             window,
-                                            x + 8.0,
+                                            x + 4.0,
                                             yy,
-                                            (w - 16.0).max(0.0),
+                                            (w - 8.0).max(0.0),
                                             line_h(),
-                                            palette.selected_bg,
+                                            lenz_gpui::popup::selected(&palette),
                                         );
                                     }
                                     text(
@@ -290,6 +292,7 @@ impl Viewer {
                                         if *heading { palette.accent } else { palette.fg },
                                     );
                                 }
+                                lenz_gpui::popup::scrollbar(window, x, y + 4.0, w, scrolled.visible as f32 * line_h(), scrolled, &palette);
                             });
                         },
                     )

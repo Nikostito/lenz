@@ -15,6 +15,7 @@ path = "src/main.rs"
 gui-test = ["dep:code-gui", "dep:gpui"]
 
 [dependencies]
+lenz-terminal-ui = { path = "../terminal-ui" }
 code-core = { path = "../code-core" }
 lenz-content.workspace = true
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
@@ -22,7 +23,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 # unread until the next key arrives.
 crossterm = { version = "0.29.0", features = ["event-stream", "use-dev-tty"] }
 # Already built for crossterm: restores the terminal on SIGTERM/SIGHUP.
-signal-hook = "0.3.18"
+signal-hook = "0.4.6"
 futures-lite = "2.6.1"
 async-io = "2.6.0"
 unicode-width = "0.2.2"
@@ -32,6 +33,7 @@ code-gui = { path = "../code-gui", optional = true, features = ["test-support"] 
 gpui = { workspace = true, optional = true, features = ["test-support"] }
 
 [dev-dependencies]
+lenz-archive = { path = "../archive", features = ["testing"] }
 code-core = { path = "../code-core", features = ["test-support"] }
 tempfile = "3"
 # Throwaway git repositories for the blame tests.

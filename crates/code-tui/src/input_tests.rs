@@ -34,6 +34,12 @@ mod scrollbar;
 mod problems;
 #[path = "input_tests/project_syntax.rs"]
 mod project_syntax;
+#[path = "input_tests/archive.rs"]
+mod archive;
+#[path = "input_tests/branch_picker.rs"]
+mod branch_picker;
+#[path = "input_tests/trust.rs"]
+mod trust;
 use crossterm::event::{KeyEvent, KeyModifiers};
 use lenz_content::theme::{ThemeOverrides, ThemePaths};
 use std::{
@@ -60,12 +66,73 @@ pub(crate) fn config(dir: &Path) -> Config {
     }
 }
 fn app(dir: &Path) -> App {
+    // The folder is trusted (an installed language server may start there, as before folder trust), so which servers
+    // a machine has installed never brings up the folder-trust dialog in these scenarios.
+    let providers = config(dir).providers;
+    if !providers.exists() && let Ok(real) = std::fs::canonicalize(dir) {
+        std::fs::create_dir_all(providers.parent().unwrap()).unwrap();
+        std::fs::write(&providers, serde_json::json!({ "trusted": [real] }).to_string()).unwrap();
+    }
     // Reader-shortcut scenarios explicitly model a backend without validated text input.
     App::with_text_input(config(dir), Some(dir.to_owned()), false)
 }
 
 fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.handle(Event::Key(KeyEvent::new(code, modifiers)));
+}
+
+#[test]
+fn open_prompt_keeps_exact_path_whitespace_and_first_pasted_line() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["file", "file ", " file", " "] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let mut a = app(dir.path());
+    for name in ["file ", " file", " "] {
+        a.run(CommandId::Open);
+        key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(a.modal.as_ref().is_some_and(|m| m.error.is_some()));
+        a.handle(Event::Paste(format!("{name}\nignored")));
+        assert_eq!(a.modal.as_ref().unwrap().input, name);
+        key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+        let target = dir.path().join(name);
+        settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == target));
+        let source = a.session.state().current_source().unwrap();
+        assert_eq!(source.copy_range(0..source.len_bytes()).unwrap(), name);
+    }
+    assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), b"file");
+}
+
+#[test]
+fn alt_home_and_end_jump_picker_rows_without_editing_query() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a_item.txt", "b_item.txt"] {
+        std::fs::write(dir.path().join(name), name).unwrap();
+    }
+    let mut a = app(dir.path());
+    settle(&mut a, |a| a.session.state().project().is_some_and(|p| matches!(p.coverage(), code_core::project::Coverage::Complete(_))));
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    a.handle(Event::Paste("item".into()));
+    navigation_ready(&mut a);
+    assert_eq!(a.session.state().navigation().unwrap().rows.len(), 2);
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::End, KeyModifiers::ALT);
+    assert_eq!(a.modal.as_ref().unwrap().at, 1);
+    assert_eq!(a.modal.as_ref().unwrap().input, "item");
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == dir.path().join("b_item.txt")));
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    a.handle(Event::Paste("item".into()));
+    navigation_ready(&mut a);
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::ALT);
+    assert_eq!(a.modal.as_ref().unwrap().at, 0);
+    assert_eq!(a.modal.as_ref().unwrap().input, "item");
+    draw(&mut a, 32, 8);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.loaded() && t.source() == dir.path().join("a_item.txt")));
 }
 pub(crate) fn settle(app: &mut App, done: impl Fn(&App) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -655,6 +722,64 @@ fn top_bar_back_control_navigates_instead_of_opening_the_palette() {
 }
 
 #[test]
+fn a_drag_selection_past_the_text_scrolls_and_takes_the_selection_along() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.txt");
+    let source: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, &source).unwrap();
+    let mut a = app(dir.path());
+    a.dispatch(Command::Open(path.clone()));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    draw(&mut a, 80, 20);
+    let text = a.layout.panes[0].text;
+    let mouse = |a: &mut App, kind, row| a.handle(Event::Mouse(MouseEvent { kind, column: text.x + 2, row, modifiers: KeyModifiers::NONE }));
+    mouse(&mut a, MouseEventKind::Down(MouseButton::Left), text.y);
+    // each drag event below the text scrolls on, the selection reaching the rows that came into view
+    for _ in 0..10 { mouse(&mut a, MouseEventKind::Drag(MouseButton::Left), text.bottom()); draw(&mut a, 80, 20); }
+    let (top, selection) = (a.session.state().top_line(), a.session.state().selection().unwrap());
+    assert!(top >= 10, "scrolled to line {top}");
+    assert!(selection.anchor < 8 && selection.head > source.lines().take(text.height as usize + 5).map(|l| l.len() + 1).sum::<usize>(), "{selection:?}");
+    // above the text it scrolls back; a release ends the drag
+    for _ in 0..3 { mouse(&mut a, MouseEventKind::Drag(MouseButton::Left), text.y.saturating_sub(1)); draw(&mut a, 80, 20); }
+    assert!(a.session.state().top_line() < top);
+    mouse(&mut a, MouseEventKind::Up(MouseButton::Left), text.y);
+    let released = (a.session.state().top_line(), a.session.state().selection());
+    mouse(&mut a, MouseEventKind::Drag(MouseButton::Left), text.bottom());
+    assert_eq!((a.session.state().top_line(), a.session.state().selection()), released);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
+fn context_menu_rows_keep_their_labels_on_one_line_beside_their_shortcuts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut a = app(dir.path());
+    a.dispatch(Command::Open(path));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    // tall enough that the whole menu shows without scrolling
+    draw(&mut a, 120, 60);
+    let p = a.layout.panes[0].text;
+    // near the right edge, where a menu sized to its labels alone used to wrap a label under its shortcut
+    a.handle(Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), column: p.x + p.width.saturating_sub(2), row: p.y, modifiers: KeyModifiers::NONE }));
+    let labels: Vec<String> = a.choices().iter().map(|c| c.label.to_string()).collect();
+    assert!(labels.iter().any(|l| l == "Go to Type Definition"), "{labels:?}");
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..60).map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect()).collect();
+    for label in &labels {
+        assert!(rows.iter().any(|row| row.contains(label.as_str())), "{label} wrapped:\n{}", rows.join("\n"));
+    }
+    // and with room to spare, every shortcut shows on its label's row
+    for choice in a.choices() {
+        let ChoiceTarget::Action(id) = choice.target else { continue };
+        let Some(key) = a.session.key_hint(id) else { continue };
+        assert!(rows.iter().any(|row| row.contains(&*choice.label) && row.contains(key.as_str())), "{} lost {key}:\n{}", choice.label, rows.join("\n"));
+    }
+}
+
+#[test]
 fn context_menu_follows_the_clicked_split_and_preview_and_scrolls_in_tiny_frames() {
     let dir = tempfile::tempdir().unwrap();
     let text = dir.path().join("a.txt");
@@ -979,13 +1104,18 @@ fn server_status_reports_missing_setup_and_offers_restart_or_enable_without_touc
         .layout
         .controls
         .iter()
-        .find(|(id, _)| *id == CommandId::LanguageServer)
+        .find(|(id, _)| *id == CommandId::InstallServer)
         .unwrap()
         .1;
     click(&mut a, control.x, control.y);
+    assert!(matches!(a.modal.as_ref().unwrap().kind, Prompt::Details { kind: Details::Install, .. }));
+    assert!(!a.session.state().server_install().unwrap().running);
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::NONE);
     assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::LanguageServer);
     draw(&mut a, 100, 26);
-    assert_eq!(a.choices().len(), 10);
+    assert_eq!(a.choices().len(), 11);
     assert!(a.choices().iter().all(|c| matches!(c.target, ChoiceTarget::Action(_))));
     let (x, y) = (a.layout.modal_rows.x, a.layout.modal_rows.y);
     click(&mut a, x, y);
@@ -1022,6 +1152,16 @@ fn server_status_reports_missing_setup_and_offers_restart_or_enable_without_touc
     let copy = a.layout.details_copy;
     click(&mut a, copy.x, copy.y);
     assert_eq!(a.copy.take().as_deref(), Some(copied.as_str()));
+    // The button says it copied, until the next key.
+    let label = |a: &mut App| {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let r = a.layout.details_copy;
+        (r.x..r.right()).map(|x| terminal.backend().buffer()[(x, r.y)].symbol()).collect::<String>()
+    };
+    assert!(label(&mut a).contains("Copied"), "{}", label(&mut a));
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    assert!(label(&mut a).contains("Copy") && !label(&mut a).contains("Copied"));
     let close = a.layout.details_close;
     click(&mut a, close.x, close.y);
     assert!(a.modal.is_none());
@@ -1060,6 +1200,26 @@ fn server_status_reports_missing_setup_and_offers_restart_or_enable_without_touc
             .state()
             .provider()
             .is_some_and(|v| matches!(v.status, Status::Missing(_)))
+    });
+    // The folder's project tools are trusted, then no longer, from the same menu: the row follows the state.
+    settle(&mut a, |a| a.session.disabled(CommandId::TrustProjectTools).is_none());
+    key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    draw(&mut a, 80, 24);
+    activate(&mut a, CommandId::TrustProjectTools);
+    settle(&mut a, |a| a.session.disabled(CommandId::UntrustProjectTools).is_none());
+    key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    draw(&mut a, 80, 24);
+    assert!(a.choices().iter().any(|c| matches!(
+        c.target,
+        ChoiceTarget::Action(CommandId::UntrustProjectTools)
+    ) && c.disabled.is_none()));
+    activate(&mut a, CommandId::UntrustProjectTools);
+    settle(&mut a, |a| {
+        a.session.disabled(CommandId::TrustProjectTools).is_none()
+            && a.session
+                .state()
+                .provider()
+                .is_some_and(|v| matches!(v.status, Status::Missing(_)))
     });
     assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     assert_eq!(a.session.state().selection(), selected);
@@ -2006,7 +2166,7 @@ fn hover_is_debounced_cancelled_and_uses_real_core_documentation_request() {
     let mut cfg = config(dir.path());
     cfg.idle = code_core::semantics::IDLE;
     std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap();
-    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_LOG": log, "FAKE_LSP_NO_DECOR": "1" } } } }).to_string()).unwrap();
+    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_LOG": log, "FAKE_LSP_NO_DECOR": "1" } } }, "trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()] }).to_string()).unwrap();
     let mut a = App::new(cfg, Some(root));
     a.dispatch(Command::Open(path.clone()));
     settle(&mut a, |a| {
@@ -2152,7 +2312,7 @@ fn changed_inlay_hints_invalidate_source_hits_until_the_next_frame() {
     let fake = profile.join(format!("examples/fake_lsp{}", std::env::consts::EXE_SUFFIX));
     let cfg = config(dir.path());
     std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap();
-    std::fs::write(&cfg.providers, serde_json::json!({"providers":{"rust-analyzer":{"executable":fake,"env":{"FAKE_LSP_SLOW_DECOR":"1"}}}}).to_string()).unwrap();
+    std::fs::write(&cfg.providers, serde_json::json!({"providers":{"rust-analyzer":{"executable":fake,"env":{"FAKE_LSP_SLOW_DECOR":"1"}}},"trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()]}).to_string()).unwrap();
     let mut a = App::new(cfg, Some(root));
     a.dispatch(Command::Open(path.clone()));
     settle(&mut a, |a| a.session.state().provider().is_some_and(|p| p.status == code_core::semantics::Status::Ready)
@@ -2365,6 +2525,7 @@ fn server_runtime_dialog_validates_saves_and_preserves_the_document() {
     key(&mut a, KeyCode::Char('a'), KeyModifiers::CONTROL);
     let selected = a.session.state().selection();
     key(&mut a, KeyCode::F(2), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Home, KeyModifiers::NONE);
     let at = a
         .choices()
         .iter()
@@ -2464,15 +2625,15 @@ fn navigation_shortcuts_cycle_scopes_and_keep_modal_input_isolated() {
     }
     key(&mut a, KeyCode::Char('k'), KeyModifiers::CONTROL);
     a.handle(Event::Paste("α界\nquery".into()));
-    assert_eq!(a.modal.as_ref().unwrap().input, "α界query");
+    assert_eq!(a.modal.as_ref().unwrap().input, "α界");
     key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::Files);
     key(&mut a, KeyCode::BackTab, KeyModifiers::SHIFT);
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::All);
-    assert_eq!(a.session.state().navigation().unwrap().query, "α界query");
+    assert_eq!(a.session.state().navigation().unwrap().query, "α界");
     key(&mut a, KeyCode::Char('s'), KeyModifiers::CONTROL);
     key(&mut a, KeyCode::Backspace, KeyModifiers::NONE);
-    assert_eq!(a.modal.as_ref().unwrap().input, "α界quer");
+    assert_eq!(a.modal.as_ref().unwrap().input, "α");
     assert_eq!(a.session.state().selection(), selection);
     assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
@@ -2775,7 +2936,7 @@ fn navigation_enhanced_keyboard_repeats_move_caret_and_modal_selection() {
 }
 
 #[test]
-fn navigation_scope_shortcuts_preserve_query_inside_modal_and_plain_ctrl_a_clears() {
+fn navigation_scope_shortcuts_preserve_query_and_ctrl_a_selects_before_delete() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = app(dir.path());
     a.run(CommandId::SearchEverywhere);
@@ -2802,6 +2963,8 @@ fn navigation_scope_shortcuts_preserve_query_inside_modal_and_plain_ctrl_a_clear
         assert_eq!(search.query, "α界 typed query");
     }
     key(&mut a, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    assert!(App::field_cursor(a.modal.as_ref().unwrap()).all_selected(&a.modal.as_ref().unwrap().input));
+    key(&mut a, KeyCode::Backspace, KeyModifiers::NONE);
     assert!(a.modal.as_ref().unwrap().input.is_empty());
     assert!(a.session.state().navigation().unwrap().query.is_empty());
     assert_eq!(a.session.state().navigation().unwrap().scope, Scope::All);
@@ -3135,14 +3298,14 @@ fn recent_popup_fuzzy_filters_forgets_and_opens_scrolled_paths_at_saved_caret() 
             .detail
             .contains("folder-3")
     );
-    key(&mut a, KeyCode::Delete, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(6), KeyModifiers::NONE);
     assert_eq!(
         a.session.state().navigation().unwrap().rows.len(),
         1,
         "Delete must reject a stale displayed revision"
     );
     draw(&mut a, 40, 10);
-    key(&mut a, KeyCode::Delete, KeyModifiers::NONE);
+    key(&mut a, KeyCode::F(6), KeyModifiers::NONE);
     navigation_ready(&mut a);
     assert!(a.session.state().navigation().unwrap().rows.is_empty());
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
@@ -3490,6 +3653,39 @@ fn about_opens_from_the_application_menu_with_its_logo_and_closes_to_the_documen
     assert!(a.session.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap() == "first\n"));
 }
 
+#[test]
+fn inline_blame_shows_the_caret_lines_commit_faintly_after_its_end() {
+    use lenz_content::git::testing::{commit_all, repo, write};
+    let r = repo();
+    write(r.path(), "a.txt", "one\ntwo\n");
+    commit_all(r.path(), "First line");
+    let mut a = app(r.path());
+    a.dispatch(Command::Open(r.path().join("a.txt")));
+    settle(&mut a, |a| a.session.state().current_source().is_some());
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "off by default");
+    // The command list reaches the setting.
+    key(&mut a, KeyCode::Char(':'), KeyModifiers::NONE);
+    for c in "inline blame".chars() { key(&mut a, KeyCode::Char(c), KeyModifiers::NONE); }
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(a.session.state().inline_blame(), "on");
+    let tab = a.session.state().active().unwrap().id();
+    settle(&mut a, |a| a.session.state().caret_blame(tab).is_some());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<(u16, String)> = (0..20).map(|y| (y, (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())).filter(|(_, row)| row.contains(" • First line")).collect();
+    assert_eq!(rows.len(), 1, "only the caret line");
+    let (y, row) = &rows[0];
+    assert!(row.contains("two  t, "), "two cells after the line's end: {row}");
+    let x = (3..100u16).find(|&x| ["o", " ", " ", "t"].iter().enumerate().all(|(i, s)| buffer[(x - 3 + i as u16, *y)].symbol() == *s)).unwrap();
+    assert_eq!(buffer[(x, *y)].fg, crate::render::color(a.session.state().palette().dim), "faint");
+    assert_eq!(a.session.state().active().unwrap().annotation_cols(), 0, "no annotation column");
+    key(&mut a, KeyCode::Right, KeyModifiers::SHIFT);
+    assert!(!draw_screen(&mut a, 100, 20).contains("First line"), "not over a selection");
+    assert_eq!(std::fs::read(r.path().join("a.txt")).unwrap(), b"one\ntwo\n");
+}
+
 /// An app on a git repository with `a.txt` (two lines) committed as "First line", annotated with Alt+B.
 fn annotated_app() -> (tempfile::TempDir, App, String) {
     use lenz_content::git::testing::{commit_all, git, repo, write};
@@ -3689,6 +3885,65 @@ fn open_popup(a: &mut App) {
 }
 
 #[test]
+fn branch_rows_stay_one_line_and_enter_on_show_more_opens_the_section() {
+    use lenz_content::git::testing::git;
+    let (r, _wt, mut a) = branches_app();
+    for i in 0..14 { git(r.path(), &["branch", &format!("topic-a-very-long-branch-name-number-{i:02}-for-the-settings-dialog")]); }
+    open_popup(&mut a);
+    let more = a.choices().iter().position(|c| matches!(&c.target, ChoiceTarget::Branch(code_core::branches::BranchTarget::More("Local")))).expect("a Show more row");
+    // At 60 columns every row is one line: the long names keep both ends around a …
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 40)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..40).map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect()).collect();
+    let cut: Vec<_> = rows.iter().filter(|row| row.contains("topic-a-very") ).collect();
+    assert!(!cut.is_empty() && cut.iter().all(|row| row.contains('…') && row.contains("dialog")), "{}", rows.join("\n"));
+    assert!(!rows.iter().any(|row| row.trim_start().starts_with("for-the-settings")), "no name wraps onto a second line");
+    // Enter on Show more lists the rest and keeps the highlight on the first row it brings in.
+    a.modal.as_mut().unwrap().at = more;
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(prompt_kind(&a), Some(Prompt::Branches), "the popup stays");
+    assert_eq!(a.modal.as_ref().unwrap().at, more);
+    assert!(!a.choices().iter().any(|c| matches!(&c.target, ChoiceTarget::Branch(code_core::branches::BranchTarget::More("Local")))));
+    assert!(matches!(&a.choices()[more].target, ChoiceTarget::Branch(code_core::branches::BranchTarget::Branch(_))));
+    assert_eq!(std::fs::read_to_string(r.path().join("a.txt")).unwrap(), "main\n", "nothing was checked out");
+}
+
+#[test]
+fn branch_folders_open_by_key_and_a_star_from_the_menu_keeps_the_picker() {
+    use code_core::branches::BranchTarget;
+    use lenz_content::git::testing::git;
+    let (r, _wt, mut a) = branches_app();
+    for b in ["team/a", "team/b"] { git(r.path(), &["branch", b]); }
+    open_popup(&mut a);
+    let rows = |a: &App| a.session.state().branch_rows("");
+    let folder = rows(&a).iter().position(|r| matches!(&r.target, BranchTarget::Folder("Local", n) if n == "team")).expect("a team folder");
+    a.modal.as_mut().unwrap().at = folder;
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(rows(&a)[folder].open && rows(&a)[folder + 1].depth == 1);
+    key(&mut a, KeyCode::Left, KeyModifiers::NONE);
+    assert!(!rows(&a)[folder].open);
+    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    assert!(rows(&a)[folder].open);
+    assert_eq!((prompt_kind(&a), a.modal.as_ref().unwrap().at), (Some(Prompt::Branches), folder));
+    // the folder's branches render one level in, under their short names
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|f| a.draw(f)).unwrap();
+    let screen: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+    assert!(screen.contains("▾ team/") && screen.contains("  ⎇ a"), "{screen}");
+    // → on a branch lists its actions; Add to Favorites stars it and returns to the list, on that branch.
+    a.modal.as_mut().unwrap().at = folder + 2;
+    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    let star = a.choices().iter().position(|c| c.label == "Add to Favorites").expect("the menu offers a star");
+    a.modal.as_mut().unwrap().at = star;
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(prompt_kind(&a), Some(Prompt::Branches), "back to the list");
+    let at = a.modal.as_ref().unwrap().at;
+    assert!(rows(&a)[at].favorite && matches!(&rows(&a)[at].target, BranchTarget::Branch(b) if b == "team/b"));
+    assert_eq!(std::fs::read_to_string(r.path().join("a.txt")).unwrap(), "main\n", "nothing was checked out");
+}
+
+#[test]
 fn the_toolbar_branch_opens_the_popup_and_enter_checks_out() {
     let (r, _wt, mut a) = branches_app();
     let (_, rect) = *a.layout.controls.iter().find(|(id, _)| *id == CommandId::GitBranches).expect("a branch cell");
@@ -3716,12 +3971,12 @@ fn a_rows_menu_makes_a_branch_and_the_revision_prompt_checks_out() {
     let (r, _wt, mut a) = branches_app();
     open_popup(&mut a);
     typed(&mut a, "v1");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     assert!(matches!(prompt_kind(&a), Some(Prompt::BranchMenu { .. })));
     assert_eq!(a.choices().into_iter().map(|c| c.label).collect::<Vec<_>>(), ["Checkout", "New Branch from Here…", "Compare with Working Tree"]);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!((prompt_kind(&a), a.modal.as_ref().unwrap().input.as_str()), (Some(Prompt::Branches), "v1"), "back to the list");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(prompt_kind(&a), Some(Prompt::NewBranch { from: Some("refs/tags/v1".into()), checkout: true }));
@@ -3806,7 +4061,7 @@ fn a_worktree_opens_here_or_in_a_new_view_and_a_tiny_terminal_copes() {
     draw(&mut a, 100, 20);
     a.modal.as_mut().unwrap().input = "second".into();
     a.modal.as_mut().unwrap().at = 0;
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert!(a.new_view);
@@ -3821,8 +4076,8 @@ fn a_worktree_opens_here_or_in_a_new_view_and_a_tiny_terminal_copes() {
 fn enter_on_the_current_branch_or_worktree_does_nothing_and_keeps_the_popup() {
     let (_r, _wt, mut a) = branches_app();
     open_popup(&mut a);
-    for current in ["● main", "Worktrees"] {
-        let at = a.choices().iter().position(|c| c.label.contains(current) && c.label.contains("●")).unwrap();
+    for current in ["Local", "Worktrees"] {
+        let at = a.choices().iter().position(|c| c.section == Some(current) && c.label.contains("●")).unwrap();
         a.modal.as_mut().unwrap().at = at;
         key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!a.session.state().checking_out(), "{current}: no checkout");
@@ -3889,13 +4144,34 @@ fn the_git_menu_compares_the_working_tree_in_this_terminal() {
 }
 
 #[test]
+fn compare_with_base_never_hands_lenz_diff_a_subcommand_from_origin_head() {
+    use lenz_content::git::testing::{git, write};
+    let (r, _wt, mut a) = branches_app();
+    let _bin = lenz_diff_beside(&mut a);
+    git(r.path(), &["switch", "-q", "other"]);
+    git(r.path(), &["branch", "-q", "-D", "main"]);
+    let sha = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    for target in ["pr", "merge", "--about"] {
+        write(r.path(), &format!(".git/{target}"), format!("{sha}\n"));
+        write(r.path(), ".git/refs/remotes/origin/HEAD", format!("ref: {target}\n"));
+        a.run(CommandId::CompareWithBase);
+        assert_eq!(foreground_args(&mut a), None, "{target}");
+        assert!(a.session.status_message().contains("no main or master branch"), "{target}: {}", a.session.status_message());
+    }
+    git(r.path(), &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+    git(r.path(), &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
+    a.run(CommandId::CompareWithBase);
+    assert_eq!(foreground_args(&mut a), Some(vec!["refs/remotes/origin/trunk".to_string()]));
+}
+
+#[test]
 fn rows_compare_and_compare_with_worktree_lists_the_other_worktree() {
     let (r, wt, mut a) = branches_app();
     let _bin = lenz_diff_beside(&mut a);
     open_popup(&mut a);
     typed(&mut a, "other");
-    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
-    assert_eq!(a.choices().into_iter().map(|c| c.label).collect::<Vec<_>>(), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here"]);
+    key(&mut a, KeyCode::Enter, KeyModifiers::ALT);
+    assert_eq!(a.choices().into_iter().map(|c| c.label).collect::<Vec<_>>(), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here", "Add to Favorites"]);
     for _ in 0..3 { key(&mut a, KeyCode::Down, KeyModifiers::NONE); }
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     let split = lenz_content::git::testing::git(r.path(), &["rev-parse", "main"]).trim().to_string();
@@ -3988,7 +4264,7 @@ fn completion_popup_takes_only_its_keys_and_fits_a_tiny_terminal() {
     let mut cfg = config(dir.path());
     cfg.idle = code_core::semantics::IDLE;
     std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap();
-    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_NO_DECOR": "1" } } } }).to_string()).unwrap();
+    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_NO_DECOR": "1" } } }, "trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()] }).to_string()).unwrap();
     let mut a = App::new(cfg, Some(root));
     a.enable_draft_input_for_test();
     a.dispatch(Command::Open(path.clone()));
@@ -4091,7 +4367,7 @@ fn snippet_placeholders_are_tabbed_through_and_escape_ends_them() {
     let fake = profile.join(format!("examples/fake_lsp{}", std::env::consts::EXE_SUFFIX));
     let cfg = config(dir.path());
     std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap();
-    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_NO_DECOR": "1" } } } }).to_string()).unwrap();
+    std::fs::write(&cfg.providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": fake, "env": { "FAKE_LSP_NO_DECOR": "1" } } }, "trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()] }).to_string()).unwrap();
     let mut a = App::new(cfg, Some(root));
     a.enable_draft_input_for_test();
     a.dispatch(Command::Open(path.clone()));
@@ -4322,7 +4598,7 @@ fn completion_documentation_scroll_reaches_the_end_without_editing() {
     let mut build=std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     build.args(["build","-q","-p","code-core","--example","fake_lsp"]); if profile.ends_with("release") { build.arg("--release"); } assert!(build.status().unwrap().success());
     let mut cfg=config(dir.path()); cfg.idle=code_core::semantics::IDLE;
-    std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap(); std::fs::write(&cfg.providers,serde_json::json!({"providers":{"rust-analyzer":{"executable":profile.join("examples/fake_lsp"),"env":{"FAKE_LSP_COMPLETION_DOC":"1","FAKE_LSP_NO_DECOR":"1"}}}}).to_string()).unwrap();
+    std::fs::create_dir_all(cfg.providers.parent().unwrap()).unwrap(); std::fs::write(&cfg.providers,serde_json::json!({"providers":{"rust-analyzer":{"executable":profile.join("examples/fake_lsp"),"env":{"FAKE_LSP_COMPLETION_DOC":"1","FAKE_LSP_NO_DECOR":"1"}}},"trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()]}).to_string()).unwrap();
     let mut a=App::new(cfg,Some(root)); a.enable_draft_input_for_test(); a.dispatch(Command::Open(path.clone())); settle(&mut a,|a|a.session.state().provider().is_some_and(|p|p.status==code_core::semantics::Status::Ready));
     let at=text.find("hel }").unwrap()+3; a.dispatch(Command::Select(Selection{anchor:at,head:at})); a.dispatch(Command::Complete);
     settle(&mut a,|a|a.session.state().completion().is_some_and(|c|c.documentation_preview().is_some())); draw(&mut a,100,30);
@@ -4392,7 +4668,7 @@ fn java_member_semantic_colour_stays_painted_during_typing_and_lexical_arrival()
         providers.insert(p.id.into(), serde_json::json!({"executable":format!("/nonexistent/{}", p.id)}));
     }
     providers.insert("jdtls".into(), serde_json::json!({"executable":profile.join("examples/fake_lsp"),"env":{"FAKE_LSP_TOKEN_GATE":gate}}));
-    std::fs::write(&cfg.providers, serde_json::json!({"providers":providers}).to_string()).unwrap();
+    std::fs::write(&cfg.providers, serde_json::json!({"providers":providers,"trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()]}).to_string()).unwrap();
     let mut a = App::new(cfg, Some(path.clone()));
     a.enable_draft_input_for_test();
     settle(&mut a, |a| a.session.state().active().and_then(|tab| a.session.state().view(tab.id())).is_some_and(|view| view.tokens().is_some() && view.highlights().is_some()));
@@ -4850,4 +5126,43 @@ fn choosing_a_recent_project_with_one_open_asks_this_tab_or_a_new_project_tab() 
     key(&mut a, KeyCode::Char('t'), KeyModifiers::NONE);
     settle(&mut a, |a| a.session.state().project().is_some_and(|p| p.root() == beta));
     assert!(!a.new_view);
+}
+
+#[test]
+fn popup_fields_edit_ranges_and_preserve_document_and_both_carets() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("original.txt");std::fs::write(&path,"original\n").unwrap();
+    let mut a=app(dir.path());a.dispatch(Command::OpenRetained(path.clone()));settle(&mut a,|a|a.session.state().current_source().is_some());
+    let tab=a.session.state().active().unwrap().id();a.prompt(Prompt::SaveAs(tab));a.modal.as_mut().unwrap().input="one é👩🏽‍💻 two".into();a.modal.as_mut().unwrap().selected=false;
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::CONTROL);key(&mut a,KeyCode::Right,KeyModifiers::NONE);
+    for _ in 0..2 {key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);}
+    assert_eq!(App::field_cursor(a.modal.as_ref().unwrap()).selected(&a.modal.as_ref().unwrap().input),Some("é👩🏽‍💻"));
+    key(&mut a,KeyCode::Char('x'),KeyModifiers::CONTROL);assert_eq!(a.modal.as_ref().unwrap().input,"one  two");assert_eq!(a.copy.as_deref(),Some("é👩🏽‍💻"));
+    a.handle(Event::Paste("é👩🏽‍💻".into()));assert_eq!(a.modal.as_ref().unwrap().input,"one é👩🏽‍💻 two");
+    for (w,h) in [(80,24),(24,8),(5,3)] {draw(&mut a,w,h);}
+    key(&mut a,KeyCode::Char('s'),KeyModifiers::CONTROL);key(&mut a,KeyCode::Char('z'),KeyModifiers::CONTROL);key(&mut a,KeyCode::Esc,KeyModifiers::NONE);
+    assert_eq!(std::fs::read(&path).unwrap(),b"original\n");
+    let source=a.session.state().current_source().unwrap();assert_eq!(source.copy_range(0..source.len_bytes()).unwrap(),"original\n");
+    a.prompt(Prompt::Search);a.modal.as_mut().unwrap().input="first".into();a.modal.as_mut().unwrap().secondary="*.rs".into();a.modal.as_mut().unwrap().selected=false;
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);key(&mut a,KeyCode::Tab,KeyModifiers::NONE);
+    key(&mut a,KeyCode::Home,KeyModifiers::NONE);key(&mut a,KeyCode::Right,KeyModifiers::SHIFT);key(&mut a,KeyCode::BackTab,KeyModifiers::SHIFT);
+    assert_eq!(App::field_cursor(a.modal.as_ref().unwrap()).selected(&a.modal.as_ref().unwrap().input),Some("f"));
+}
+
+#[path = "input_tests/workspace_edit.rs"]
+mod workspace_edit;
+
+/// Cmd+Backspace as terminals send it: with Cmd reported (kitty protocol) it deletes the line everywhere; as Ctrl+U
+/// (macOS terminals) only on macOS, where Ctrl+U in the text means it. Elsewhere Ctrl+U leaves the text alone.
+#[test]
+fn cmd_backspace_deletes_the_line_as_the_terminal_sends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rb");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let mut a = app(dir.path()); a.dispatch(Command::OpenRetained(path.clone())); settle(&mut a, |a| a.session.state().current_source().is_some()); a.enable_draft_input_for_test(); draw(&mut a, 80, 16);
+    let text = |a: &App| { let s = a.session.state().current_source().unwrap(); s.copy_range(0..s.len_bytes()).unwrap() };
+    key(&mut a, KeyCode::Backspace, KeyModifiers::SUPER);
+    assert_eq!(text(&a), "two\nthree\n");
+    key(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    assert_eq!(text(&a), if crate::app::CMD_BACKSPACE_IS_CTRL_U { "three\n" } else { "two\nthree\n" });
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
 }

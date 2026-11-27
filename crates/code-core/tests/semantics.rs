@@ -12,7 +12,7 @@ use code_core::{
     search::ResultsKind,
     semantics::hierarchy::Direction,
     semantics::Status,
-    session::{Command, CommandId, Completion, Config, Selection, Session},
+    session::{Command, CommandId, Completion, Config, Selection, Session, TrustChoice},
 };
 use lenz_content::highlight::Capture;
 use serde_json::Value;
@@ -60,8 +60,18 @@ fn fixture_input(id: &str, env: &[(&str, &str)], files: &[(&str, &str)], setting
     fixture_ids(&[id], env, files, settings, clock, text_input)
 }
 
-/// As [`fixture_input`], with the fake standing in for every provider in `ids` (each its own server process).
+/// As [`fixture_input`], with the fake standing in for every provider in `ids` (each its own server process). The
+/// project's folder is trusted (its servers run the project's code).
 fn fixture_ids(ids: &[&str], env: &[(&str, &str)], files: &[(&str, &str)], settings: Value, clock: code_core::semantics::Clock, text_input: bool) -> Fixture {
+    fixture_trusting(ids, env, files, settings, clock, text_input, true)
+}
+
+/// As [`fixture_as`], in a folder the user has never been asked to trust (Restricted).
+fn untrusted_fixture(id: &str, files: &[(&str, &str)], settings: Value) -> Fixture {
+    fixture_trusting(&[id], &[], files, settings, std::sync::Arc::new(Instant::now), true, false)
+}
+
+fn fixture_trusting(ids: &[&str], env: &[(&str, &str)], files: &[(&str, &str)], settings: Value, clock: code_core::semantics::Clock, text_input: bool, trusted: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("proj");
     write(&root, "Cargo.toml", "[package]\nname = \"proj\"\n");
@@ -89,19 +99,26 @@ fn fixture_ids(ids: &[&str], env: &[(&str, &str)], files: &[(&str, &str)], setti
     // Only the fake runs: every other provider is pointed nowhere.
     let mut all: serde_json::Map<String, Value> = code_core::semantics::provider::PROVIDERS.iter().map(|p| (p.id.to_string(), serde_json::json!({ "executable": format!("/nonexistent/{}", p.id) }))).collect();
     for id in ids { all.insert((*id).into(), ra.clone()); }
-    std::fs::write(&providers, serde_json::json!({ "providers": all }).to_string()).unwrap();
-    let s = Session::with_text_input(Config {
-        themes: ThemePaths::under(&dir.path().join("config"), &dir.path().join("state"), "lenz-code"),
-        recent: dir.path().join("state/recent-roots.json"),
-        settings: dir.path().join("state/settings.json"),
-        providers,
-        cache: dir.path().join("cache"),
+    // The folder holding the project and its neighbours (dependencies, other projects) the tests open.
+    let trusted: Vec<PathBuf> = if trusted { vec![std::fs::canonicalize(dir.path()).unwrap()] } else { Vec::new() };
+    std::fs::write(&providers, serde_json::json!({ "providers": all, "trusted": trusted }).to_string()).unwrap();
+    let s = session_in(dir.path(), clock, text_input);
+    Fixture { _dir: dir, root, log, s }
+}
+
+/// A session over the fixture folder `dir`'s configuration (as after a restart).
+fn session_in(dir: &Path, clock: code_core::semantics::Clock, text_input: bool) -> Session {
+    Session::with_text_input(Config {
+        themes: ThemePaths::under(&dir.join("config"), &dir.join("state"), "lenz-code"),
+        recent: dir.join("state/recent-roots.json"),
+        settings: dir.join("state/settings.json"),
+        providers: dir.join("config/providers.json"),
+        cache: dir.join("cache"),
         idle: code_core::semantics::IDLE,
         clock,
         overrides: ThemeOverrides::default(),
         dark: true,
-    }, text_input);
-    Fixture { _dir: dir, root, log, s }
+    }, text_input)
 }
 
 /// The fake server: the `fake_lsp` example, built (once per test run; a no-op when fresh) next to this test's
@@ -411,8 +428,50 @@ fn messages(log: &Path) -> Vec<Value> {
 }
 
 fn alive(pid: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Use one observation: a zombie can be reaped between kill -0 and a
+        // second /proc read. Missing after that successful kill was reported alive.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let fields = stat.rsplit_once(')').expect("proc stat has a command").1;
+                let state = fields.split_whitespace().next().expect("proc stat has a state");
+                !matches!(state, "Z" | "X")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => false,
+            Err(error) => panic!("cannot inspect owned helper {pid}: {error}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
-        && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.split(' ').nth(2) == Some("Z"))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn liveness_probe_handles_running_zombie_and_reaped_helpers() {
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "printf 'owned helper' > /proc/self/comm && printf ready && read hold"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let pid = u64::from(child.id());
+    let mut ready = [0; 5];
+    std::io::Read::read_exact(&mut child.stdout.take().unwrap(), &mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    let running = alive(pid);
+    child.kill().unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut zombie = false;
+    while Instant::now() < until {
+        zombie = std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|s| s.lines().any(|line| line.starts_with("State:\tZ")));
+        if zombie { break; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let zombie_running = alive(pid);
+    child.wait().unwrap();
+    assert!(running, "the owned helper must start running");
+    assert!(zombie, "the killed direct child remains reserved until wait");
+    assert!(!zombie_running, "zombies must not count as running, including names with spaces");
+    assert!(!alive(pid), "a reaped helper must stay gone");
 }
 
 const LIB: &str = "pub fn helper() {}\npub struct Thing;\n";
@@ -501,7 +560,7 @@ fn missing_unsupported_failed_empty_and_virtual_answers_are_distinct() {
     // Not installed: setup guidance, and the commands say why they cannot run.
     let mut f = fixture(&[], &[("src/main.rs", MAIN)]);
     let providers = f.root.parent().unwrap().join("config/providers.json");
-    std::fs::write(&providers, r#"{"providers":{"rust-analyzer":{"executable":"/nonexistent/rust-analyzer"}}}"#).unwrap();
+    std::fs::write(&providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": "/nonexistent/rust-analyzer" } }, "trusted": [std::fs::canonicalize(&f.root).unwrap()] }).to_string()).unwrap();
     let mut m = Session::new(Config {
         themes: ThemePaths::under(&f.root.join("../c2"), &f.root.join("../s2"), "lenz-code"),
         recent: f.root.join("../s2/recent.json"),
@@ -622,6 +681,51 @@ fn edits_are_declined_and_initialization_is_not_readiness() {
     f.definition("nothing_here", false);
     f.asked();
     assert!(f.notice("it may still be loading or indexing its workspace"), "{:?}", f.s.state().notices());
+}
+
+/// A file JDT LS checks for syntax only, being outside the build's source folders (its diagnostic code "32"), says so
+/// in the status bar and Server Details, until a publication without it.
+#[test]
+fn a_file_outside_the_build_says_so_until_the_server_takes_it_back() {
+    let mut f = fixture(&[], &[("src/main.rs", MAIN)]);
+    f.open("src/main.rs");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    let uri = format!("file://{}", f.root.join("src/main.rs").display());
+    let mut publish = |items: Value| f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Message {
+        session: 1,
+        message: serde_json::json!({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{"uri":uri, "diagnostics":items}}),
+    }));
+    publish(serde_json::json!([{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":2,"code":"32","source":"Java","message":"main.rs is not on the classpath of project demo, only syntax errors are reported"}]));
+    f.s.dispatch(Command::GoToLine(lenz_content::goto::LineColumn { line: 3, column: Some(1) }));
+    assert!(f.s.state().outside_build().is_some_and(|o| !o.no_project));
+    assert_eq!(f.s.status_message(), "Outside the build's source folders: syntax errors only · F2 for details");
+    let details = f.s.language_server_details();
+    assert!(details.contains("main.rs is not on the classpath of project demo, only syntax errors are reported.\nIts folder is not a source folder of the build."), "{details}");
+    // Brought into the build: the next publication has no such diagnostic.
+    let uri = format!("file://{}", f.root.join("src/main.rs").display());
+    f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Message {
+        session: 1,
+        message: serde_json::json!({"jsonrpc":"2.0", "method":"textDocument/publishDiagnostics", "params":{"uri":uri, "diagnostics":[]}}),
+    }));
+    assert!(f.s.state().outside_build().is_none());
+    assert_ne!(f.s.status_message(), "Outside the build's source folders: syntax errors only · F2 for details");
+}
+
+/// A ready server indexing for a moment around a request (jdtls validates documents) is not still loading: an
+/// empty answer says only that nothing was found.
+#[test]
+fn a_ready_servers_brief_indexing_is_not_reported_as_loading() {
+    let mut f = fixture(&[], &[("src/lib.rs", LIB), ("src/main.rs", MAIN)]);
+    f.open("src/main.rs");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Message {
+        session: 1,
+        message: serde_json::json!({"jsonrpc":"2.0", "method":"$/progress", "params":{"token":"validate", "value":{"kind":"begin", "title":"Validate documents"}}}),
+    }));
+    f.definition("nothing_here", false);
+    f.asked();
+    assert!(f.notice("found no definition here"), "{:?}", f.s.state().notices());
+    assert!(!f.notice("may still be loading"), "{:?}", f.s.state().notices());
 }
 
 #[test]
@@ -843,7 +947,7 @@ fn large_files_are_never_sent_and_dependencies_show_their_origin() {
     f.definition("from_dep", false);
     f.settle(|s| s.state().current_source().is_some_and(|d| d.source().starts_with(&dep)));
     assert_eq!(f.selected_text(), "from_dep");
-    assert!(f.notice("Read-only source from a Cargo dependency"), "{:?}", f.s.state().notices());
+    assert!(f.notice("Source from a Cargo dependency"), "{:?}", f.s.state().notices());
     f.settle(|s| s.state().tree_rows().any(|r| r.name.as_ref() == "sibling.rs"));
     assert!(f.s.state().tree_rows().any(|r| r.name.as_ref() == "Libraries"));
     assert_eq!(f.s.state().project().unwrap().root(), f.root);
@@ -866,7 +970,10 @@ fn percentile(samples: &mut [f64], p: f64) -> f64 {
 
 #[test]
 fn indexing_progress_keeps_percentage_title_and_partial_reports() {
-    let mut f = fixture(&[], &[("src/main.rs", MAIN)]);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let clock = now.clone();
+    let mut f = fixture_with(&[], &[("src/main.rs", MAIN)], serde_json::json!({}), std::sync::Arc::new(move || *clock.lock().unwrap()));
+    let later = || *now.lock().unwrap() += code_core::semantics::REINDEX_QUIET;
     f.open("src/main.rs");
     f.settle(|s| s.state().provider().is_some_and(|p| p.status == Status::Ready));
     let mut progress = |token: Value, value: Value| {
@@ -877,6 +984,12 @@ fn indexing_progress_keeps_percentage_title_and_partial_reports() {
         (f.s.state().language_server_label(), f.s.state().provider().unwrap().summary())
     };
     let (label, detail) = progress(serde_json::json!(7), serde_json::json!({"kind":"begin", "title":"Indexing Ruby files", "message":"app/models", "percentage":0}));
+    // A ready server indexing again stays "ready" in the bar for a moment (servers do so briefly for each opened
+    // file); the details say what it does.
+    assert_eq!(label, "LSP ready");
+    assert!(detail.contains("Indexing Ruby files") && detail.contains("app/models"), "{detail}");
+    later();
+    let (label, detail) = progress(serde_json::json!(7), serde_json::json!({"kind":"report", "percentage":0}));
     assert!(label.contains("0%"), "{label}");
     assert!(detail.contains("Indexing Ruby files") && detail.contains("app/models"), "{detail}");
     let (label, detail) = progress(serde_json::json!(7), serde_json::json!({"kind":"report", "percentage":42}));
@@ -894,7 +1007,76 @@ fn indexing_progress_keeps_percentage_title_and_partial_reports() {
     let (label, _) = progress(serde_json::json!("other"), serde_json::json!({"kind":"end"}));
     assert_eq!(label, "LSP ready");
     let (label, _) = progress(serde_json::json!("next"), serde_json::json!({"kind":"begin", "title":"Loading gems"}));
+    assert_eq!(label, "LSP ready", "quiet again after being ready");
+    later();
+    // The wake a quiet start schedules redraws while it is still indexing.
+    assert!(f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Quiet)).repaint);
+    let label = f.s.state().language_server_label();
     assert!(label.contains("indexing") && !label.contains('%'), "{label}");
+}
+
+/// Switching files loads the text off the UI thread for a few milliseconds. Meanwhile the status bar already
+/// shows the new tab's server and SQL state and no message, so it does not blink "LSP no file" or a path.
+#[test]
+fn status_follows_the_switched_to_tab_while_its_text_loads() {
+    let mut f = fixture(&[], &[("src/main.rs", MAIN), ("src/lib.rs", "pub fn helper() {}\n"), ("notes.md", "# x\n"), ("q.sql", "select 1;\n")]);
+    f.open("src/main.rs");
+    f.settle(|s| s.state().provider().is_some_and(|p| p.status == Status::Ready));
+    f.s.dispatch(Command::GoToLine(lenz_content::goto::LineColumn { line: 2, column: Some(5) }));
+    assert_eq!(f.s.status_position(), "2:5");
+    // Reading it again keeps its caret: shown as last drawn meanwhile, not "Line 1".
+    f.s.dispatch(Command::Reload);
+    assert!(f.s.state().loading().is_some());
+    assert_eq!(f.s.status_position(), "2:5");
+    f.settle(|s| s.state().loading().is_none());
+    assert_eq!(f.s.status_position(), "2:5");
+    f.open("src/lib.rs");
+    for (name, label, sql) in [("src/main.rs", "LSP ready", false), ("notes.md", "LSP unsupported", false), ("q.sql", "LSP unsupported", true)] {
+        f.s.dispatch(Command::Open(f.root.join(name)));
+        assert!(f.s.state().loading().is_some(), "{name}: checked before its text arrives");
+        assert_eq!(f.s.state().language_server_label(), label, "{name}");
+        assert_eq!(f.s.status_message(), "", "{name}");
+        assert_eq!(f.s.state().sql_dialect_label().is_some(), sql, "{name}");
+        // A preview tab showing another file keeps its id, never the other file's caret.
+        let position = f.s.status_position();
+        f.settle(|s| s.state().loading().is_none());
+        assert_eq!(f.s.status_position(), position, "{name}");
+        assert_eq!(f.s.state().language_server_label(), label, "{name}: unchanged once loaded");
+        assert_eq!(f.s.state().sql_dialect_label().is_some(), sql, "{name}");
+    }
+}
+
+/// Status Details names the server and each notice once: the notice first, the server's summary in its section.
+#[test]
+fn status_details_lists_each_notice_and_the_server_once() {
+    let mut f = fixture(&[], &[("src/main.rs", MAIN)]);
+    f.open("src/main.rs");
+    f.settle(|s| s.state().provider().is_some_and(|p| p.status == Status::Ready));
+    f.s.dispatch(Command::Notice("Definition: no definition here".into()));
+    let details = f.s.status_details();
+    let lines: Vec<&str> = details.lines().collect();
+    let summary = format!("Server: {}", f.s.state().provider().unwrap().summary());
+    assert_eq!(lines.iter().filter(|l| **l == summary).count(), 1, "{details}");
+    assert_eq!(lines.iter().filter(|l| **l == "Definition: no definition here").count(), 1, "{details}");
+    assert_eq!(lines.first(), Some(&"Definition: no definition here"), "what needs attention first");
+    // Server Details on its own still ends with the notice.
+    assert!(f.s.language_server_details().ends_with("Definition: no definition here"));
+}
+
+/// A load that is still running after a moment is named, by the file's name only; a quick one never is.
+#[test]
+fn only_a_slow_load_is_named_in_the_status_bar() {
+    let now = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let clock = now.clone();
+    let mut f = fixture_with(&[], &[("src/main.rs", MAIN), ("src/lib.rs", "pub fn helper() {}\n")], serde_json::json!({}), std::sync::Arc::new(move || *clock.lock().unwrap()));
+    f.open("src/main.rs");
+    f.s.dispatch(Command::Open(f.root.join("src/lib.rs")));
+    assert!(f.s.state().loading().is_some());
+    assert_eq!(f.s.status_message(), "");
+    *now.lock().unwrap() += code_core::session::LOADING_QUIET;
+    assert_eq!(f.s.status_message(), "Loading lib.rs…");
+    f.settle(|s| s.state().loading().is_none());
+    assert_eq!(f.s.status_message(), "");
 }
 
 /// An error the server logs or shows (Ruby LSP 0.26.11 logs a failed `initialized` and keeps running) is kept and
@@ -915,11 +1097,14 @@ fn server_errors_are_shown_while_it_keeps_running() {
     assert_eq!(label, "LSP ready");
     assert!(!details.contains("Server error"), "{details}");
     let (label, details, status) = message("window/logMessage", 1, "Error processing initialized: Unable to activate rubocop-1.73.2 (Gem::ConflictError)\n\tfrom specification.rb:1383");
-    assert_eq!((label.as_str(), status), ("LSP error · ready", Status::Ready), "shown, still running");
-    assert!(details.contains("Server error: Error processing initialized") && details.contains("Gem::ConflictError") && details.contains("specification.rb:1383"), "{details}");
+    assert_eq!((label.as_str(), status), ("LSP ready", Status::Ready), "still running; the label follows state, not logs");
+    assert!(details.contains("Server error: Error processing initialized") && details.contains("Gem::ConflictError"), "{details}");
+    // The trace below its first line is in Logs, not in Server Details.
+    assert!(!details.contains("specification.rb:1383") && details.contains("Its full text is in Logs."), "{details}");
     let (_, details, _) = message("window/showMessage", 1, "Error while indexing");
     assert!(details.contains("Error while indexing") && !details.contains("Gem::ConflictError"), "the latest error: {details}");
     assert!(f.s.state().notices().iter().any(|n| n.contains("Error while indexing")), "a shown error is still a notice");
+    assert!(f.s.state().activity_log().iter().any(|row| row.contains("rust-analyzer error: Error processing initialized") && row.contains("specification.rb:1383")), "{:?}", f.s.state().activity_log());
 }
 
 /// Release timing with the fake server: the reader's own cost of a definition round trip (the fake answers
@@ -1090,7 +1275,8 @@ fn usages_list_semantic_references_with_their_provenance() {
     f.caret("lonely");
     f.s.dispatch(Command::Usages);
     f.asked();
-    assert!(f.notice("Usages: rust-analyzer found no usages. Known limits:"), "{:?}", f.s.state().notices());
+    assert!(f.notice("Usages: rust-analyzer found no usages"), "{:?}", f.s.state().notices());
+    assert!(!f.s.state().notices().iter().any(|n| n.contains("Known limits")), "the limits stay in Server Details");
     // Unsupported by the server: not an empty success.
     let mut g = fixture(&[("FAKE_LSP_NO_REFERENCES", "1")], &[("src/main.rs", USES)]);
     g.open("src/main.rs");
@@ -1282,6 +1468,13 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     f.settle(|s| s.state().current_source().is_some_and(|d| d.copy_range(0..d.len_bytes()).unwrap().contains("Omega")));
     let log = f.log.clone();
     f.settle_until(move || messages(&log)[start..].iter().any(|m| m["method"] == "textDocument/didChange"));
+    // The refresh waits until Ruby LSP has applied the new text (its sync barrier answered).
+    let log = f.log.clone();
+    f.settle_until(move || {
+        let messages = messages(&log);
+        let tail = &messages[start..];
+        tail.iter().position(|m| m["method"] == "textDocument/didChange").is_some_and(|c| tail[c..].iter().any(|m| m["method"] == "textDocument/documentSymbol"))
+    });
     f.open("b.rb");
     let log = f.log.clone();
     let uri = code_core::semantics::lsp::file_uri(&f.root.join("a.rb"));
@@ -1296,6 +1489,10 @@ fn ruby_refreshes_a_changed_open_document_and_rechecks_it_after_close() {
     let changed = tail.iter().position(|m| m["method"] == "textDocument/didChange").unwrap();
     let closed = tail.iter().position(|m| m["method"] == "textDocument/didClose").unwrap();
     assert!(tail[changed + 1..closed].iter().any(|m| m["method"] == "textDocument/documentSymbol"), "refresh must follow the new text");
+    // the opening's own barrier can land after `start` under load: only one after the change counts
+    let barrier = changed + tail[changed..].iter().position(|m| m["method"] == "rubyLsp/workspace/addons").unwrap();
+    let refresh = changed + tail[changed..].iter().position(|m| m["method"] == "textDocument/documentSymbol").unwrap();
+    assert!(changed < barrier && barrier < refresh, "the refresh is asked once the text is applied");
     assert!(f.s.state().results().is_none(), "the internal reply must not open a symbol panel");
     assert!(f.s.state().asking().is_none());
 }
@@ -1362,7 +1559,7 @@ fn launch_overrides_settings_and_configuration_are_the_users() {
     // An executable the launch's own PATH lacks: explained, without reading shell startup files.
     let mut g = fixture_with(&[], &[("src/main.rs", USES)], serde_json::json!({ "env": { "PATH": "/nonexistent" } }), std::sync::Arc::new(Instant::now));
     let providers = g.root.parent().unwrap().join("config/providers.json");
-    std::fs::write(&providers, r#"{"providers":{"rust-analyzer":{"executable":"rust-analyzer","env":{"PATH":"/nonexistent"}}}}"#).unwrap();
+    std::fs::write(&providers, serde_json::json!({ "providers": { "rust-analyzer": { "executable": "rust-analyzer", "env": { "PATH": "/nonexistent" } } }, "trusted": [std::fs::canonicalize(&g.root).unwrap()] }).to_string()).unwrap();
     g.s = Session::new(Config {
         themes: ThemePaths::under(&g.root.join("../c3"), &g.root.join("../s3"), "lenz-code"),
         recent: g.root.join("../s3/recent.json"),
@@ -1556,9 +1753,8 @@ fn server_memory_counts_the_server_and_its_helpers_separately() {
     let (server, helpers) = view.memory.unwrap();
     assert!(helpers < server / 4, "the helper (a sleep) is counted apart: {server} {helpers}");
     assert!(view.summary().contains(" MiB + ") && view.summary().ends_with(" MiB helpers"), "{}", view.summary());
-    assert!(code_core::semantics::memory_notice(server + helpers).is_none(), "below the notice threshold");
+    // Memory is shown, never warned about: no notice however much the servers use.
     assert!(!f.s.state().notices().iter().any(|n| n.starts_with("Language servers use")));
-    assert_eq!(code_core::semantics::memory_notice(3 << 30).as_deref(), Some("Language servers use 3.0 GiB (above 2 GiB); disable or restart ones you do not need"));
 }
 
 /// Release timing with the fake server: usages (500 references over 50 files, all read and located by the
@@ -1705,6 +1901,157 @@ fn a_selected_name_is_asked_about_at_its_start() {
     assert_eq!(positions, [at as u64, at as u64], "either direction: the name's start, never past its end");
 }
 
+/// JDT LS re-imports from its build files: a changed pom.xml reaches it (other files do not, as it does not rely on
+/// Lenz for them), it is asked to update without prompting, and when its re-import ends (an "Updating …" status, then
+/// ProjectStatus) open files are reopened so they lose the old project's errors.
+#[test]
+fn jdtls_hears_of_build_file_changes_and_open_files_are_reopened_after_a_reimport() {
+    let files = [("pom.xml", "<project/>\n"), ("src/A.java", "class A {}\n")];
+    let mut f = fixture_as("jdtls", &[("FAKE_LSP_JDT", "1")], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("src/A.java");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    let initialize = messages(&f.log).into_iter().find(|m| m["method"] == "initialize").unwrap();
+    assert_eq!(initialize["params"]["initializationOptions"]["settings"]["java"]["configuration"]["updateBuildConfiguration"], "automatic");
+    std::fs::write(f.root.join("pom.xml"), "<project><!-- changed --></project>\n").unwrap();
+    f.s.dispatch(Completion::Changed(code_core::watch::Change { paths: [f.root.join("pom.xml"), f.root.join("src/A.java")].into_iter().collect(), ..Default::default() }));
+    let log = f.log.clone();
+    f.settle_until(move || messages(&log).iter().any(|m| m["method"] == "workspace/didChangeWatchedFiles"));
+    let watched: Vec<Value> = messages(&f.log).into_iter().filter(|m| m["method"] == "workspace/didChangeWatchedFiles").collect();
+    assert_eq!(watched.len(), 1, "{watched:?}");
+    assert_eq!(watched[0]["params"]["changes"].as_array().unwrap().len(), 1, "only the build file: {watched:?}");
+    assert!(watched[0]["params"]["changes"][0]["uri"].as_str().unwrap().ends_with("/pom.xml"));
+    let status = |f: &mut Fixture, kind: &str, message: &str| f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Message {
+        session: 1,
+        message: serde_json::json!({"jsonrpc":"2.0", "method":"language/status", "params":{"type":kind, "message":message}}),
+    }));
+    let opens = |log: &Path| messages(log).iter().filter(|m| m["method"] == "textDocument/didOpen").count();
+    let before = opens(&f.log);
+    status(&mut f, "ProjectStatus", "OK");
+    assert!(!messages(&f.log).iter().any(|m| m["method"] == "textDocument/didClose"), "a status at start reopens nothing");
+    status(&mut f, "Message", "Updating proj configuration");
+    status(&mut f, "ProjectStatus", "OK");
+    let log = f.log.clone();
+    f.settle_until(move || opens(&log) > before);
+    let closed = messages(&f.log).into_iter().filter(|m| m["method"] == "textDocument/didClose").count();
+    assert_eq!(closed, 1);
+}
+
+/// Maven Profiles… activates profiles of the project's pom.xml for JDT LS's import: Lenz writes them to a settings
+/// file of its own, points the project's `java.configuration.maven.globalSettings` at it and restarts the server
+/// with it; an unknown profile changes nothing.
+#[test]
+fn maven_profiles_are_given_to_jdtls_through_a_settings_file_of_lenzs() {
+    let pom = "<project><profiles><profile><id>benchmarks</id></profile><profile><id>release</id></profile></profiles></project>\n";
+    let files = [("pom.xml", pom), ("src/A.java", "class A {}\n")];
+    let mut f = fixture_as("jdtls", &[("FAKE_LSP_JDT", "1")], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("src/A.java");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    assert_eq!(f.s.disabled(CommandId::MavenProfiles), None);
+    let project = f.s.maven_project().unwrap();
+    assert_eq!((project.available.clone(), project.active.clone()), (vec!["benchmarks".to_owned(), "release".to_owned()], vec![]));
+    assert!(f.s.maven_profiles_prompt().contains("pom.xml declares: benchmarks, release"), "{}", f.s.maven_profiles_prompt());
+    assert!(f.s.language_server_details().contains("Maven profiles: the defaults (pom.xml declares benchmarks, release;"));
+    f.s.dispatch(Command::SetMavenProfiles("nightly".into()));
+    assert!(f.notice("nightly is not a profile of this pom.xml"), "{:?}", f.s.state().notices());
+    f.s.dispatch(Command::SetMavenProfiles("benchmarks".into()));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Maven profiles for")));
+    assert!(f.notice("Maven profiles for proj: benchmarks. Eclipse JDT LS restarts"), "the folder's name, not its path: {:?}", f.s.state().notices());
+    assert_eq!(code_core::semantics::maven::active_in(&project.xml), ["benchmarks"]);
+    // Restarted with the file as its Maven global settings (added to the user's own ~/.m2/settings.xml).
+    let log = f.log.clone();
+    let xml = project.xml.display().to_string();
+    f.settle_until(move || messages(&log).iter().filter(|m| m["method"] == "initialize").any(|m| m["params"]["initializationOptions"]["settings"]["java"]["configuration"]["maven"]["globalSettings"] == xml.as_str()));
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    assert_eq!(f.s.maven_project().unwrap().active, ["benchmarks"]);
+    assert!(f.s.language_server_details().contains("Maven profiles: benchmarks (pom.xml declares benchmarks, release;"));
+}
+
+/// A file outside the build whose folder an inactive Maven profile adds: the status bar and F2 name that profile, and
+/// one action activates it (keeping the active ones).
+#[test]
+fn the_maven_profile_that_adds_a_files_folder_is_offered() {
+    let pom = "<project><profiles><profile><id>security</id></profile><profile><id>benchmarks</id><build><plugins><plugin><executions><execution><configuration><sources><source>${project.basedir}/src/jmh/java</source></sources></configuration></execution></executions></plugin></plugins></build></profile></profiles></project>\n";
+    let files = [("pom.xml", pom), ("src/jmh/java/B.java", "class B {}\n")];
+    let mut f = fixture_as("jdtls", &[("FAKE_LSP_JDT", "1"), ("FAKE_LSP_OUTSIDE", "1")], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("src/jmh/java/B.java");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready) && s.state().outside_build().is_some());
+    f.s.dispatch(Command::GoToLine(lenz_content::goto::LineColumn { line: 1, column: Some(8) }));
+    assert_eq!(f.s.maven_suggestion(), Some(("benchmarks".to_owned(), "src/jmh/java".to_owned())));
+    assert_eq!(f.s.status_message(), "Outside the build: Maven profile benchmarks adds its folder · F2 to include it");
+    let rows = f.s.language_server_rows();
+    assert_eq!(rows[1], ("Activate Maven Profile “benchmarks” for This File".to_owned(), Some(CommandId::IncludeInBuild)));
+    assert!(f.s.language_server_details().contains("Its folder src/jmh/java is added by the Maven profile benchmarks, which is not active."));
+    // JDT LS's "… does not exist" error says what that row explains: kept in Logs, not repeated.
+    f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Message {
+        session: 1,
+        message: serde_json::json!({"jsonrpc":"2.0", "method":"window/logMessage", "params":{"type":1, "message":"Nov 21 src/jmh/java [in proj] does not exist\nJava Model Exception"}}),
+    }));
+    assert!(!f.s.language_server_details().contains("Server error:"));
+    // A lookup that finds nothing says why.
+    f.definition("class B", false);
+    f.asked();
+    assert!(f.notice("found no definition here (this file is outside the build; the Maven profile benchmarks adds it: F2)"), "{:?}", f.s.state().notices());
+    let xml = f.s.maven_project().unwrap().xml;
+    f.s.dispatch(Command::IncludeInBuild);
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Maven profiles for proj: benchmarks.")));
+    assert_eq!(code_core::semantics::maven::active_in(&xml), ["benchmarks"]);
+}
+
+/// Go to Definition on `this` lands on the class around it (as IntelliJ does), from Lenz's own parse: JDT LS answers
+/// nothing for `this`, inside the build or not, so it is not asked.
+#[test]
+fn definition_on_this_lands_on_the_enclosing_class() {
+    let source = "package demo;\n\npublic class Holder {\n    private final int value;\n\n    public Holder(int value) {\n        this.value = value;\n    }\n}\n";
+    let files = [("pom.xml", "<project/>\n"), ("src/demo/Holder.java", source)];
+    let mut f = fixture_as("jdtls", &[("FAKE_LSP_JDT", "1")], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("src/demo/Holder.java");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready) && s.state().active().and_then(|t| s.state().view(t.id())).is_some_and(|v| v.declarations().is_some()));
+    f.definition("this.value", false);
+    f.asked();
+    assert_eq!(f.selected_text(), "Holder");
+    assert_eq!(f.s.state().selection().unwrap().range().start, source.find("Holder {").unwrap(), "the class's name, not the constructor's");
+    assert!(!messages(&f.log).iter().any(|m| m["method"] == "textDocument/definition"), "the server is not asked about `this`");
+    // Back returns to `this`.
+    f.s.dispatch(Command::Back);
+    let at = source.find("this.value").unwrap();
+    assert!((at..at + 4).contains(&f.s.state().selection().unwrap().head), "back on `this`");
+}
+
+/// With breadcrumbs and sticky scroll off the tab holds no parse: Go to Definition on `this` makes one of its own, off
+/// the UI thread, and lands on the class; the server is not asked.
+#[test]
+fn definition_on_this_parses_when_the_tab_holds_no_parse() {
+    let source = "package demo;\n\npublic class Holder {\n    private final int value;\n\n    public Holder(int value) {\n        this.value = value;\n    }\n}\n";
+    let files = [("pom.xml", "<project/>\n"), ("src/demo/Holder.java", source)];
+    let mut f = fixture_as("jdtls", &[("FAKE_LSP_JDT", "1")], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+    f.s.dispatch(Command::SetBreadcrumbs(false));
+    f.s.dispatch(Command::SetStickyScroll(false));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("src/demo/Holder.java");
+    f.settle(|s| s.state().provider().is_some_and(|v| v.status == Status::Ready));
+    assert!(f.s.state().active().and_then(|t| f.s.state().view(t.id())).unwrap().declarations().is_none(), "no parse held");
+    f.definition("this.value", false);
+    f.settle(|s| s.state().selection().is_some_and(|sel| sel.anchor != sel.head));
+    assert_eq!(f.selected_text(), "Holder");
+    assert!(!messages(&f.log).iter().any(|m| m["method"] == "textDocument/definition"), "the server is not asked about `this`");
+}
+
+/// The class `this` names is found with no server holding the text: in a folder never trusted, JDT LS does not start.
+#[test]
+fn definition_on_this_needs_no_server() {
+    let source = "public class Holder {\n    int value;\n    Holder(int value) { this.value = value; }\n}\n";
+    let mut f = untrusted_fixture("jdtls", &[("pom.xml", "<project/>\n"), ("Holder.java", source)], serde_json::json!({}));
+    f.s.dispatch(Command::Open(f.root.join("Holder.java")));
+    f.settle(|s| s.state().active().and_then(|t| s.state().view(t.id())).is_some_and(|v| v.declarations().is_some()));
+    f.definition("this.value", false);
+    assert_eq!(f.selected_text(), "Holder");
+    assert!(f.s.state().asking().is_none());
+}
+
 #[test]
 fn a_virtual_definition_target_is_retrieved_into_a_read_only_tab_of_its_session() {
     let files = [("pom.xml", ""), ("src/A.java", "class A {\n    void m() { virt(); }\n}\n")];
@@ -1778,7 +2125,11 @@ fn background_lanes_never_cancel_a_pending_definition() {
     f.s.dispatch(Command::HighlightAt);
     f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("lib.rs"))); // the definition still arrived
     let log = messages(&f.log);
-    assert!(!log.iter().any(|m| m["method"] == "$/cancelRequest"), "nothing was cancelled");
+    let definition = log.iter().find(|m| m["method"] == "textDocument/definition").expect("the foreground request reached the server");
+    // Following the definition can cancel highlights of the file we just left.
+    // Protect the foreground request itself, regardless of that background timing.
+    let cancelled: Vec<_> = log.iter().filter(|m| m["method"] == "$/cancelRequest").collect();
+    assert!(!cancelled.iter().any(|m| m["params"]["id"] == definition["id"]), "the pending definition was cancelled: {cancelled:?}");
 }
 
 #[test]
@@ -1791,10 +2142,10 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
     assert_eq!(f.s.context_menu(), vec![
         C(CommandId::Definition), C(CommandId::PeekDefinition), C(CommandId::TypeDefinition),
         C(CommandId::Implementation), C(CommandId::Usages), C(CommandId::CallHierarchy),
-        C(CommandId::TypeHierarchy), C(CommandId::Documentation), Separator,
+        C(CommandId::TypeHierarchy), C(CommandId::Documentation), C(CommandId::RenameSymbol), Separator,
         C(CommandId::Collapse), C(CommandId::Expand), C(CommandId::CollapseAll), C(CommandId::ExpandAll), Separator,
         C(CommandId::Copy), C(CommandId::SendSelectionToTerminal), C(CommandId::Cut), C(CommandId::Paste), C(CommandId::Delete), C(CommandId::ReadOnlyMode),
-        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::LocateFile), Separator,
+        C(CommandId::CopyPath), C(CommandId::CopyPathLine), C(CommandId::CopyReference), C(CommandId::LocateFile), Separator,
         C(CommandId::AnnotateBlame), Separator, C(CommandId::OpenInEditor), C(CommandId::OpenWithDefaultApp),
         C(CommandId::ResolveExternalChange), C(CommandId::CompareWith), C(CommandId::CompareSaved), C(CommandId::CloseSavedComparison), Separator,
         C(CommandId::SplitRight), C(CommandId::SplitDown),
@@ -1807,6 +2158,7 @@ fn the_context_menu_lists_navigation_then_copy_and_copies_paths() {
     assert_eq!(f.s.disabled(CommandId::CloseSavedComparison), Some("No saved comparison is open"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: false }).copy.as_deref(), Some("src/main.rs"));
     assert_eq!(f.s.dispatch(Command::CopyPath { line: true }).copy.as_deref(), Some("src/main.rs:2"));
+    assert_eq!(f.s.dispatch(Command::CopyReference).copy.as_deref(), Some("crate::main"), "the function holding the caret");
     assert_eq!(CommandId::CopyPathLine.label(), "Copy Path:Line");
     assert!(CommandId::ALL.contains(&CommandId::CopyPath));
     assert_eq!(f.s.disabled(CommandId::CopyPath), None);
@@ -2054,7 +2406,13 @@ fn a_new_version_cancels_the_older_request_and_asks_again() {
     f.settle_until(|| !sent(&log, "textDocument/inlayHint").is_empty());
     write(&f.root, "src/main.rs", &HINTED.replace("add(1)", "add(2)"));
     f.s.dispatch(Command::Reload);
-    f.settle_until(|| sent(&log, "textDocument/inlayHint").len() >= 2);
+    // Earlier background requests can already make the count reach two. Wait for the
+    // actual post-change request before asserting protocol order.
+    f.settle_until(|| {
+        let all = messages(&log);
+        all.iter().position(|m| m["method"] == "textDocument/didChange")
+            .is_some_and(|change| all.iter().skip(change + 1).any(|m| m["method"] == "textDocument/inlayHint"))
+    });
     // The fake answers one request at a time (300 ms each), so the older one is still pending when the text changes.
     f.settle_until(|| !sent(&log, "$/cancelRequest").is_empty());
     let hint_ids: Vec<Value> = sent(&f.log, "textDocument/inlayHint").iter().map(|m| m["id"].clone()).collect();
@@ -2545,7 +2903,7 @@ fn initialize_declares_call_hierarchy_support() {
 }
 
 /// A TypeScript 7 project (its TypeScript has no tsserver) is served by typescript-go, launched as the project's own
-/// `node_modules/.bin/tsc` with `--lsp --stdio`, and named so.
+/// `node_modules/.bin/tsc` with `--lsp --stdio` once the user trusts the opened folder, and named so.
 #[test]
 fn a_typescript_7_project_is_served_by_typescript_go_from_its_own_tsc() {
     let files = [("package.json", "{}\n"), ("node_modules/typescript/package.json", "{ \"name\": \"typescript\", \"version\": \"7.0.2\" }\n"), ("src/a.ts", "export const a = 1;\n"), ("src/lib/b.ts", "export const b = 2;\n")];
@@ -2555,6 +2913,9 @@ fn a_typescript_7_project_is_served_by_typescript_go_from_its_own_tsc() {
     std::fs::create_dir_all(tsc.parent().unwrap()).unwrap();
     std::fs::copy(f.root.parent().unwrap().join("fake-server"), &tsc).unwrap();
     f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| s.disabled(CommandId::UntrustProjectTools).is_none());
     f.open("src/a.ts");
     let view = f.s.state().provider().unwrap();
     assert_eq!((view.name, view.root.as_deref()), ("typescript-go", Some(f.root.as_path())));
@@ -2576,6 +2937,422 @@ fn a_typescript_7_project_is_served_by_typescript_go_from_its_own_tsc() {
     f.settle(|s| s.state().servers().iter().all(|v| v.name != "typescript-go"));
 }
 
+/// The servers that run a project's code (its build, its Gemfile, its TypeScript and plugins), one fixture each: the
+/// provider, the file opened and the project files beside it.
+/// A gated provider's fixture: its id, the file opened and the project files.
+type GatedFixture = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
+const GATED: [GatedFixture; 6] = [
+    ("rust-analyzer", "src/main.rs", &[("src/main.rs", "fn main() {}\n")]),
+    ("typescript-language-server", "src/a.ts", &[("package.json", "{}\n"), ("src/a.ts", "export const a = 1;\n")]),
+    ("ruby-lsp", "lib/a.rb", &[("Gemfile", "source \"https://rubygems.org\"\n"), ("lib/a.rb", "class A; end\n")]),
+    ("jdtls", "src/Main.java", &[("pom.xml", "<project/>\n"), ("src/Main.java", "class Main {}\n")]),
+    ("kotlin-lsp", "src/Main.kt", &[("build.gradle.kts", "\n"), ("src/Main.kt", "class Main\n")]),
+    ("gopls", "main.go", &[("go.mod", "module m\n"), ("main.go", "package main\n")]),
+];
+
+/// `id`'s fixture whose every program (the server, and the `bundle` beside it that Ruby LSP composes its bundle with)
+/// leaves `marker` when it runs.
+fn marked_fixture(id: &str, files: &[(&str, &str)]) -> (Fixture, PathBuf) {
+    let f = untrusted_fixture(id, files, serde_json::json!({}));
+    let marker = f._dir.path().join("project-code-ran");
+    let fake = f._dir.path().join("fake-server");
+    let text = std::fs::read_to_string(&fake).unwrap();
+    std::fs::write(&fake, text.replacen("#!/bin/sh\n", &format!("#!/bin/sh\ntouch '{}'\n", marker.display()), 1)).unwrap();
+    script(&f._dir.path().join("bundle"), &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+    (f, marker)
+}
+
+/// Restricted: in an opened folder the user has not trusted, no server that runs the project's code starts, and
+/// nothing it would run (its version probe, Ruby LSP's `bundle lock`) runs either.
+#[test]
+fn an_untrusted_folder_starts_no_server_that_runs_project_code() {
+    let mut ran = Vec::new();
+    for (id, file, files) in GATED {
+        let (mut f, marker) = marked_fixture(id, files);
+        f.s.dispatch(Command::OpenRoot(f.root.clone()));
+        f.settle(|s| s.state().project().is_some());
+        f.s.dispatch(Command::Open(f.root.join(file)));
+        f.settle(|s| s.state().provider().is_some_and(|v| v.root.is_some() && !matches!(v.status, Status::Queued | Status::Starting)));
+        if marker.exists() { ran.push((id, f.s.state().provider().map(|v| v.status))); }
+    }
+    assert!(ran.is_empty(), "ran in a folder that is not trusted: {ran:?}");
+}
+
+/// The status a server held back in Restricted mode shows.
+fn restricted(s: &Session) -> bool {
+    s.state().provider().is_some_and(|v| matches!(v.status, Status::Restricted(_)))
+}
+
+/// Restricted mode end to end, for each server that runs a project's code: held back with its status saying so, one
+/// dialog naming what would run, Trust starts it without reopening anything, and Stop Trusting stops it again and is
+/// remembered (declined), so it is not asked about again.
+#[test]
+fn trusting_a_restricted_folder_starts_what_was_held_back_and_stop_trusting_stops_it() {
+    for (id, file, files) in GATED {
+        let (mut f, marker) = marked_fixture(id, files);
+        f.s.dispatch(Command::OpenRoot(f.root.clone()));
+        f.settle(|s| s.state().project().is_some());
+        assert_eq!(f.s.restricted_label(), Some("Restricted"), "{id}");
+        f.s.dispatch(Command::Open(f.root.join(file)));
+        f.settle(restricted);
+        let view = f.s.state().provider().unwrap();
+        assert_eq!(view.status_label(), "LSP off until trusted");
+        assert!(view.summary().contains("off until you trust this folder"), "{}", view.summary());
+        let runs = code_core::semantics::provider::PROVIDERS.iter().find(|p| p.id == id).unwrap().runs;
+        assert!(!runs.is_empty());
+        let text = f.s.trust_text().unwrap_or_default();
+        assert!(text.contains(runs) && text.contains(&f.root.display().to_string()), "{id}: {text}");
+        assert_eq!(f.s.trust_choices().first().map(|c| c.1), Some(TrustChoice::StayRestricted), "the default first");
+        assert!(f.s.language_server_details().contains("Off until you trust this folder"), "{id}");
+        assert!(!marker.exists(), "{id} ran before the folder was trusted");
+        // Trust: what was held back starts, with nothing reopened.
+        f.s.dispatch(Command::TrustChoice(TrustChoice::Trust));
+        assert!(f.s.trust_text().is_none());
+        f.settle(ready);
+        assert!(marker.exists(), "{id} did not start once trusted");
+        assert_eq!(f.s.restricted_label(), None);
+        // Stop trusting: it stops (Restricted again) and the folder is declined, never asked about again.
+        std::fs::remove_file(&marker).unwrap();
+        f.s.dispatch(Command::SetProjectToolsTrusted(false));
+        f.settle(restricted);
+        assert!(f.s.trust_text().is_none(), "{id}: a declined folder is not asked about");
+        assert_eq!(f.s.restricted_label(), Some("Restricted"));
+        assert!(!marker.exists(), "{id} started in a folder that is no longer trusted");
+        let providers = f._dir.path().join("config/providers.json");
+        let real = std::fs::canonicalize(&f.root).unwrap();
+        f.settle_until(|| std::fs::read(&providers).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v| v["declined"] == serde_json::json!([real])));
+    }
+}
+
+/// One dialog per folder, whatever holds back: two servers and a formatter add what they would run to the dialog
+/// already open. Stay Restricted is remembered: after a restart (the settings read again) nothing asks, and the
+/// servers stay off.
+#[test]
+fn one_dialog_asks_once_per_folder_and_staying_restricted_survives_a_restart() {
+    let files = [("src/main.rs", "fn main() {}\n"), ("go.mod", "module m\n"), ("main.go", "package main\n"), (".erb_lint.yml", "linters: {}\n"), ("a.html.erb", "<p><%= 1 %></p>\n")];
+    let mut f = fixture_trusting(&["rust-analyzer", "gopls"], &[], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now), true, false);
+    let marker = f._dir.path().join("erb-lint-ran");
+    script(&f.root.join("bin/erb_lint"), &format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    assert!(f.s.trust_text().is_none(), "opening a folder runs nothing, so asks nothing");
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    f.settle(|s| restricted(s) && s.trust_text().is_some());
+    f.s.dispatch(Command::Open(f.root.join("main.go")));
+    f.settle(|s| restricted(s) && s.trust_text().is_some_and(|t| t.contains("gopls would run")));
+    f.s.dispatch(Command::Open(f.root.join("a.html.erb")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("a.html.erb")));
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Format Document:")));
+    assert!(f.notice("Format Document: Off until you trust this folder (erb_lint would run"), "{:?}", f.s.state().notices());
+    assert!(!marker.exists(), "erb_lint ran before the folder was trusted");
+    let text = f.s.trust_text().unwrap();
+    assert!(text.contains("rust-analyzer would run") && text.contains("gopls would run") && text.contains("erb_lint would run"), "{text}");
+    f.s.dispatch(Command::TrustChoice(TrustChoice::StayRestricted));
+    assert!(f.s.trust_text().is_none());
+    // Asked once: holding back again asks nothing.
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    f.settle(restricted);
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    assert!(f.s.trust_text().is_none());
+    // Restarted: still declined, nothing asks, nothing runs.
+    let providers = f._dir.path().join("config/providers.json");
+    f.settle_until(|| std::fs::read_to_string(&providers).is_ok_and(|t| t.contains("declined")));
+    f.s = session_in(f._dir.path(), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    assert_eq!(f.s.folder_trust(), Some(code_core::semantics::provider::Trust::Declined));
+    f.s.dispatch(Command::Open(f.root.join("main.go")));
+    f.settle(restricted);
+    assert!(f.s.trust_text().is_none(), "a declined folder is not asked about after a restart");
+    // The Restricted item (Folder Trust…) still opens the dialog, and Trust then starts the server.
+    f.s.dispatch(Command::OpenFolderTrust);
+    assert!(f.s.trust_text().is_some_and(|t| t.contains("You chose to keep it restricted")));
+    f.s.dispatch(Command::TrustChoice(TrustChoice::Trust));
+    f.settle(ready);
+    // Trusted, the project's erb_lint runs.
+    f.s.dispatch(Command::Open(f.root.join("a.html.erb")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("a.html.erb")));
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle_until(|| marker.exists());
+}
+
+/// A dialog or a held-back server's report about a folder no longer open does not ask about the next one, and with
+/// no folder open nothing asks (a file outside every trusted folder stays restricted).
+#[test]
+fn trust_is_asked_only_about_the_open_folder() {
+    let (mut f, marker) = marked_fixture("rust-analyzer", GATED[0].2);
+    let other = f._dir.path().join("other");
+    write(&other, "README.md", "# other\n");
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    // The held-back server's report is kept back until the next folder has opened: arriving late, it does not ask
+    // about that folder.
+    let rx = f.s.completions();
+    let until = Instant::now() + Duration::from_secs(15);
+    let late = loop {
+        assert!(Instant::now() < until, "no report from the held-back server");
+        match recv(&rx) {
+            Ok(c @ Completion::Semantic(code_core::semantics::Event::Restricted { .. })) => break c,
+            Ok(c) => { f.s.dispatch(c); }
+            Err(()) => {}
+        }
+    };
+    assert!(f.s.trust_text().is_none());
+    f.s.dispatch(Command::OpenRoot(other.clone()));
+    f.settle(|s| s.state().project().is_some_and(|p| p.root() == other));
+    f.s.dispatch(late);
+    assert!(f.s.trust_text().is_none(), "a report about the previous folder asked about this one");
+    assert_eq!(f.s.folder_trust(), Some(code_core::semantics::provider::Trust::Unasked));
+    // A dialog open for the previous folder does not stay for the next one.
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some_and(|p| p.root() != other));
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    f.settle(|s| s.trust_text().is_some());
+    f.s.dispatch(Command::OpenRoot(other.clone()));
+    f.settle(|s| s.state().project().is_some_and(|p| p.root() == other));
+    assert!(f.s.trust_text().is_none(), "the previous folder's dialog stayed open");
+    f.s.dispatch(Command::Open(other.join("README.md")));
+    f.settle(|s| s.state().current_source().is_some());
+    assert!(f.s.trust_text().is_none(), "a folder where nothing is held back is not asked about");
+    // No folder open: a project file alone stays restricted (Cargo.toml beside it), and nothing asks.
+    let (mut f, marker2) = marked_fixture("rust-analyzer", &[("main.rs", "fn main() {}\n")]);
+    f.s.dispatch(Command::Open(f.root.join("main.rs")));
+    f.settle(restricted);
+    assert!(f.s.trust_text().is_none() && f.s.restricted_label().is_none());
+    f.s.dispatch(Command::OpenFolderTrust);
+    assert!(f.s.trust_text().is_none(), "Folder Trust… needs an open folder");
+    assert_eq!(f.s.disabled(CommandId::FolderTrust), Some("No folder is open: open the project's folder to trust its tools"));
+    assert!(!marker.exists() && !marker2.exists());
+}
+
+/// Trust Parent Folder trusts the folder holding the open one, and every folder in it: another project there is
+/// trusted too. Stop Trusting in a folder inside it keeps just that folder restricted.
+#[test]
+fn trust_parent_folder_trusts_the_folders_beside_the_open_one() {
+    let (mut f, marker) = marked_fixture("rust-analyzer", GATED[0].2);
+    let sibling = f._dir.path().join("sibling");
+    write(&sibling, "Cargo.toml", "[package]\nname = \"s\"\n");
+    write(&sibling, "src/main.rs", "fn main() {}\n");
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    f.settle(|s| s.trust_text().is_some());
+    let parent = std::fs::canonicalize(f._dir.path()).unwrap();
+    assert!(f.s.trust_text().unwrap().contains(&format!("Trust Parent Folder trusts {}", parent.display())));
+    assert_eq!(f.s.trust_choices().into_iter().map(|c| c.1).collect::<Vec<_>>(), [TrustChoice::StayRestricted, TrustChoice::Trust, TrustChoice::TrustParent]);
+    f.s.dispatch(Command::TrustChoice(TrustChoice::TrustParent));
+    f.settle(ready);
+    assert!(marker.exists());
+    f.s.dispatch(Command::OpenRoot(sibling.clone()));
+    f.settle(|s| s.state().project().is_some_and(|p| p.root() == sibling));
+    assert_eq!(f.s.folder_trust(), Some(code_core::semantics::provider::Trust::Trusted));
+    f.s.dispatch(Command::Open(sibling.join("src/main.rs")));
+    f.settle(ready);
+    f.s.dispatch(Command::SetProjectToolsTrusted(false));
+    f.settle(restricted);
+    assert_eq!(f.s.folder_trust(), Some(code_core::semantics::provider::Trust::Declined), "the folder inside the trusted one");
+}
+
+/// Restricted: Format Document on a template does not run the project's erb_lint binstub (it loads the project's
+/// linters) in a folder the user has not trusted.
+#[test]
+fn an_untrusted_folder_does_not_run_the_projects_erb_lint() {
+    let files = [(".erb_lint.yml", "linters: {}\n"), ("app/views/a.html.erb", "<p><%= 1 %></p>\n")];
+    let mut f = untrusted_fixture("ruby-lsp", &files, serde_json::json!({ "executable": "/nonexistent/ruby-lsp" }));
+    let marker = f._dir.path().join("erb-lint-ran");
+    script(&f.root.join("bin/erb_lint"), &format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::Open(f.root.join("app/views/a.html.erb")));
+    f.settle(|s| s.state().current_source().is_some());
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Format Document:")));
+    assert!(!marker.exists(), "the project's erb_lint ran in a folder that is not trusted: {:?}", f.s.state().notices());
+}
+
+/// A trusted folder bounds where a lone file's project is looked for, but is not opened by it: a file with no project
+/// file between it and the trusted folder holding it has its own folder as its workspace, never the trusted folder
+/// (which may hold many checkouts).
+#[test]
+fn a_lone_file_in_a_trusted_folder_is_not_served_as_the_whole_folder() {
+    for (id, file) in [("pyright", "a/b/x.py"), ("yaml-language-server", "a/b/x.yaml"), ("typescript-language-server", "a/b/x.ts")] {
+        let mut f = fixture_as(id, &[], &[(file, "x = 1\n")], serde_json::json!({}), std::sync::Arc::new(Instant::now));
+        std::fs::remove_file(f.root.join("Cargo.toml")).unwrap();
+        f.s.dispatch(Command::Open(f.root.join(file)));
+        f.settle(|s| s.state().provider().is_some_and(|v| v.root.is_some()));
+        assert_eq!(f.s.state().provider().and_then(|v| v.root), Some(f.root.join("a/b")), "{id}");
+    }
+}
+
+/// Workspace discovery stops at the opened folder: a Cargo workspace or a `go.work` above it is not the project's,
+/// even in a trusted folder (its server would build what is above).
+#[test]
+fn workspaces_above_the_opened_folder_are_not_used() {
+    for (id, file, files) in [
+        ("rust-analyzer", "crate/src/main.rs", &[("Cargo.toml", "[workspace]\nmembers = [\"crate\"]\n"), ("crate/Cargo.toml", "[package]\nname = \"c\"\n"), ("crate/src/main.rs", "fn main() {}\n")][..]),
+        ("gopls", "crate/main.go", &[("go.work", "go 1.22\n"), ("crate/go.mod", "module m\n"), ("crate/main.go", "package main\n")][..]),
+    ] {
+        let mut f = fixture_as(id, &[], files, serde_json::json!({}), std::sync::Arc::new(Instant::now));
+        let folder = f.root.join("crate");
+        f.s.dispatch(Command::OpenRoot(folder.clone()));
+        f.settle(|s| s.state().project().is_some());
+        f.s.dispatch(Command::SetProjectToolsTrusted(true));
+        f.settle(|s| s.disabled(CommandId::UntrustProjectTools).is_none());
+        f.s.dispatch(Command::Open(f.root.join(file)));
+        f.settle(|s| s.state().provider().is_some_and(|v| v.root.is_some()));
+        assert_eq!(f.s.state().provider().and_then(|v| v.root), Some(folder), "{id}");
+    }
+}
+
+/// A project's own `tsc` is the project's program. Opened alone, or in a folder that is not trusted, it never runs: its
+/// server says why and how to trust the folder. Trusting the folder runs it and is kept, privately, in providers.json
+/// outside the checkout; stopping trusting stops it. A `tsc` above the trusted folder is never searched for.
+#[test]
+fn a_project_tsc_runs_only_in_a_trusted_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let files = [("package.json", "{}\n"), ("node_modules/typescript/package.json", "{ \"name\": \"typescript\", \"version\": \"7.0.2\" }\n"), ("src/a.ts", "export const a = 1;\n"), ("app/package.json", "{}\n"), ("app/b.ts", "export const b = 2;\n")];
+    let settings = serde_json::json!({ "executable": null, "env": { "PATH": "/nonexistent" } });
+    let untrusted = |s: &Session| s.state().provider().is_some_and(|v| v.name == "typescript-go" && matches!(&v.status, Status::Missing(why) if why.contains("is the project's program")));
+    // The project's tsc leaves a marker, then serves as the fake.
+    let fixture = || {
+        let f = untrusted_fixture("typescript-go", &files, settings.clone());
+        let marker = f._dir.path().join("tsc-ran");
+        script(&f.root.join("node_modules/.bin/tsc"), &format!("#!/bin/sh\n: > '{}'\nexec '{}' \"$@\"\n", marker.display(), f._dir.path().join("fake-server").display()));
+        (f, marker)
+    };
+    // Opened alone (no folder): nothing to trust, nothing above the file's folder is its project, and nothing runs.
+    let (mut f, marker) = fixture();
+    f.s.dispatch(Command::Open(f.root.join("src/a.ts")));
+    f.settle(|s| s.state().provider().is_some_and(|v| v.root.is_some() && !matches!(v.status, Status::Queued | Status::Starting)));
+    assert_eq!(f.s.disabled(CommandId::TrustProjectTools), Some("No folder is open: open the project's folder to trust its tools"));
+    assert!(!marker.exists(), "an untrusted project's tsc ran");
+    // The folder open, not trusted: still nothing, and the command offers to trust it.
+    let (mut f, marker) = fixture();
+    let providers = f._dir.path().join("config/providers.json");
+    std::fs::set_permissions(&providers, std::fs::Permissions::from_mode(0o600)).unwrap();
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::Open(f.root.join("src/a.ts")));
+    f.settle(|s| untrusted(s) && s.trust_text().is_some());
+    assert!(!marker.exists(), "an untrusted folder's tsc ran");
+    // typescript-go itself runs (no tsc on PATH here), and the dialog says what trusting would run.
+    assert!(f.s.trust_text().unwrap().contains("typescript-go would run this project's own TypeScript compiler"), "{:?}", f.s.trust_text());
+    assert_eq!(f.s.disabled(CommandId::UntrustProjectTools), Some("This folder's project tools are not trusted"));
+    assert!(f.s.language_server_rows().iter().any(|(_, id)| *id == Some(CommandId::TrustProjectTools)));
+    // Trusted: its tsc serves, and the trust is saved privately.
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| ready(s) && s.disabled(CommandId::UntrustProjectTools).is_none());
+    assert!(marker.exists(), "the trusted folder's tsc did not run");
+    assert!(f.s.language_server_rows().iter().any(|(_, id)| *id == Some(CommandId::UntrustProjectTools)));
+    let saved: Value = serde_json::from_slice(&std::fs::read(&providers).unwrap()).unwrap();
+    assert_eq!(saved["trusted"], serde_json::json!([f.root]));
+    assert_eq!(std::fs::metadata(&providers).unwrap().permissions().mode() & 0o777, 0o600, "providers.json stays private");
+    // Folder-level server commands keep it private too.
+    f.s.dispatch(Command::SetServerEnabled(false));
+    f.settle(|s| s.disabled(CommandId::EnableServer).is_none());
+    assert_eq!(std::fs::metadata(&providers).unwrap().permissions().mode() & 0o777, 0o600);
+    f.s.dispatch(Command::SetServerEnabled(true));
+    f.settle(|s| s.disabled(CommandId::DisableServer).is_none() && ready(s));
+    // Stopping trusting stops it; it does not start again.
+    std::fs::remove_file(&marker).unwrap();
+    f.s.dispatch(Command::SetProjectToolsTrusted(false));
+    f.settle(untrusted);
+    assert!(!marker.exists());
+    assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&providers).unwrap()).unwrap().get("trusted"), None);
+    // A trusted folder inside the project: the project's tsc above it is not searched for.
+    let (mut f, marker) = fixture();
+    let app = f.root.join("app");
+    f.s.dispatch(Command::OpenRoot(app.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| s.disabled(CommandId::UntrustProjectTools).is_none());
+    f.s.dispatch(Command::Open(app.join("b.ts")));
+    f.settle(|s| s.state().provider().is_some_and(|v| matches!(v.status, Status::Missing(_))));
+    assert!(!marker.exists(), "a tsc above the trusted folder ran");
+}
+
+/// A Python environment the project configures is the project's: without a recorded version, its interpreter is run
+/// for one only once the user trusts the opened folder; until then Server Details says the version is unknown and how
+/// to trust the folder.
+#[test]
+fn a_project_python_interpreter_runs_only_in_a_trusted_folder() {
+    let files = [("pyrightconfig.json", "{ \"venvPath\": \".\", \"venv\": \"env\" }"), ("env/lib/python3.12/site-packages/.keep", ""), ("app.py", "x = 1\n")];
+    let mut f = untrusted_fixture("pyright", &files, serde_json::json!({}));
+    let marker = f._dir.path().join("python-ran");
+    script(&f.root.join("env/bin/python"), &format!("#!/bin/sh\ntouch '{}'\necho 'Python 3.12.0'\n", marker.display()));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.open("app.py");
+    let environment = |s: &Session| s.state().provider().and_then(|v| v.environment).and_then(Result::ok).unwrap_or_default();
+    assert!(environment(&f.s).contains("Python version unknown") && environment(&f.s).contains("Trust Project Tools in This Folder"), "{}", environment(&f.s));
+    assert!(f.s.language_server_details().contains("Trust Project Tools in This Folder"));
+    assert!(!marker.exists(), "an untrusted project's interpreter ran");
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| ready(s) && environment(s).contains("Python 3.12.0"));
+    assert!(marker.exists());
+}
+
+/// The ruff of a project's environment is the project's program: in a folder that is not trusted, Format Document
+/// does not run it and says how to trust the folder.
+#[test]
+fn python_formatting_runs_the_projects_ruff_only_in_a_trusted_folder() {
+    let mut f = python_format_fixture("x  =  1\n");
+    f.s.dispatch(Command::SetProjectToolsTrusted(false));
+    f.settle(|s| s.disabled(CommandId::TrustProjectTools).is_none() && ready(s));
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Format Document:")));
+    assert!(!f.root.join("env/bin/ruff.args").exists(), "an untrusted project's ruff ran");
+    // A ruff on PATH may format instead; without one, the message says how to trust the folder.
+    if code_core::semantics::provider::find_executable(Path::new("ruff"), None).is_none() {
+        assert!(f.notice("Trust Project Tools in This Folder"), "{:?}", f.s.state().notices());
+        assert_eq!(current_text(f.s.state()), "x  =  1\n");
+    }
+}
+
+/// Gap B1: an environment the project configures outside the opened folder (a venvPath of `..`) is not the project's
+/// own: its ruff is never run, even in a trusted folder.
+#[test]
+fn python_formatting_never_runs_an_environment_outside_the_opened_folder() {
+    let files = [("pyrightconfig.json", "{ \"venvPath\": \"..\", \"venv\": \"outside\" }"), ("pyproject.toml", "[project]\nname = \"p\"\n\n[tool.ruff]\nline-length = 60\n"), ("app.py", "x  =  1\n")];
+    let mut f = fixture_input("pyright", &[], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    let outside = f._dir.path().join("outside");
+    write(&outside, "pyvenv.cfg", "version = 3.13.5\n");
+    write(&outside, "lib/python3.13/site-packages/.keep", "");
+    script(&outside.join("bin/ruff"), FAKE_RUFF);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| s.folder_trust() == Some(code_core::semantics::provider::Trust::Trusted));
+    f.open("app.py");
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Format Document:")));
+    assert!(!outside.join("bin/ruff.args").exists(), "an environment outside the opened folder ran: {:?}", f.s.state().notices());
+}
+
+/// Pyright itself runs the interpreter its settings name: in a folder that is not trusted, a relative pythonPath (a
+/// file of the project) is not given to it, in its initialization or its configuration; trusted, it is.
+#[test]
+fn pyright_is_not_given_a_projects_interpreter_in_a_folder_that_is_not_trusted() {
+    let files = [("app.py", "x = 1\n")];
+    let mut f = untrusted_fixture("pyright", &files, serde_json::json!({ "settings": { "pythonPath": "env/bin/python" } }));
+    let marker = f._dir.path().join("python-ran");
+    script(&f.root.join("env/bin/python"), &format!("#!/bin/sh\ntouch '{}'\necho 'Python 3.12.0'\n", marker.display()));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.open("app.py");
+    let initialized = |log: &Path| messages(log).into_iter().filter(|m| m["method"] == "initialize").map(|m| m["params"]["initializationOptions"].clone()).collect::<Vec<_>>();
+    assert_eq!(initialized(&f.log).last().map(|o| o.get("pythonPath").is_none()), Some(true), "{:?}", initialized(&f.log));
+    assert!(f.s.trust_text().is_none(), "Pyright runs in Restricted mode: nothing is held back, nothing asks");
+    assert!(!marker.exists());
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| ready(s) && s.folder_trust() == Some(code_core::semantics::provider::Trust::Trusted));
+    let log = f.log.clone();
+    f.settle_until(move || initialized(&log).len() == 2);
+    assert_eq!(initialized(&f.log).last().and_then(|o| o.get("pythonPath").cloned()), Some(serde_json::json!("env/bin/python")));
+}
+
 #[test]
 fn server_runtime_selection_saves_restarts_and_keeps_disabled_servers_disabled() {
     let mut f = fixture_as("jdtls", &[], &[("Main.java", "class Main {}\n")], serde_json::json!({}), std::sync::Arc::new(Instant::now));
@@ -2589,7 +3366,8 @@ fn server_runtime_selection_saves_restarts_and_keeps_disabled_servers_disabled()
     let settings = f._dir.path().join("config/providers.json");
     let before = std::fs::read(&settings).unwrap();
     f.s.dispatch(Command::OpenServerRuntime);
-    f.settle(|s| s.state().server_runtime().unwrap().message.starts_with("Enter"));
+    // Discovery has finished: no "Finding installed … runtimes…" any more.
+    f.settle(|s| !s.state().server_runtime().unwrap().message.starts_with("Finding"));
     f.s.dispatch(Command::CloseServerRuntime);
     assert!(f.s.state().server_runtime().is_none());
     assert_eq!(std::fs::read(&settings).unwrap(), before);
@@ -3734,6 +4512,137 @@ fn typing_a_tags_closing_bracket_inserts_its_closing_tag_as_its_own_undo_step() 
     assert_eq!(f.auto_inserts().len(), 1, "no question with several carets");
 }
 
+fn ruby_fixture(source: &str) -> Fixture {
+    let config = "root = true\n[*]\nindent_style = space\nindent_size = 2\n";
+    let mut f = fixture_input("ruby-lsp", &[], &[("Gemfile", ""), (".editorconfig", config), ("a.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f
+}
+
+impl Fixture {
+    fn on_types(&self) -> Vec<Value> { messages(&self.log).into_iter().filter_map(|m| m.get("onType").cloned()).collect() }
+    /// Apply what arrives for `ms` milliseconds.
+    fn pump(&mut self, ms: u64) {
+        let rx = self.s.completions();
+        let until = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < until { if let Ok(c) = recv(&rx) { self.s.dispatch(c); } }
+    }
+}
+
+/// Enter after a Ruby block opener indents the body at once, then asks Ruby LSP (the fake answering as it does) for
+/// its on-type edits: the `end` it adds goes in as its own Undo step, with the caret left on the body line. A block
+/// that already has its `end` gets no second one, even when the server (seeing a syntax error elsewhere) offers it.
+#[test]
+fn enter_takes_the_servers_end_as_its_own_undo_step_and_never_adds_a_second_end() {
+    let source = "class A\n  def go\nend\n";
+    let mut f = ruby_fixture(source);
+    let tab = f.s.state().active().unwrap().id();
+    let at = source.find("def go").unwrap() + "def go".len();
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.keys("\n");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the body's indentation comes at once");
+    f.settle(|s| current_text(s.state()).contains("  end\nend"));
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \n  end\nend\n");
+    assert_eq!(f.s.state().selection().map(|s| s.range()), Some(at + 5..at + 5), "the caret stays on the body line");
+    let asked = f.on_types();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0], serde_json::json!({ "ch": "\n", "options": { "tabSize": 2, "insertSpaces": true }, "position": { "line": 2, "character": 4 } }));
+    f.keys("x");
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    x\n  end\nend\n");
+    f.s.dispatch(Command::Undo { tab });
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), "class A\n  def go\n    \nend\n", "the server's `end` is undone on its own");
+    f.s.dispatch(Command::Undo { tab });
+    assert_eq!(current_text(f.s.state()), source);
+    // Closed already: the server answers `end` (the file does not parse elsewhere), and none is added.
+    let closed = "def go\nend\nsyntax_error(\n";
+    let mut g = ruby_fixture(closed);
+    let at = "def go".len();
+    g.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    g.keys("\n");
+    let log = g.log.clone();
+    g.settle_until(move || messages(&log).iter().any(|m| m.get("onType").is_some()));
+    g.pump(400);
+    assert_eq!(current_text(g.s.state()), "def go\n  \nend\nsyntax_error(\n");
+    // A plain line asks the server too, which answers nothing; several carets ask nothing.
+    g.keys("y\n");
+    g.pump(300);
+    assert_eq!(current_text(g.s.state()), "def go\n  y\n  \nend\nsyntax_error(\n");
+    let asked = g.on_types().len();
+    g.s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+    g.s.dispatch(Command::AddCursorBelow);
+    g.keys("\n");
+    g.pump(300);
+    assert_eq!(g.on_types().len(), asked, "no question with several carets");
+    assert_eq!(std::fs::read_to_string(g.root.join("a.rb")).unwrap(), closed, "only the draft changes");
+}
+
+/// Ruby LSP parses a document when a request about it arrives but applies text on another thread, so each text
+/// change is followed by a document-free request (its add-on list) and nothing is asked about the new text (its
+/// problems, completion, symbols, hints or tokens) until that is answered.
+#[test]
+fn questions_about_edited_ruby_wait_behind_a_sync_barrier() {
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_PULL_DIAGNOSTICS", "1")], &[("Gemfile", ""), ("a.rb", "def go\n  1\nend\n")], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("a.rb");
+    f.s.dispatch(Command::Select(Selection { anchor: 9, head: 9 }));
+    f.keys("x");
+    f.keys("y");
+    f.pump(1500);
+    let methods: Vec<String> = messages(&f.log).into_iter().filter_map(|m| m["method"].as_str().map(str::to_owned)).collect();
+    let changes: Vec<usize> = methods.iter().enumerate().filter(|(_, m)| *m == "textDocument/didChange").map(|(i, _)| i).collect();
+    assert!(!changes.is_empty() && methods.iter().any(|m| m == "textDocument/diagnostic"), "{methods:?}");
+    for (i, method) in methods.iter().enumerate() {
+        // Every question about a document: its problems, completion, symbols, hints, tokens.
+        if !method.starts_with("textDocument/") || method.starts_with("textDocument/did") { continue; }
+        // The last text change before this question has a barrier between it and the question.
+        let Some(&change) = changes.iter().rev().find(|&&c| c < i) else { continue };
+        assert!(methods[change..i].iter().any(|m| m == "rubyLsp/workspace/addons"), "a question right behind an edit: {methods:?}");
+    }
+    assert_eq!(current_text(f.s.state()), "def go\n  xy1\nend\n");
+}
+
+/// Go to Definition in Ruby where Ruby LSP's index has nothing (the fake, like Ruby LSP, does not read ActiveSupport's
+/// `cattr_accessor`): the bundle's gems (listed by `rubyLsp/workspace/dependencies`) and the project are searched by
+/// name, so the method a gem declares with the macro opens as a source outside the project; with several, they are
+/// listed as candidates.
+#[test]
+fn ruby_definitions_find_methods_declared_by_macros_in_gems() {
+    let gems = tempfile::tempdir().unwrap();
+    let mailer = gems.path().join("actionmailer-8.1");
+    let mail = gems.path().join("mail-2.9");
+    for (path, text) in [
+        (mailer.join("lib/action_mailer/delivery_methods.rb"), "module DeliveryMethods\n  included do\n    cattr_accessor :perform_deliveries, default: true\n  end\nend\n"),
+        (mail.join("lib/mail/message.rb"), "class Message\n  attr_accessor :delivery_handler\n  delegate :perform_deliveries, to: :config\nend\n"),
+        (mail.join("test/ignored.rb"), "cattr_accessor :perform_deliveries\n"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let list = format!("{}:{}", mailer.display(), mail.display());
+    let source = "class Messenger < ActionMailer::Base\n  def go\n    Messenger.perform_deliveries\n  end\nend\n";
+    let mut f = fixture_input("ruby-lsp", &[("FAKE_LSP_GEMS", &list)], &[("Gemfile", ""), ("lib/messenger.rb", source)], serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.open("lib/messenger.rb");
+    let log = f.log.clone();
+    f.settle_until(move || messages(&log).iter().any(|m| m["method"] == "rubyLsp/workspace/dependencies"));
+    f.pump(300);
+    let at = source.find("perform_deliveries").unwrap() + 3;
+    f.s.dispatch(Command::Select(Selection { anchor: at, head: at }));
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().results().is_some());
+    let hits: Vec<(String, usize, String)> = f.s.state().results().unwrap().hits().iter().map(|h| (h.path.to_string(), h.line, h.text.trim().to_owned())).collect();
+    assert_eq!(hits, [
+        (mailer.join("lib/action_mailer/delivery_methods.rb").display().to_string(), 2, "cattr_accessor :perform_deliveries, default: true".into()),
+        (mail.join("lib/mail/message.rb").display().to_string(), 2, "delegate :perform_deliveries, to: :config".into()),
+    ], "both gems' declarations, not a gem's tests");
+    f.s.dispatch(Command::OpenResult(0));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("delivery_methods.rb")));
+    assert!(f.s.state().notices().iter().any(|n| n.contains("outside the project") || n.contains("Read-only")), "{:?}", f.s.state().notices());
+    assert_eq!(std::fs::read_to_string(f.root.join("lib/messenger.rb")).unwrap(), source);
+}
+
 /// A closing tag answered after more typing is dropped, and one the settings turn off (`autoClosingTags: false`) is
 /// never asked; the typed text stays exactly as typed.
 #[test]
@@ -3771,7 +4680,7 @@ fn pyright_names_its_configured_environment_and_a_missing_one_stops_it_while_edi
     let expected = format!("Python environment: {} (venv \"env\" with venvPath \".\" in {}), Python 3.13.5; installed packages from {}", env.display(), f.root.join("pyrightconfig.json").display(), env.join("lib/python3.13/site-packages").display());
     assert_eq!(f.s.state().provider().unwrap().environment, Some(Ok(expected.clone())));
     let details = f.s.language_server_details();
-    assert!(details.contains(&format!("Workspace: {}\n\n{expected}\n\n", f.root.display())), "{details}");
+    assert!(details.contains(&format!("Workspace: {}\n{expected}\n", f.root.display())), "{details}");
     // The configured environment goes away: a restart refuses to start Pyright with another one.
     std::fs::rename(&env, f.root.join("moved")).unwrap();
     let starts = messages(&f.log).iter().filter(|m| m["method"] == "initialize").count();
@@ -3781,8 +4690,8 @@ fn pyright_names_its_configured_environment_and_a_missing_one_stops_it_while_edi
     assert_eq!(f.s.state().provider().unwrap().status, Status::Failed(why.clone()));
     assert_eq!(f.s.state().provider().unwrap().status_label(), "LSP stopped");
     let details = f.s.language_server_details();
-    assert!(details.starts_with(&format!("Pyright: stopped: {why}\n\n")), "{details}");
-    assert!(details.contains("\n\nThe language server was not started: correct the project environment named above, then choose Restart Language Server. Lenz never creates environments or installs packages.\n\n"), "{details}");
+    assert!(details.starts_with(&format!("Server: Pyright: stopped: {why}\n")), "{details}");
+    assert!(details.contains("\nHelp: The language server was not started: correct the project environment named above, then choose Restart Language Server. Lenz never creates environments or installs packages.\n"), "{details}");
     assert!(!details.contains("Setup: ") && !details.contains("runtime selection"), "nothing suggests reinstalling Pyright: {details}");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(messages(&f.log).iter().filter(|m| m["method"] == "initialize").count(), starts, "no server was started");
@@ -3811,6 +4720,10 @@ fn python_format_fixture(text: &str) -> Fixture {
     let mut f = fixture_input("pyright", &[], &files, serde_json::json!({}), std::sync::Arc::new(Instant::now), true);
     script(&f.root.join("env/bin/ruff"), FAKE_RUFF);
     f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    // The environment's ruff is the project's program: it runs only in a folder the user trusts.
+    f.s.dispatch(Command::SetProjectToolsTrusted(true));
+    f.settle(|s| s.disabled(CommandId::UntrustProjectTools).is_none());
     f.open("app.py");
     f
 }
@@ -3854,7 +4767,7 @@ fn python_format_and_organize_imports_run_the_projects_ruff_from_its_environment
     assert!(f.s.editing_preferences_details().lines().any(|l| l == formatter), "{}", f.s.editing_preferences_details());
     let details = f.s.language_server_details();
     let row = format!("Format Document and Organize Imports run the project's formatter, not the language server: ruff (configured by {}); executable {}", f.root.join("pyproject.toml").display(), f.root.join("env/bin/ruff").display());
-    assert!(details.split("\n\n").any(|r| r == row), "{details}");
+    assert!(details.lines().any(|r| r == row), "{details}");
     // Format on save formats with ruff, then writes; the other file stays as it is.
     f.s.dispatch(Command::SetFormatOnSave(true));
     assert!(f.s.editing_preferences_details().contains("Format on save: on for this project (Save runs the project's formatter first)"));
@@ -4195,7 +5108,7 @@ fn erb_templates_format_with_the_projects_erb_lint_as_one_undo_step_and_say_when
     f.s.dispatch(Command::Undo { tab });
     assert_eq!(current_text(f.s.state()), ERB_FORMAT, "one Undo takes it back");
     let row = format!("Format Document runs the project's erb_lint, not a language server: erb_lint (configured by {}); run as {} with --autocorrect", f.root.join(".erb_lint.yml").display(), f.root.join("bin/erb_lint").display());
-    assert!(f.s.language_server_details().split("\n\n").any(|r| r == row), "{}", f.s.language_server_details());
+    assert!(f.s.language_server_details().lines().any(|r| r == row), "{}", f.s.language_server_details());
     assert!(f.s.editing_preferences_details().lines().any(|l| l == format!("Formatter: {}", row.split_once(": ").unwrap().1)), "{}", f.s.editing_preferences_details());
     // A result for text that has changed since is refused.
     f.open("app/views/posts/slow.html.erb");
@@ -4372,4 +5285,276 @@ fn erasing_the_last_name_closes_automatic_but_preserves_manual_completion() {
     assert!(f.s.state().completion().is_some(), "an explicit request can keep showing on a blank line");
     assert_eq!(f.s.state().completion().unwrap().trigger, code_core::session::CompletionTrigger::Manual);
     assert_eq!(current_text(f.s.state()), original);
+}
+
+/// Each Go to Definition is a Back step, also within one file: Back returns to every place a definition was asked
+/// from, in turn, and Forward retraces the steps.
+#[test]
+fn back_returns_to_each_place_a_definition_was_asked_from_in_the_same_file() {
+    let main = "fn main() {\n    first();\n}\nfn first() {\n    second();\n}\nfn second() {}\n";
+    let mut f = fixture(&[], &[("src/main.rs", main)]);
+    f.open("src/main.rs");
+    let caret = |f: &Fixture| f.s.state().selection().unwrap().head;
+    let first_call = f.caret("first();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn first").unwrap() + 3));
+    assert_eq!(f.selected_text(), "first");
+    let second_call = f.caret("second();") + 1;
+    f.s.dispatch(Command::Definition { peek: false });
+    f.settle(|s| s.state().asking().is_none() && s.state().selection().is_some_and(|sel| sel.range().start == main.find("fn second").unwrap() + 3));
+    assert!(f.s.state().can_back());
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), second_call, "back to the second click");
+    f.s.dispatch(Command::Back);
+    assert_eq!(caret(&f), first_call, "back to the first click");
+    // Forward retraces the steps: where the second definition was asked from (the place left), then that definition.
+    f.s.dispatch(Command::Forward);
+    assert_eq!(caret(&f), second_call, "forward to the second click");
+    f.s.dispatch(Command::Forward);
+    assert_eq!(f.selected_text(), "second", "forward to the second definition");
+    assert!(!f.s.state().can_forward());
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), main);
+}
+
+/// A definition deep in nested modules lands with its line in view below the sticky headers of the modules around
+/// it, not under them, in the same file and from another one.
+#[test]
+fn a_definition_in_nested_modules_lands_below_the_sticky_headers() {
+    let body = "                    let _ = 1;\n".repeat(12);
+    // The methods before it push `fn deep` far below the headers, as in a long class.
+    let before = "                pub fn filler() {}\n".repeat(30);
+    let nested = format!("pub mod a {{\n    pub mod b {{\n        pub mod c {{\n            pub mod d {{\n{before}                pub fn deep() {{\n{body}                }}\n            }}\n        }}\n    }}\n}}\n");
+    let main = format!("{nested}fn main() {{\n{}    a::b::c::d::deep();\n}}\n", "    let _ = 0;\n".repeat(40));
+    let other = "mod lib;\nfn caller() { lib::a::b::c::d::deeper(); }\n";
+    let mut f = fixture(&[], &[("src/main.rs", &main), ("src/lib.rs", &nested.replace("fn deep", "fn deeper")), ("src/other.rs", other)]);
+    let def_line = 34;
+    for (file, needle, name) in [("src/main.rs", "deep();", "deep"), ("src/other.rs", "deeper();", "deeper")] {
+        f.open(file);
+        f.s.dispatch(Command::SetTextSize { pane: 0, cols: 100, rows: 20 });
+        f.s.dispatch(Command::Scroll(usize::MAX));
+        f.definition(needle, false);
+        f.settle(|s| s.state().asking().is_none() && s.state().current_source().is_some_and(|d| d.line_of(s.state().selection().map_or(0, |sel| sel.head)) == def_line && !d.source().ends_with("other.rs")));
+        // Its sticky headers, once the file's declarations are known.
+        f.settle(|s| s.state().active().is_some_and(|t| s.state().view(t.id()).is_some_and(|v| v.declarations().is_some())));
+        let (top, band) = {
+            let state = f.s.state();
+            let view = state.view(state.active().unwrap().id()).unwrap();
+            let code_core::layout::Query::Ready(sticky) = view.layout_sticky(code_core::tabs::sticky_cap(20), None) else { panic!("sticky layout pending") };
+            (view.tab().top_line(), sticky.len())
+        };
+        assert!(def_line >= top + band, "{file}: `fn deep` (line {def_line}) is under the {band} sticky header(s) from top line {top}");
+        assert_eq!(f.selected_text(), name, "{file}");
+    }
+}
+
+/// Leaving an edited file for another of its language and coming back: its semantic colours and hints come back with
+/// its syntax colours, and the other file has its own.
+#[test]
+fn an_edited_file_shown_again_gets_its_semantic_colours_and_hints_back() {
+    let mut f = fixture(&[], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    f.settle(decorated);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(decorated);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")), "back on the edited file: {:?}", f.s.state().active().map(|t| t.source().to_owned()));
+    f.settle(|s| decorated(s) && active_view(s).is_some_and(|v| v.highlights().is_some()));
+    assert!(f.s.state().tab_dirty(tab), "still unsaved");
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
+}
+
+/// The same with a server that sends no semantic colours: the edited file's syntax colours come back on their own.
+#[test]
+fn an_edited_file_shown_again_is_highlighted_with_a_server_without_decorations() {
+    let mut f = fixture(&[("FAKE_LSP_NO_DECOR", "1")], &[("src/main.rs", HINTED), ("src/other.rs", HINTED)]);
+    f.open("src/main.rs");
+    let colored = |s: &Session| active_view(s).is_some_and(|v| v.highlights().is_some_and(|h| h.spans(0..1).iter().any(|l| !l.is_empty())));
+    f.settle(colored);
+    let tab = f.s.state().active().unwrap().id();
+    let doc = f.s.state().current_source().unwrap().clone();
+    let end = doc.len_bytes();
+    f.s.dispatch(Command::Edit { tab, expected: doc.key(), edits: vec![code_core::text::TextEdit { range: end..end, text: "fn broken( {\n".into() }], kind: code_core::text::EditKind::Typing });
+    f.settle(|s| s.state().tab_dirty(tab));
+    f.s.dispatch(Command::Open(f.root.join("src/other.rs")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("other.rs")));
+    f.settle(colored);
+    f.s.dispatch(Command::ActivateTab(tab));
+    assert!(f.s.state().active().is_some_and(|t| t.id() == tab && t.source().ends_with("main.rs")));
+    f.settle(colored);
+    assert_eq!(std::fs::read_to_string(f.root.join("src/main.rs")).unwrap(), HINTED);
+}
+
+/// Rewrite the fixture's settings so that `key` (`trusted` or `declined`) holds `folders` (their links resolved), and
+/// start its session again (as after a restart).
+fn decide(f: &mut Fixture, key: &str, folders: &[&Path]) {
+    let providers = f._dir.path().join("config/providers.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&providers).unwrap()).unwrap();
+    v[key] = serde_json::json!(folders.iter().map(|p| std::fs::canonicalize(p).unwrap()).collect::<Vec<_>>());
+    std::fs::write(&providers, v.to_string()).unwrap();
+    f.s = session_in(f._dir.path(), std::sync::Arc::new(Instant::now), true);
+}
+
+/// Apply whatever arrives for `ms` milliseconds.
+fn drain(f: &mut Fixture, ms: u64) {
+    let rx = f.s.completions();
+    let until = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < until {
+        if let Ok(c) = recv(&rx) { f.s.dispatch(c); }
+    }
+}
+
+/// A folder trusted inside an opened folder that is not: the project's own programs are found only in the trusted
+/// folder, never in the opened folder around it (a venvPath of ".." names an environment of the opened folder).
+#[test]
+fn a_trusted_folder_inside_an_untrusted_opened_folder_runs_none_of_its_programs() {
+    let files = [("svc/pyrightconfig.json", "{ \"venvPath\": \"..\", \"venv\": \"e\" }"), ("svc/app.py", "x = 1\n"), ("e/lib/python3.12/site-packages/.keep", "")];
+    let mut f = untrusted_fixture("pyright", &files, serde_json::json!({}));
+    let marker = f._dir.path().join("python-ran");
+    script(&f.root.join("e/bin/python"), &format!("#!/bin/sh\ntouch '{}'\necho 'Python 3.12.0'\n", marker.display()));
+    let svc = f.root.join("svc");
+    decide(&mut f, "trusted", &[&svc]);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    assert_eq!(f.s.folder_trust(), Some(code_core::semantics::provider::Trust::Unasked));
+    f.open("svc/app.py");
+    let environment = |s: &Session| s.state().provider().and_then(|v| v.environment).and_then(Result::ok).unwrap_or_default();
+    f.settle(|s| !environment(s).is_empty());
+    assert!(!marker.exists(), "the untrusted opened folder's interpreter ran: {}", environment(&f.s));
+    assert!(environment(&f.s).contains("Python version unknown"), "{}", environment(&f.s));
+}
+
+/// The same for formatting: a trusted folder's Python file is never formatted with the ruff of the untrusted opened
+/// folder's own environment.
+#[test]
+fn python_formatting_in_a_trusted_folder_never_runs_the_untrusted_opened_folders_ruff() {
+    let files = [("svc/pyproject.toml", "[project]\nname = \"p\"\n\n[tool.ruff]\nline-length = 60\n"), ("svc/app.py", "x  =  1\n")];
+    let mut f = untrusted_fixture("pyright", &files, serde_json::json!({}));
+    script(&f.root.join(".venv/bin/ruff"), FAKE_RUFF);
+    let svc = f.root.join("svc");
+    decide(&mut f, "trusted", &[&svc]);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.open("svc/app.py");
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.settle(|s| s.state().notices().iter().any(|n| n.starts_with("Format Document:")));
+    assert!(!f.root.join(".venv/bin/ruff.args").exists(), "the untrusted opened folder's ruff ran: {:?}", f.s.state().notices());
+}
+
+/// Trust Parent Folder after Stay Restricted: the folder is trusted with its parent, as the message says.
+#[test]
+fn trust_parent_folder_after_staying_restricted_trusts_the_folder() {
+    use code_core::semantics::provider::Trust;
+    let mut f = untrusted_fixture("rust-analyzer", &[("src/main.rs", "fn main() {}\n")], serde_json::json!({}));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::SetProjectToolsTrusted(false));
+    f.settle(|s| s.folder_trust() == Some(Trust::Declined) && s.disabled(CommandId::FolderTrust).is_none());
+    f.s.dispatch(Command::OpenFolderTrust);
+    assert!(f.s.trust_choices().iter().any(|c| c.1 == TrustChoice::TrustParent), "{:?}", f.s.trust_choices());
+    f.s.dispatch(Command::TrustChoice(TrustChoice::TrustParent));
+    assert_eq!(f.s.folder_trust(), Some(Trust::Trusted));
+    let parent = std::fs::canonicalize(f._dir.path()).unwrap();
+    assert!(f.notice(&format!("Trusted {}", parent.display())), "{:?}", f.s.state().notices());
+    f.open("src/main.rs");
+}
+
+/// The dialog's Stay Restricted (also what Enter and Escape choose) keeps the trust given to a folder inside the open
+/// one; Stop Trusting Project Tools in This Folder revokes it.
+#[test]
+fn staying_restricted_keeps_the_trust_of_folders_inside_and_stop_trusting_revokes_it() {
+    use code_core::semantics::provider::{Settings, Trust};
+    let mut f = untrusted_fixture("rust-analyzer", &[("src/main.rs", "fn main() {}\n"), ("sub/keep.txt", "\n")], serde_json::json!({}));
+    let sub = std::fs::canonicalize(f.root.join("sub")).unwrap();
+    decide(&mut f, "trusted", &[&sub]);
+    let (providers, real) = (f._dir.path().join("config/providers.json"), std::fs::canonicalize(&f.root).unwrap());
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.s.dispatch(Command::Open(f.root.join("src/main.rs")));
+    f.settle(|s| s.trust_text().is_some());
+    f.s.dispatch(Command::TrustChoice(TrustChoice::StayRestricted));
+    // Saved: a trust command given while the save runs is refused.
+    f.settle(|s| Settings::read(&providers).trust(&real) == Trust::Declined && s.disabled(CommandId::FolderTrust).is_none());
+    assert_eq!(Settings::read(&providers).trust(&sub), Trust::Trusted, "a stray Enter on the parent untrusted the folder inside");
+    f.s.dispatch(Command::SetProjectToolsTrusted(false));
+    f.settle(|_| Settings::read(&providers).trust(&sub) == Trust::Declined);
+}
+
+/// The dialog asks only about what the open folder's own answer decides: a server held back for a folder outside the
+/// open one, or inside it but declined on its own, stays restricted without asking about the open folder.
+#[test]
+fn a_tool_held_back_elsewhere_does_not_ask_about_the_open_folder() {
+    let mut f = untrusted_fixture("gopls", &[("go.mod", "module m\n"), ("main.go", "package main\n"), ("sub/go.mod", "module s\n"), ("sub/main.go", "package main\n")], serde_json::json!({}));
+    let other = f._dir.path().join("other");
+    write(&other, "go.mod", "module o\n");
+    write(&other, "main.go", "package main\n");
+    let sub = f.root.join("sub");
+    decide(&mut f, "declined", &[&sub]);
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    for file in [other.join("main.go"), sub.join("main.go")] {
+        f.s.dispatch(Command::Open(file.clone()));
+        f.settle(|s| restricted(s) && s.state().current_source().is_some_and(|d| d.source() == file));
+        drain(&mut f, 300);
+        assert!(f.s.trust_text().is_none(), "{} asked about the open folder: {:?}", file.display(), f.s.trust_text());
+    }
+    assert!(f.s.language_server_details().contains("with its folder open"), "{}", f.s.language_server_details());
+    // The open folder's own server asks.
+    f.s.dispatch(Command::Open(f.root.join("main.go")));
+    f.settle(|s| restricted(s) && s.trust_text().is_some_and(|t| t.contains("gopls would run")));
+}
+
+/// A formatter's answer for a lone file arrives after a folder opened: it is not that folder's, and asks nothing.
+#[test]
+fn a_formatter_answer_from_before_a_folder_opened_asks_nothing() {
+    let files = [(".erb_lint.yml", "linters: {}\n"), ("a.html.erb", "<p><%= 1 %></p>\n")];
+    let mut f = untrusted_fixture("rust-analyzer", &files, serde_json::json!({}));
+    let marker = f._dir.path().join("erb-lint-ran");
+    script(&f.root.join("bin/erb_lint"), &format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()));
+    // No folder open: the template alone. The folder opens before the formatter's answer is applied.
+    f.s.dispatch(Command::Open(f.root.join("a.html.erb")));
+    f.settle(|s| s.state().current_source().is_some_and(|d| d.source().ends_with("a.html.erb")));
+    // Analysed first, so that Format runs the formatter at once rather than waiting for it.
+    drain(&mut f, 300);
+    f.s.dispatch(Command::Format(code_core::session::FormatKind::Format));
+    f.s.dispatch(Command::OpenRoot(f.root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    drain(&mut f, 1000);
+    assert!(f.s.trust_text().is_none(), "{:?} {:?}", f.s.trust_text(), f.s.state().notices());
+    assert!(!marker.exists());
+}
+
+/// Another window's answer is taken over: Stop Trusting there stops the servers trusted here, and trusting there starts
+/// them again (its settings file is read again when it changes).
+#[test]
+fn folder_trust_changed_in_another_window_applies_here() {
+    use code_core::semantics::provider::Trust;
+    let mut f = untrusted_fixture("rust-analyzer", &[("src/main.rs", "fn main() {}\n")], serde_json::json!({}));
+    let root = f.root.clone();
+    decide(&mut f, "trusted", &[&root]);
+    f.s.dispatch(Command::OpenRoot(root.clone()));
+    f.settle(|s| s.state().project().is_some());
+    f.open("src/main.rs");
+    let providers = f._dir.path().join("config/providers.json");
+    let rewrite = |from: &str, to: &str| {
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&providers).unwrap()).unwrap();
+        let folders = v[from].take();
+        v.as_object_mut().unwrap().remove(from);
+        v[to] = folders;
+        std::fs::write(&providers, v.to_string()).unwrap();
+    };
+    rewrite("trusted", "declined");
+    f.s.dispatch(Completion::Semantic(code_core::semantics::Event::Tick));
+    f.settle(restricted);
+    assert_eq!(f.s.folder_trust(), Some(Trust::Declined));
+    // Coming back to the window checks too (the adapters recheck on focus).
+    rewrite("declined", "trusted");
+    f.s.dispatch(Command::Recheck);
+    f.settle(ready);
+    assert_eq!(f.s.folder_trust(), Some(Trust::Trusted));
 }

@@ -25,6 +25,26 @@ work without a terminal; ordinary reading needs an interactive terminal on stdin
 path beginning with a dash. Opening a file alone does not enumerate its parent; Open Folder starts project
 browsing and project search.
 
+Opening a ZIP, TAR, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`/`.tbz`, `.tar.xz`/`.txz`, or
+`.tar.zst`/`.tzst` shows its contents in the explorer. This works from the command line,
+**Open File…**, and an archive in a project. Enter or Right expands folders and nested archives;
+Enter opens a member in an ordinary editor tab. Typing, paste, Undo/Redo and Ctrl+S work there:
+Save replaces that member inside the outer archive, preserving the other members. No files are
+extracted into the project. Tabs, breadcrumbs and Status details show readable paths such as
+`sources.zip!/src/main.rs`.
+
+Left selects a member's parent or collapses an expanded folder. **↑ Up / close archive** returns
+from a nested archive or closes its browser while keeping open member tabs. Escape returns to an
+open editor; with no editor it goes up and closes the root browser. Type to search archive names,
+then Enter to open the selected member. Ctrl+Shift+E returns to the explorer. In a narrow terminal,
+the focused archive browser uses the available width, and opening a member returns it to the editor.
+The status bar names the selected row's action. An unreadable archive has an Enter-to-retry row;
+empty archives keep the Up / close row available.
+
+Links and archive records whose metadata cannot be preserved are read-only, with their reason in
+Status details. Archives with ambiguous duplicate member names are read-only. Filesystem actions such as
+Rename, Move and Delete do not act on archive members; Save As can write a member to a regular file.
+
 A window with nothing open starts on **Open File…**, **Open Folder…**, the recent folders and the files recently
 opened without a folder (each newest first, at most ten, kept in `recent-roots.json` and `recent-files.json` in the
 state folder), in the terminal as in the GUI. A click runs the command or opens the folder or file; closing the last
@@ -64,7 +84,7 @@ only their own untracked status.
 The gutter marks the draft's changes too, left of the line numbers: **M** in the modified-file blue for a line the
 draft modifies and **A** in the added-file green for a line it adds, each identified by its letter rather than its
 colour (`NO_COLOR` loses only the colours); a second cell shows **D** where the draft deleted lines just above the
-line. The baseline is named in the status bar (`vs HEAD`, `vs new`, `vs saved`) and in **Status details…** (Shift+F2,
+line. The baseline is named in **Status details…** (Shift+F2,
 `vs HEAD (main · 1a2b3c3): 2 added, 1 modified`), and the caret's line names its change there
 (`Modified from HEAD (main · 1a2b3c3)`) unless blame annotates that line. Tracked files are compared with HEAD's version — unsaved edits included, so
 Save leaves them — new and untracked files are compared with nothing and say so (`new file (untracked)`, or
@@ -109,8 +129,8 @@ nothing. An already requested Save can still finish after Cancel. External
 comparison actions explicitly use saved disk inputs. See the
 [handoff behavior and verification](../research/code-external-open-decisions.md).
 
-**New Scratch File…** (F10 → File) creates a named personal file; include an extension such as `.rs` or `.md`
-to choose its language. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
+**New Scratch File…** (F10 → File) lists the kinds of personal file, each with its Nerd Font file-type icon while
+File Icons is on; typing filters and Enter creates the next `scratch_N.<extension>`. **Scratch Files…** lists these files to reopen, with typing to filter and Enter to open.
 They live in `$XDG_STATE_HOME/lenz-code/scratch-files` (by default `~/.local/state/lenz-code/scratch-files`),
 independently of the project, and remain available after switching projects or restarting. Save writes edits and
 ordinary draft recovery protects unsaved changes; closing a tab does not delete the file. Scratches have no run
@@ -241,6 +261,15 @@ each (**Edit → Lines and Indentation** menu, F10 and the palette in both adapt
   (a duplicate leaves the original selected). Each line keeps the newline written at its position—CRLF, LF, mixed
   endings and a missing final newline are preserved byte for byte—so the last line of a file has no line below it
   and the commands say "Already on the last line" / "Already on the first line" there.
+- **Ctrl+Y** (IntelliJ preset), or **Cmd+Backspace** where the terminal reports Cmd (the kitty keyboard protocol in
+  kitty, WezTerm, Ghostty), deletes the lines the selections touch in one Undo step, as **Delete Line** in the GUI;
+  each caret keeps its column on the line below. Most macOS terminals send Cmd+Backspace as Ctrl+U (iTerm2's Natural
+  Text Editing preset, Ghostty), so on macOS Ctrl+U in the text deletes the line too; elsewhere Ctrl+U is not bound
+  in the text.
+- **Enter** in code indents the new line as its block calls for, as in the GUI (see
+  [Lenz Code](README.md)): one step deeper after `def`, `do |x|`, `{` or Python's `:`, the closer
+  of `{|}` on its own line, and a blank line inside a body continues it. With Ruby LSP running, its `end` follows as
+  its own Undo step, never below a block that already has one.
 - Typing an opening delimiter wraps a selection (`(` around `x` gives `(x)` with `x` still selected) or opens a pair
   with the caret between (`{}`, `[]`, `""`, `''` or a backtick pair); the closing delimiter already in front of the caret is
   stepped over rather than doubled, a quote after a word stays an apostrophe, and no pair is opened in front of a
@@ -346,7 +375,7 @@ terminal use the same parser and editing commands.
 
 ## CSV tables
 
-CSV's header **Table / Source** button and F10's **CSV: Table / Source** switch modes. Arrows move cells;
+The **Table / Source** button at the file's top-right and F10's **CSV: Table / Source** switch modes. Arrows move cells;
 Enter edits, Ctrl+A clears the pending value, Enter commits and Escape cancels. Pending fields must be finished
 before Save or closing. `/` filters the selected column by a literal substring; `s` cycles ascending text,
 descending text and source order. Filtering and sorting affect the view only. Column move/drop and header-row
@@ -427,7 +456,7 @@ the Last saved pane remains read-only.
 | Delete a word | Ctrl-Backspace / Ctrl-Delete where the terminal reports Ctrl with them (Ctrl-Backspace sent as Ctrl-H or Ctrl-W keeps that key's command); Alt-Backspace / Alt-Delete otherwise |
 | Scroll text | Ctrl-Up/Ctrl-Down a row; PageUp/PageDown; wheel (j/k and Home/End scroll while text input is gated) |
 | Select / copy | Click or drag, double click word, triple click its syntax group, Shift-arrows, Ctrl-A / Ctrl-C |
-| Git branches | Ctrl-\` (if your terminal sends it), F10 → Git, or click the branch in the top bar; type to filter, Enter checks out / opens a worktree, → or right-click for a row's actions; checkout problems: s Smart, f Force (f again to confirm), Esc cancels; new branch: Tab toggles Check out |
+| Git branches | Ctrl-\` (if your terminal sends it), F10 → Git, or click the branch in the top bar; separate local/remote branch and worktree sections, type to filter, Enter checks out / opens a worktree, → or right-click for a row's actions; checkout problems: s Smart, f Force (f again to confirm), Esc cancels; new branch: Tab toggles Check out |
 | Git comparisons | F10 → Git: Show Local Changes, Compare with Branch, Tag or Revision… (a list of branches and tags; type to filter or for any revision), Compare with Base Branch, Show Changes Since Branch Start, Compare with Worktree… (the other worktrees; Enter compares); a Git Branches row's → menu: Compare with Working Tree, Show Changes Since Branching from Here. Lenz Diff's terminal app runs in this terminal until it quits |
 | Annotate with Git blame | Alt-B (View menu, right-click); click an annotation for its commit (d Show Diff, c Copy Revision); the status line shows the caret line's commit |
 | Extend / shrink syntax selection | Ctrl-W / Ctrl-Shift-W |
@@ -435,6 +464,9 @@ the Last saved pane remains read-only.
 | Comment / uncomment | Ctrl-/ or Alt-/ (F10 → Edit when the terminal swallows it) |
 | Move lines down / up | Ctrl-Shift-Down / Ctrl-Shift-Up (VS Code keymap: Alt-Down / Alt-Up) |
 | Duplicate lines below / above | Alt-Shift-Down / Alt-Shift-Up |
+| Delete line | Ctrl-Y; Cmd-Backspace (sent as Ctrl-U by macOS terminals, which macOS builds take) |
+| Go to test or subject | Ctrl-Shift-T where the terminal reports it (kitty protocol); the F10 menu |
+| Copy reference (`Foo::Bar::Baz#foo_method`) | Ctrl-Alt-Shift-C where the terminal reports it (kitty protocol); the F10 menu or the right-click menu |
 | Next / previous tab | Ctrl-Tab / Ctrl-Shift-Tab |
 | Split right / down; focus pane | Ctrl-\ / Ctrl-Shift-\; Ctrl-1 / Ctrl-2 |
 | Back / forward | Alt-Left / Alt-Right |
@@ -501,7 +533,7 @@ for a server that is missing, failing or indexing. Its clickable **Copy** and **
 Ctrl-C copies the full, unwrapped snapshot through OSC 52, and Esc closes it. Reopen the popup to refresh its
 contents. **Copy Language Server Details** remains in F10. The menu offers Restart, Enable/Disable for This
 Folder and Set Workspace Root with shared disabled reasons. Recovery actions stay in fixed positions while
-background status changes. **Install Language Server…** previews curated npm installs and requires explicit Start (`S`/Enter); progress/output, Cancel (`C`), Server Details (`D`) and Close/Escape are in its focused dialog. Missing managers and unsupported servers show a manual setup action; see [managed installation](providers.md#explicit-managed-installation). Other missing servers need user installation or an executable/PATH correction; restarting
+background status changes. **Install Language Server…** previews curated npm, Ruby LSP and gopls installs and requires explicit Start (`S`/Enter). A missing server has a direct Install control in the footer; F2 selects Install as its first action. Setup can choose an existing Node runtime (`R`) before installing the server. Progress/output, retry, Cancel (`C`), Server Details (`D`) and Close/Escape stay in its focused dialog. Missing managers and unsupported servers show a manual setup action; see [managed installation](providers.md#explicit-managed-installation). Other missing servers need user installation or an executable/PATH correction; restarting
 rechecks setup. Disabled servers stay off until explicitly enabled. Unsupported documents explain that no server
 is available; text search and syntax highlighting remain usable. See [provider setup](providers.md#status-and-recovery).
 
@@ -511,7 +543,7 @@ and restart only the affected provider/workspace. Exclusions default to On and r
 gems; toggle them Off to restore that coverage without clearing unrelated settings. Reset restores inherited settings for that provider/project. See [project settings](providers.md#project-language-server-settings)
 for JSON overrides, precedence and legacy Ruby `.index.yml` handling.
 
-The same menu offers **Reuse Saved Declaration Index: On/Off** (On by default) and **Rebuild Project Index**.
+The same menu offers **Reuse Saved Declaration Index** (marked ✓ when on, the default) and **Rebuild Project Index**.
 Rebuild discards the current project's saved declarations, refreshes open documents and restarts its language
 servers while rebuilding local symbols. Both controls also appear in F10 and Find Action. See
 [cache and rebuild controls](providers.md#saved-declarations-and-rebuilding) for settings and limits.
@@ -618,7 +650,7 @@ F2 shows the detected/tested server version, bounded launch log and selected run
 
 Haml templates (`.haml`, including `.html.haml`) suggest tag names after `%` and attributes inside `(…)`
 with Ctrl+Space. Enter follows Haml indentation. Format Document uses installed haml-lint when the project
-has `.haml-lint.yml`; each result is one Undo step, and only Save writes it. Ruby completion, Parameter Info
+has `.haml-lint.yml` and you trust its folder; each result is one Undo step, and only Save writes it. Ruby completion, Parameter Info
 and problems use exact template locations. See [Haml capabilities and limits](providers.md#haml-editing).
 
 For PostgreSQL SQL drafts, choose the dialect in the command menu. Ctrl+Space completes query-local
@@ -640,3 +672,11 @@ its retained text, **Clear** removes it, and **Hide** or Escape collapses the pa
 input to the editor. The latest 256 entries are kept in memory, up to 8 KiB each, with UTC timestamps;
 they survive file switches but are not saved between sessions. New entries follow the bottom when
 scrolled there. This is application activity, not an unrestricted capture of every child process's output.
+
+Project-wide replacement and symbol rename use Commands → **Replace in Project…** /
+**Rename Symbol…**. Replace starts from a completed project search, retaining its file
+filter and match options. Enter previews the replacement/new name; `N`/`P` selects a
+preview file, Space includes/excludes it, `A` applies to drafts, and Escape cancels.
+The same controls have clickable buttons, including in narrow terminals. Normal Save
+writes a changed file; Undo reverts its replacement as one step. See the
+[replacement and rename guide](README.md#project-replacement-and-symbol-rename) for limits.

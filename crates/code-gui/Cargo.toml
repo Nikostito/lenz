@@ -22,7 +22,7 @@ lenz-gpui.workspace = true
 gpui.workspace = true
 unicode-segmentation = "1.13.3"
 # SVG logos and embedded raster images in Reader content.
-resvg = { version = "0.49.0", default-features = false, features = ["raster-images"] }
+resvg = { version = "0.50.0", default-features = false, features = ["raster-images"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }
@@ -31,6 +31,7 @@ gpui_platform = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 
 [dev-dependencies]
+lenz-archive = { path = "../archive", features = ["testing"] }
 # Throwaway git repositories for the blame tests.
 lenz-content = { workspace = true, features = ["git-testing", "write-testing"] }
 gpui = { workspace = true, features = ["test-support"] }

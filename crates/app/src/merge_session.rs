@@ -269,7 +269,7 @@ pub fn open_conflict(root: &Path, file: &conflicts::ConflictedFile) -> Result<Op
     let git_output =
         conflicts::merge_file(root, file, setup.labels(), setup.style, setup.marker_size)
             .ok()
-            .map(|(bytes, _)| crate::encoding::decode(&bytes, None).text);
+            .map(|(bytes, conflicts)| (crate::encoding::decode(&bytes, None).text, conflicts));
     let mut opened = assemble([b, o, t], &target, file.path.clone(), setup, git_output)?;
     opened.snapshot = opened.snapshot.in_repository(root).map_err(|e| e.to_string())?;
     Ok(opened)
@@ -326,7 +326,7 @@ pub fn open_files(
     // git's output from mergetool's temp files, which are in working-tree form like the file git wrote (the
     // stages' object ids would give index form). Outside git, `$MERGED` is no git merge output to resume from.
     let git_output = rel.as_ref().and_then(|_| {
-        let (bytes, _) = conflicts::merge_files(
+        let (bytes, conflicts) = conflicts::merge_files(
             cwd,
             [ours, base, theirs],
             setup.labels(),
@@ -334,7 +334,7 @@ pub fn open_files(
             setup.marker_size,
         )
         .ok()?;
-        Some(crate::encoding::decode(&bytes, None).text)
+        Some((crate::encoding::decode(&bytes, None).text, conflicts))
     });
     let path = rel.unwrap_or_else(|| {
         merged
@@ -347,17 +347,20 @@ pub fn open_files(
 }
 
 /// The Merge View of three decoded versions, the Result saved to `merged` (shown as `path`), resumed from what an
-/// earlier save or another editor left in that file when it differs from `git_output`.
+/// earlier save or another editor left in that file when it differs from `git_output` (git's text and its count of
+/// conflicts).
 fn assemble(
     [b, o, t]: [crate::encoding::Decoded; 3],
     merged: &Path,
     path: String,
     setup: Setup,
-    git_output: Option<String>,
+    git_output: Option<(String, usize)>,
 ) -> Result<Opened, String> {
+    let (git_output, git_conflicts) = git_output.map_or((None, 0), |(text, n)| (Some(text), n));
     // the Result keeps the working-tree file's encoding, BOM and line endings; Ours' when there's no file
+    let mut hides_ascii = [&b, &o, &t].iter().any(|d| d.hides_ascii);
     let (snapshot, file) = match write::Snapshot::read(merged, None) {
-        Ok((s, d)) => (s, Some(lossless(&path, d)?.text)),
+        Ok((s, d)) => { hides_ascii |= d.hides_ascii; (s, Some(lossless(&path, d)?.text)) }
         Err(_) if !merged.exists() => (write::Snapshot::missing(merged, &o), None),
         Err(e) => return Err(format!("lenz diff merge: {e}")),
     };
@@ -377,13 +380,19 @@ fn assemble(
             &lenz_engine::compare_lines(&ol, &tl, &Default::default()),
         )
     };
+    // git and Lenz may place a change differently; a merge git stops at never opens as settled without a word
+    let unsettled = (git_conflicts > 0 && !result.blocks().iter().any(|b| b.kind == lenz_engine::MergeKind::Conflict))
+        .then(|| format!("git finds {git_conflicts} conflict{} here that this merge settles; check the changes applied at open",
+            if git_conflicts == 1 { "" } else { "s" }));
     if let (Some(git), Some(file)) = (&git_output, &file) {
         result.resume(git, file, style, setup.marker_size, &setup.labels);
     }
     let notices = [
+        unsettled,
         (!setup.has_base).then(|| "Added on both sides — no common base".to_string()),
         form_notice("Ours", &o, &snapshot),
         form_notice("Theirs", &t, &snapshot),
+        hides_ascii.then(|| crate::encoding::HIDES_ASCII_NOTICE.to_string()),
     ];
     let lang = highlight::detect(merged, ol.first().copied().unwrap_or(""));
     // markers as git writes them: read off git's own markers still in the file, else `HEAD` for ours in a repository
@@ -1095,6 +1104,7 @@ impl MergeSession {
     }
     pub fn notices(&self) -> Vec<String> {
         let mut out = self.notices.clone();
+        out.extend(highlight::Parsed::limit_note(self.parsed.iter().map(Option::as_deref)).map(str::to_owned));
         match self.m.edited_outside() {
             0 => {}
             n => out.push(format!(
@@ -1484,6 +1494,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_guessed_encoding_that_hides_ascii_is_noticed_in_the_merge_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // "# 設定を表示" in Shift_JIS, then a backtick after a lead byte
+        let sjis = b"# \x90\xDD\x92\xE8\x82\xF0\x95\x5C\x8E\xA6\necho \"mode: \x83`touch marker #\x83`\"\n";
+        let [b, o, t, m] = ["base", "ours", "theirs", "merged"].map(|n| d.join(n));
+        std::fs::write(&b, "a\n").unwrap();
+        std::fs::write(&o, "a\n").unwrap();
+        std::fs::write(&t, sjis).unwrap();
+        let opened = open_files(&b, &o, &t, &m, d).unwrap();
+        assert!(opened.notices.iter().any(|n| n == crate::encoding::HIDES_ASCII_NOTICE), "{:?}", opened.notices);
+        std::fs::write(&t, "b\n").unwrap();
+        assert!(open_files(&b, &o, &t, &m, d).unwrap().notices.is_empty());
+    }
+
+    #[test]
     fn a_file_added_on_both_sides_merges_without_a_base() {
         let (dir, [b, o, t]) = conflicted(None);
         let d = dir.path();
@@ -1869,6 +1895,68 @@ pub(crate) mod tests {
         assert_eq!(m.lines().join("\n"), "ONE\nOURS\nthree\nfour\n");
     }
 
+    /// Theirs inserts a copy of two lines that could sit just before Ours' change as well: git stops on it.
+    const SLID: [&str; 3] = ["alpha line\n\nbeta line\ndelta line\n", "alpha line\n\nbeta line\ndelta CHANGED\n",
+        "alpha line\n\nbeta line\n\nbeta line\ndelta line\n"];
+
+    #[test]
+    fn a_change_git_stops_on_opens_as_a_conflict() {
+        let [base, ours, theirs] = SLID.map(str::as_bytes);
+        let (dir, [b, o, t]) = conflicted_in(repo(), Some(base), ours, theirs);
+        let d = dir.path();
+        let on_disk = std::fs::read(d.join("f.txt")).unwrap();
+        let file = conflicts::list(d).unwrap().remove(0);
+        let opened = open_conflict(d, &file).unwrap();
+        assert!(opened.result.unresolved() >= 1, "{:?}", opened.result.lines());
+        assert!(opened.notices.is_empty(), "{:?}", opened.notices);
+        assert_eq!(std::fs::read(d.join("f.txt")).unwrap(), on_disk, "opening writes nothing");
+        let mut session = MergeSession::new(opened, 40.0);
+        session.save().unwrap();
+        let saved = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert!(saved.contains("<<<<<<<") && saved.contains(">>>>>>>"), "{saved}");
+        // the same versions as `git mergetool` hands them over, and outside git
+        assert!(open_files(&b, &o, &t, &d.join("f.txt"), d).unwrap().result.unresolved() >= 1);
+        let outside = tempfile::tempdir().unwrap();
+        let (b2, o2, t2, m2) = ["base", "ours", "theirs", "merged"].map(|n| outside.path().join(n)).into();
+        for (p, text) in [(&b2, SLID[0]), (&o2, SLID[1]), (&t2, SLID[2])] { std::fs::write(p, text).unwrap(); }
+        assert!(open_files(&b2, &o2, &t2, &m2, outside.path()).unwrap().result.unresolved() >= 1);
+        // a deletion and an append among repeated lines: settled as git settles them, byte for byte
+        let [b8, o8, t8] = ["line one\nshared\nline two\nshared\nline three\n", "line one\nshared\nline two\nshared\nline three\nshared\n",
+            "line one\nline two\nshared\nline three\n"].map(lenz_engine::split_lines);
+        let m = crate::merge::MergeResult::new(&o8, &b8, &t8, lenz_engine::merge_lines(&o8, &b8, &t8, &Default::default()));
+        assert_eq!((m.unresolved(), m.lines().join("\n")), (0, "line one\nline two\nshared\nline three\nshared\n".to_string()));
+    }
+
+    #[test]
+    fn a_pane_whose_highlighting_stopped_at_its_limit_is_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for (name, text) in [("base.rs", "fn a() {}\n"), ("ours.rs", "fn b() {}\n"), ("theirs.rs", "fn c() {}\n")] { std::fs::write(d.join(name), text).unwrap(); }
+        let opened = open_files(&d.join("base.rs"), &d.join("ours.rs"), &d.join("theirs.rs"), &d.join("result.rs"), d).unwrap();
+        let mut s = MergeSession::new(opened, 40.0);
+        let mut tags = Vec::new();
+        for job in s.parse_jobs() { let (tag, parsed) = job.run(); assert!(s.finish_parse(&tag, parsed)); tags.push(tag); }
+        assert!(!tags.is_empty() && !s.notices().iter().any(|n| n == highlight::LIMIT_NOTE), "{:?}", s.notices());
+        // one pane's parse stopped at the limit, as the syntax worker reports it
+        let limited = Arc::new(highlight::Parsed::limited_plain("fn c() {}\n"));
+        assert!(s.finish_parse(tags.last().unwrap(), Some(limited)));
+        assert_eq!(s.notices().iter().filter(|n| *n == highlight::LIMIT_NOTE).count(), 1, "{:?}", s.notices());
+    }
+
+    #[test]
+    fn a_merge_that_settles_what_git_stops_on_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = |t: &str| crate::encoding::decode(t.as_bytes(), None);
+        let setup = || Setup { labels: Labels { ours: "o".into(), base: "b".into(), theirs: "t".into() }, has_base: true,
+            style: conflicts::Style::Merge, marker_size: 7 };
+        let versions = || [text("l1\nl2\n"), text("l1\nX\n"), text("l1\nl2\n")];
+        let merged = dir.path().join("f.txt");
+        let opened = assemble(versions(), &merged, "f.txt".into(), setup(), Some(("l1\nX\n".into(), 1))).unwrap();
+        assert_eq!(opened.notices, ["git finds 1 conflict here that this merge settles; check the changes applied at open"]);
+        let agreed = assemble(versions(), &merged, "f.txt".into(), setup(), Some(("l1\nX\n".into(), 0))).unwrap();
+        assert!(agreed.notices.is_empty());
+    }
+
     #[test]
     fn a_conflict_list_file_added_on_both_sides_has_no_base() {
         let (dir, _) = conflicted(None);
@@ -2097,7 +2185,8 @@ pub(crate) mod tests {
         let mut s = opened_state(d, &stages);
         assert_eq!((s.m.unresolved(), s.m.edited_outside()), (0, 0));
         assert!(!s.snapshot.crlf);
-        assert_eq!(s.notices(), ["Ours: CRLF · Result keeps LF"]);
+        assert_eq!(s.notices(), ["git finds 1 conflict here that this merge settles; check the changes applied at open",
+            "Ours: CRLF · Result keeps LF"]);
         s.save().unwrap();
         assert_eq!(
             std::fs::read_to_string(d.join("f.txt")).unwrap(),
@@ -2391,6 +2480,7 @@ impl MergeSession {
 }
 
 struct MergeFind {
+    cursor: crate::field_edit::Cursor,
     search: crate::find::Find,
     editing: bool,
 }
@@ -2423,6 +2513,7 @@ impl MergeSession {
             f.editing = true;
         } else {
             self.find = Some(MergeFind {
+                cursor:Default::default(),
                 search: crate::find::Find::new(
                     String::new(),
                     options,
@@ -2435,29 +2526,16 @@ impl MergeSession {
         }
         self.refind();
     }
-    pub fn type_find(&mut self, text: &str) {
-        if let Some(f) = &mut self.find {
-            for c in crate::document::one_line(text).chars() {
-                if f.search.query.len() + c.len_utf8() > 4096 {
-                    break;
-                }
-                f.search.query.push(c);
-            }
-            self.refind();
-        }
+    pub fn find_query(&self) -> Option<&str> {self.find.as_ref().map(|f|f.search.query.as_str())}
+    pub fn find_cursor(&self) -> crate::field_edit::Cursor {self.find.as_ref().map_or(Default::default(),|f|f.cursor)}
+    pub fn edit_find(&mut self, command: crate::field_edit::Command) -> crate::field_edit::Outcome {
+        let Some(f)=self.find.as_mut() else{return Default::default()};
+        let out=f.cursor.execute_limited(&mut f.search.query,command,4096);
+        if out.changed {self.refind();}out
     }
-    pub fn backspace_find(&mut self) {
-        if let Some(f) = &mut self.find {
-            f.search.query.pop();
-            self.refind();
-        }
-    }
-    pub fn clear_find_query(&mut self) {
-        if let Some(f) = &mut self.find {
-            f.search.query.clear();
-            self.refind();
-        }
-    }
+    pub fn type_find(&mut self,text:&str){self.edit_find(crate::field_edit::Command::Insert(text.into()));}
+    pub fn backspace_find(&mut self){self.edit_find(crate::field_edit::Command::Edit{edit:crate::line_edit::Edit::Backspace,extend:false});}
+    pub fn clear_find_query(&mut self){self.edit_find(crate::field_edit::Command::Clear);}
     pub fn finish_find(&mut self) {
         if let Some(f) = &mut self.find {
             f.editing = false;

@@ -545,9 +545,84 @@ pub struct Batch {
     pub error: Option<String>,
 }
 
+/// Where the reader works, for file ranking: the folders of the files open and recently opened (most recent first,
+/// the active file's leading) and those files themselves. A file in the same folders ranks above an equal or slightly
+/// better match elsewhere; one recently opened ranks higher too. Project-relative paths.
+#[derive(Clone, Debug, Default)]
+pub struct Nearby {
+    /// Context ranking is on (Search Everywhere: Rank by Open and Recent Files); off, ranking is by the name alone.
+    on: bool,
+    /// Each leading folder path of a recent file (`dev/`, `dev/app/`…) with what sharing it is worth, best first: a
+    /// file's folder score is that of the first one it starts with.
+    folders: Vec<(Box<str>, i64)>,
+    recent: Vec<Box<str>>,
+}
+
+/// Each folder shared with a recent file's from the root (at most [`Nearby::SHARED`]) is worth this much, a little less
+/// for each older file; it outweighs the step from a scattered match to one inside the name.
+const PER_FOLDER: i64 = 12_000;
+/// A file recently opened: worth this much (the active file's), a little less for each older one.
+const RECENT: i64 = 8_000;
+/// A file whose name, or name before its first `.`, is the whole query: first whatever the context.
+const EXACT_NAME: i64 = 1_000_000;
+
+impl Nearby {
+    /// How many leading folders count, and how many recent files.
+    const SHARED: usize = 3;
+    const FILES: usize = 10;
+
+    /// From project-relative paths, most recent first (the active file first).
+    pub fn new<'a>(recent: impl IntoIterator<Item = &'a str>) -> Self {
+        let recent: Vec<Box<str>> = recent.into_iter().take(Self::FILES).map(Into::into).collect();
+        let mut folders: Vec<(Box<str>, i64)> = Vec::new();
+        for (i, path) in recent.iter().enumerate() {
+            let mut prefix = String::new();
+            for (depth, part) in path.split('/').take(path.matches('/').count()).take(Self::SHARED).enumerate() {
+                prefix.push_str(part);
+                prefix.push('/');
+                let value = (depth as i64 + 1) * (PER_FOLDER - 400 * i as i64);
+                match folders.iter_mut().find(|(p, _)| p.as_ref() == prefix) {
+                    Some((_, v)) => *v = (*v).max(value),
+                    None => folders.push((prefix.as_str().into(), value)),
+                }
+            }
+        }
+        folders.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        Self { on: true, folders, recent }
+    }
+
+    /// What `path`'s folders shared with the recent files' are worth (project-relative): a few prefix comparisons.
+    pub fn folder_boost(&self, path: &str) -> i64 {
+        self.folders.iter().find(|(prefix, _)| path.starts_with(prefix.as_ref())).map_or(0, |(_, v)| *v)
+    }
+
+    /// What having opened `path` recently is worth (the recent files are ranked on their own, so only they pay this).
+    pub fn recent_boost(&self, path: &str) -> i64 {
+        self.recent.iter().position(|r| r.as_ref() == path).map_or(0, |i| RECENT - 400 * i as i64)
+    }
+}
+
+/// Whether the file name of `lower` (lowercased) is `q`, or its part before the first `.` is.
+fn exact_name(q: &str, lower: &str) -> bool {
+    let name = lower.rsplit('/').next().unwrap_or(lower);
+    name == q || name.split('.').next() == Some(q)
+}
+
+/// A file's rank for `query` (lowercased): Lenz's fuzzy score, its context, and an exact name first.
+pub fn file_score(q: &str, lower: &str, len: usize, nearby: &Nearby, path: &str) -> Option<i64> {
+    let score = lenz_content::fuzzy::score_lowered(q, lower, len)?;
+    if !nearby.on { return Some(score); }
+    Some(score + nearby.folder_boost(path) + if exact_name(q, lower) { EXACT_NAME } else { 0 })
+}
+
 /// The best [`FINDER_LIMIT`] paths in `batches` for `query`, by Lenz's file ranking (ties keep discovery order),
 /// and how many matched in all. `None` once `current` says the query or project was superseded.
 pub fn rank(batches: &[Arc<[Entry]>], query: &str, current: impl Fn() -> bool) -> Option<(Vec<Arc<str>>, usize)> {
+    rank_near(batches, query, &Nearby::default(), current)
+}
+
+/// [`rank`] with where the reader works: files near the open and recent ones first among close matches.
+pub fn rank_near(batches: &[Arc<[Entry]>], query: &str, nearby: &Nearby, current: impl Fn() -> bool) -> Option<(Vec<Arc<str>>, usize)> {
     let q = query.to_lowercase();
     let mut hits: Vec<(i64, &Arc<str>)> = Vec::new();
     let mut matched = 0;
@@ -555,7 +630,7 @@ pub fn rank(batches: &[Arc<[Entry]>], query: &str, current: impl Fn() -> bool) -
         if i % 4096 == 0 && !current() {
             return None;
         }
-        if let Some(s) = lenz_content::fuzzy::score_lowered(&q, &e.lower, e.path.len()) {
+        if let Some(s) = file_score(&q, &e.lower, e.path.len(), nearby, &e.path) {
             matched += 1;
             hits.push((s, &e.path));
             // Keep memory bounded on broad queries: drop all but the best periodically.
@@ -574,8 +649,10 @@ fn keep_best(hits: &mut Vec<(i64, &Arc<str>)>) {
     hits.truncate(FINDER_LIMIT);
 }
 
-/// Enumerate `root` in batches: ignore rules obeyed (also outside Git), hidden files kept unless ignored, `.git`
-/// skipped, symlinked directories not followed (symlinked files are listed). Stops when `generation` moves on.
+/// Enumerate `root` in batches: folders that ignore rules exclude (`target/`, `node_modules/`; also outside Git) are
+/// not entered, but every file in a folder that is entered is listed, ignored or not, so `.env` and `.env.local`
+/// show beside `.env.example`. Hidden files and folders are kept, `.git` is skipped, symlinked directories are not
+/// followed (symlinked files are listed). Stops when `generation` moves on.
 pub fn scan(root: &Path, generation: u64, latest: &AtomicU64, mut send: impl FnMut(Batch)) {
     let failed = |e: String| Batch { done: true, error: Some(e), ..Batch::default() };
     match std::fs::metadata(root) {
@@ -583,32 +660,51 @@ pub fn scan(root: &Path, generation: u64, latest: &AtomicU64, mut send: impl FnM
         Ok(_) => return send(failed("not a folder".into())),
         Err(e) => return send(failed(e.to_string())),
     }
-    let walker = ignore::WalkBuilder::new(root)
+    // The walker decides which folders to enter; each folder's files are read from the folder itself, so the
+    // ignore rules that drop a file (`.env`, `*.log`) do not hide it.
+    let folders = ignore::WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|e| e.file_name() != ".git")
+        .filter_entry(|e| e.file_name() != ".git" && e.file_type().is_some_and(|t| t.is_dir()))
         .build();
     let mut batch = Vec::with_capacity(BATCH);
     let mut skipped = 0;
-    for entry in walker {
+    for folder in folders {
         if latest.load(Ordering::Relaxed) != generation {
             return; // superseded: the new root's scan reports instead
         }
-        let Ok(entry) = entry else {
+        let Ok(folder) = folder else {
             skipped += 1;
             continue;
         };
-        let Some(kind) = entry.file_type() else { continue };
-        let file = kind.is_file() || (kind.is_symlink() && entry.path().metadata().is_ok_and(|m| m.is_file()));
-        if !file {
+        if !folder.file_type().is_some_and(|t| t.is_dir()) {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-        let rel = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
-        batch.push(rel);
-        if batch.len() == BATCH {
-            send(Batch { paths: std::mem::replace(&mut batch, Vec::with_capacity(BATCH)), skipped: std::mem::take(&mut skipped), ..Batch::default() });
+        let Ok(rel) = folder.path().strip_prefix(root) else { continue };
+        let prefix: String = rel.components().map(|c| format!("{}/", c.as_os_str().to_string_lossy())).collect();
+        let Ok(entries) = std::fs::read_dir(folder.path()) else {
+            skipped += 1;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                skipped += 1;
+                continue;
+            };
+            let file = kind.is_file() || (kind.is_symlink() && entry.path().metadata().is_ok_and(|m| m.is_file()));
+            let name = entry.file_name();
+            if !file || name == ".git" {
+                continue;
+            }
+            batch.push(format!("{prefix}{}", name.to_string_lossy()));
+            if batch.len() == BATCH {
+                send(Batch { paths: std::mem::replace(&mut batch, Vec::with_capacity(BATCH)), skipped: std::mem::take(&mut skipped), ..Batch::default() });
+            }
         }
     }
     send(Batch { paths: batch, done: true, skipped, error: None });
@@ -712,10 +808,16 @@ mod tests {
     }
 
     #[test]
-    fn scanning_obeys_ignores_keeps_hidden_files_and_does_not_follow_directory_links() {
+    fn scanning_skips_ignored_folders_lists_ignored_files_keeps_hidden_files_and_does_not_follow_directory_links() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
-        for (p, body) in [("src/main.rs", ""), (".gitignore", "target/\n*.log\n"), ("target/out.rs", ""), ("app.log", ""), (".config/tool.toml", ""), (".git/HEAD", "ref"), ("docs/main.rs", "")] {
+        let files = [
+            ("src/main.rs", ""), (".gitignore", "target/\n*.log\n.env\n.env.*\n!.env.example\nnode_modules\n"), ("target/out.rs", ""),
+            ("app.log", ""), (".config/tool.toml", ""), (".git/HEAD", "ref"), ("docs/main.rs", ""), (".env", "SECRET=1\n"),
+            (".env.local", ""), (".env.example", ""), ("web/.env.development", ""), ("web/node_modules/x/index.js", ""),
+            ("web/.gitignore", "dist/\n"), ("web/dist/app.js", ""), ("only-ignored/.env", ""), ("sub/.git", "gitdir: elsewhere\n"),
+        ];
+        for (p, body) in files {
             std::fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
             std::fs::write(root.join(p), body).unwrap();
         }
@@ -733,7 +835,11 @@ mod tests {
             done = b.done;
         });
         found.sort();
-        let mut want = vec![".config/tool.toml", ".gitignore", "docs/main.rs", "src/main.rs"];
+        // Ignored files are listed where their folder is entered; ignored folders, nested rules included, are not.
+        let mut want = vec![
+            ".config/tool.toml", ".env", ".env.example", ".env.local", ".gitignore", "app.log", "docs/main.rs", "only-ignored/.env",
+            "src/main.rs", "web/.env.development", "web/.gitignore",
+        ];
         if cfg!(unix) {
             want.push("linked.rs");
             want.sort();

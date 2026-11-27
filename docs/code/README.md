@@ -22,6 +22,40 @@ remain unverified.
 Lenz Code is the editor in the Lenz command family; [the launcher guide](../launcher-trial.md)
 explains how to launch it as `lenz [file-or-folder]`.
 
+## Editing archives
+
+Open an archive with `lenz sources.zip`, Open File…, or the explorer. The explorer shows its
+folders and members; Enter or double-click opens a member in an ordinary editor tab. Typing,
+clipboard commands, Find/Replace, editor motions and Undo/Redo work on that member's draft.
+Save (Ctrl+S) writes its captured version back into the outer archive. Save As exports it to
+a regular file. Saving one member keeps other unsaved member drafts untouched.
+
+Supported formats match Diff: ZIP, TAR, gzip TAR (`.tar.gz`, `.tgz`), bzip2 TAR
+(`.tar.bz2`, `.tbz2`, `.tbz`), XZ TAR (`.tar.xz`, `.txz`) and Zstandard TAR
+(`.tar.zst`, `.tzst`). Nested archives work through four layers. Use the Up / close row
+to return from a nested archive or close its browser; open tabs remain available. Empty
+and damaged archives keep an exit, and a failed listing offers Retry. See the
+[terminal controls](tui.md) for keyboard navigation in a narrow terminal.
+
+Member names are virtual paths: nothing is extracted into the project. Tabs, breadcrumbs
+and status show paths such as `sources.zip!/nested.tgz!/src/main.rs`. Links are readable
+but cannot be edited. Encrypted, ambiguous or unsupported archive layouts stay read-only
+when their metadata cannot be preserved; Status details explains the reason. Rename,
+Move, Delete, external tools and language servers require physical files; export a member
+with Save As when one of those operations is needed.
+
+Save preserves untouched members, order, comments and supported metadata, and replaces the
+container atomically after checking its exact identity and bytes. Concurrent member saves
+are serialized per container. External changes are checked through the same recovery and
+comparison controls as ordinary files; failed or unconfirmed saves retain the draft.
+Unsaved member drafts also participate in restart recovery.
+
+Stored archives are limited to 512 MiB, unpacked streams to 2 GiB, members to 1 GiB and indexes
+to 100,000 records. Browsing keeps a bounded cache and loads member text on demand. Large
+members still inherit the editor's normal limits. Unsupported RAR and 7z files remain binary files.
+
+## Architecture
+
 - `crates/code-core` (`code-core`): documents, commands and the session. No GPUI.
 - `crates/code-gui` (`code-gui`, binary `lenz-code`): the window.
 - `crates/code-tui` (`code-tui`, binary `lenz-code-tui`): the [terminal editor](tui.md).
@@ -53,19 +87,22 @@ the folders the typed path names (`~/` and relative paths work; hidden folders o
 completes the chosen folder into the path, Enter opens the chosen folder, and Ctrl+Enter opens it in a new project tab.
 The desktop's Open Folder… uses the system's folder chooser.
 
+If the desktop file dialog cannot open, **Open File…** and **Open Folder…** offer an in-window path prompt with the error and an Open button. Type or paste an existing path (relative to the project, or `~/` for home); Ctrl/Cmd+A replaces it, arrows move the caret, Enter opens and Escape cancels. A bad path keeps the prompt open without changing documents. Long search and path inputs scroll to keep the caret visible, including after Home and word movement.
+
 Keys (the default IntelliJ keymap; see [Keymaps](#keymaps); in the macOS desktop app every Ctrl chord is pressed and
 shown with Cmd, and Alt with Option, as IntelliJ's macOS keymap does, so Format Document is ⌘⌥L): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
 all, Ctrl+C copy (with only a caret: its whole line), Ctrl+X cut (with only a caret: its whole line; a line copied or
 cut this way pastes back as a whole line above the caret's line), Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),
 Ctrl+Shift+Home/End select to the file's start/end, Home goes to the first non-blank character and then the line start
 while editing, Ctrl+Up/Down scroll a row (macOS: Cmd+Left/Right go to the line's ends and Cmd+Up/Down to the file's;
-no word motion there yet, since Option+Left/Right is Back/Forward), Ctrl+Backspace / Ctrl+Delete delete to the word
+Option+Left/Right are Back/Forward unless **macOS Word Motion** is on, below), Ctrl+Backspace / Ctrl+Delete delete to the word
 stop (also Alt+Backspace / Alt+Delete, macOS's Option), Ctrl+W / Ctrl+Shift+W extend / shrink the selection, Ctrl+- / Ctrl+= collapse /
 expand, Ctrl+Shift+- / Ctrl+Shift+= collapse / expand all, arrows move the cursor, PageUp/PageDown/Home/End scroll,
 Ctrl+P find file (`name:line`), Ctrl+G go to line, Ctrl+F find (Tab: replace, Enter replaces, Alt+A replaces all), F3 / Shift+F3 next / previous match, Ctrl+Shift+F search,
 Alt+Z soft wrap, Ctrl+Shift+. breadcrumbs, Ctrl+Shift+O outline, Ctrl+T declarations, F12 / Ctrl-click definition,
 Alt+F12 peek, Ctrl+Shift+B type definition, Ctrl+Alt+B implementations, Shift+F12 usages, Ctrl+Alt+H call hierarchy,
-Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons) back/forward,
+Ctrl+H or Alt+H type hierarchy, Ctrl+Q documentation, Alt+Left/Right (or the mouse's side buttons; macOS: also Cmd+[ / Cmd+]) back/forward
+(every jump is a step, a definition in the same file too: Back returns to each place you Ctrl-clicked, in turn),
 F11 toggle bookmark, Ctrl+F11 bookmark key, Shift+F11 bookmarks, Ctrl+Shift+0–9 / Alt+0–9 set / go to a numbered
 bookmark, Ctrl+E recent files, Ctrl+Alt+E recent locations, Ctrl+Shift+V Markdown source/preview, F10 command menu,
 Ctrl+Shift+A find action; Escape closes a menu or cancels a pending definition. Ctrl+Alt+Down / Up add a cursor on the next / previous line in both keymaps (also **Add Cursor Below / Above** in the Edit menu), Alt+J selects the word under the caret and then its next occurrence, and Escape, a click or a caret move returns to one cursor; several selections are edited and undone together ([limits](tui.md)). Tab / Shift+Tab indent and outdent the selected lines with the file's EditorConfig or project step, Ctrl+/ (or Alt+/) comments, Ctrl+Shift+Down / Up move lines (VS Code keymap: Alt+Down / Up) and Alt+Shift+Down / Up duplicate them ([structural edits](tui.md)). In the GUI, Close Window
@@ -75,7 +112,7 @@ The **☰** button (GUI and terminal) opens File, Edit, View, Navigate, Find, Gi
 existing commands and setting values. The selected action's disabled reason appears separately below the list;
 unavailable actions keep the menu open. Scroll long menus with the wheel or arrow keys. Click **‹ All menus**, or press Left/Escape, to go
 back to the groups. **All commands…** and the bottom-right **Commands** button open searchable Actions.
-F10 retains the plain full command menu. Narrow windows shorten the button label; below 240 px it gives way to the LSP status, with ☰ and F10
+F10 keeps the full command menu: every command under its menu's heading (File, File › New, View › Terminal…), settings with a check mark when on. Narrow windows shorten the button label; below 240 px it gives way to the LSP status, with ☰ and F10
 still available. Menus consume input before the document beneath them.
 
 With the explorer focused (Ctrl+Shift+E), typing searches visible file and folder names without opening them.
@@ -91,12 +128,32 @@ fold/unfold, F5 reload), and actions VS Code leaves unbound keep no chord there 
 language-server status, collapse/expand all) instead of reusing a key VS Code gives another action. The choice and
 every override are remembered outside the project in Lenz Code's settings file.
 
+On macOS the IntelliJ preset follows IntelliJ's macOS keymap where it differs: Cmd+Shift+N is New Scratch File there,
+so Find File is Cmd+P (and double Shift). Elsewhere it keeps IntelliJ's Linux and Windows keys (Ctrl+Shift+N finds a
+file).
+
 Both presets bind Ctrl+Alt+Down / Up to Add Cursor Below / Above and Alt+J to Select Next Occurrence; Alt+J stays
 because VS Code's Ctrl+D (select the next occurrence) is Compare Selected here. Tab and Shift+Tab are fixed editing
 keys, like Delete, and the structural edits take chords: Ctrl+/ and Alt+/ for Toggle Comment, Ctrl+Shift+Down / Up for
 Move Lines (Alt+Down / Up in the VS Code preset, which is VS Code's own chord), and Alt+Shift+Down / Up for Duplicate
 Lines in both presets—IntelliJ's own Alt+Shift+arrows move a line and its Ctrl+D duplicates one, so Move Lines takes
-IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it.
+IntelliJ's Move Statement arrows and Duplicate takes the chord VS Code uses for it. **Delete Line** removes every line
+the selections touch (one Undo step; each caret keeps its column on the line below): Ctrl+Y in the IntelliJ preset,
+and Cmd+Backspace on macOS in both presets, in the GUI and in terminals that report Cmd (the kitty keyboard protocol);
+it has no VS Code chord because Ctrl+Shift+K is Keep Tab Open here. **Copy Reference** (Ctrl+Alt+Shift+C in the
+IntelliJ preset, Cmd+Option+Shift+C on macOS; also in the text's right-click menu) copies the qualified name of the
+declaration holding the caret: `Foo::Bar::Baz#foo_method` and `Foo::Baz.make` in Ruby (`#` for instance methods, `.`
+for `def self.` and `class << self` ones), `pkg.module.Class.method` in Python, `com.acme.Box#open` in Java,
+`crate::module::Type::method` in Rust; outside a declaration (and in Markdown, HTML and CSS) it copies `path:line`. It
+names the declaration the caret is in, not a name the caret is on: a call is not resolved to what it calls.
+**Go to Test or Subject** (Ctrl+Shift+T in the IntelliJ preset, Cmd+Shift+T on macOS; also in Navigate) opens the
+active file's test, or from a test the file it tests, found by name in the project: `user.rb` ↔ `user_spec.rb` or
+`user_test.rb`, `mod.py` ↔ `test_mod.py` or `mod_test.py`, `Box.java` ↔ `BoxTest.java` (Kotlin, Scala, PHP, C#, Swift,
+Groovy alike, also `Tests` and `Spec`), `a.ts` ↔ `a.test.ts` or `a.spec.ts` (any of the JavaScript and TypeScript
+extensions), `x.go` ↔ `x_test.go`, `lib.ex` ↔ `lib_test.exs`. Among several, the one whose folders match best wins, with
+`app`, `lib`, `src`, `spec`, `test`, `tests`, `__tests__`, `main` and `java` left out of the comparison
+(`app/models/user.rb` ↔ `spec/models/user_spec.rb`, not `spec/requests/user_spec.rb`); without one it says what it
+looked for. It needs the file's project folder open; files the project's ignore rules leave out are not found.
 
 **Keymap…** lists each command with its chords, the preset origin of each override and any binding an override
 displaced. Enter takes the next key as the selected command's shortcut, Delete restores the preset's chord, Esc
@@ -108,6 +165,16 @@ own answers are not chords: the recovered-draft dialog keeps `r`, `d` and Esc in
 **Recover Unsaved Draft…** command stays in the File menu without a preset chord, like Close Window.
 
 ### Vim editing and relative line numbers
+
+**Save When Leaving a File** (Edit → Editing Preferences, or Find Action; off by default, remembered) saves an edited
+file as soon as another tab, file or pane becomes active: switching tabs, opening another file, Back/Forward or a
+definition. Its exact text is written (format on save applies to Save itself); untitled documents and read-only files
+are left as they are, and closing a tab still asks, so Discard never writes.
+
+**macOS Word Motion** (Edit → Editing Preferences, or Find Action) makes Option+Left/Right move by word on macOS,
+Shift selecting, with Back/Forward on Cmd+[ / Cmd+] (and the mouse's side buttons). Word stops then cross the spaces
+between words, for Ctrl+arrows and word deletion too: from the end of `width: 80` the stops are `80`, `:` and
+`width`. It is off by default and remembered; off, every key behaves as before.
 
 **Vim Editing** (Edit → Editing Preferences, or F10) enables built-in Normal, Insert, Visual and linewise Visual modes;
 the status bar shows the current mode and pending command. It is off by default and remembered independently
@@ -238,8 +305,26 @@ actions give the same reason in both adapters. The one copy outside the project 
 record (the draft and the last saved text, as for any file), kept in Lenz Code's recovery folder (0700) as a 0600 file
 until it is saved or discarded. Project text search and Find read the file within the session like any other.
 
-Enter carries the current line's leading tabs and spaces onto the new line. YAML, Markdown and Haml retain
-their structural indentation rules; pasted text keeps its own whitespace.
+Enter in code (Rust, C, C++, Go, Zig, Java, Kotlin, C#, Python, Ruby, PHP, Lua, shell, JavaScript, TypeScript, CSS,
+JSON and SQL) indents the new line as its block calls for: one step deeper after a line that opens a block (an opening
+bracket last; Python's `:`; Ruby's `def`, `class`, `module`, `if`, `else`, `when`, `rescue`, `do |x|`, `{ |x|`; Lua's
+and shell's `then` and `do`), one step out after Python's `return`, `pass`, `break`, `continue` and `raise`, and between
+a bracket and its closer (`{|}`) the closer moves to its own line at the opener's indentation with the caret on an
+indented line between. On an empty line the nearest line with text above stands in, so a blank line inside a body
+continues the body. The step is the file's (EditorConfig, the project's choice, the language default: two spaces for
+Ruby, YAML, Haml and SQL, a tab for Go and Makefiles, four spaces otherwise), written as
+spaces after spaces and a tab after tabs. Other files keep the line's leading tabs and spaces. Comments and quoted
+brackets open nothing; `end` and closing brackets are not outdented as they are typed. YAML, XML, Markdown and Haml
+retain their structural indentation rules; pasted text keeps its own whitespace.
+
+After that indentation, a language server that formats on Enter (`textDocument/onTypeFormatting` with `\n`) is asked
+for its edits, which go in as their own Undo step with the caret left on the new line; Ctrl+Z takes them back and keeps
+the line break. Only Ruby LSP is asked (servers opt in per provider: VS Code leaves format-on-type off, and some servers
+reformat the previous line on Enter). Ruby LSP closes the block just opened with `end` (after `def`, `class`, `module`,
+`if`, `unless`, `while`, `until`, `for`, `case` and `do`), closes a heredoc and continues a `#` comment line. It adds
+`end` only while the file does not parse; because an unrelated error elsewhere also makes it offer one, Lenz drops an
+`end` when the block already has its own (the first line below at the opener's indentation or less is `end` at the
+opener's indentation). An answer that arrives after more typing, a caret move or for several carets is dropped.
 
 The GUI source caret blinks every half second, starts visible after typing or movement, and stays steady
 while a dialog or another control/window has focus. The terminal source caret stays steady.
@@ -258,8 +343,9 @@ under the author's control.
 
 ### CSV tables
 
-CSV opens as source. Use the pane header's **Table / Source** control or **CSV: Table / Source** in Find Action
-to show a table. Each pane keeps its own filter, sort and viewport. The first record supplies column headings;
+CSV opens as source. Use the switch at the file's top-right (source | table; **Table / Source** in the
+terminal) or **CSV: Table / Source** in Find Action to show a table. Each pane keeps its own filter, sort and
+viewport. The first record supplies column headings;
 **CSV: Toggle Header Row** includes it as data instead.
 
 Click a cell and press Enter (or double-click in the GUI) to edit it. Enter commits one undoable draft edit;
@@ -325,6 +411,13 @@ keystroke typed in a Markdown file. Native macOS and Wayland, and physical termi
 **Search Everywhere** follows [IntelliJ's name-navigation pattern](https://www.jetbrains.com/help/idea/searching-everywhere.html):
 one popup with **All / Files / Symbols / Actions** tabs, a query, fuzzy matches and secondary paths/details. The All
 tab keeps matches at word starts (`nsr` finds `NewSearchResult`, not `inspector`); a single tab matches any letters in order.
+With **Search Everywhere: Letters in File Names** on (Find Action; off by default, remembered), the All tab also lists
+files whose name holds the query's letters in order (`i_summary` finds `invoice_summary.csv`).
+With **Search Everywhere: Rank by Open and Recent Files** on (Find Action; off by default, remembered), Search
+Everywhere and Find File also weigh where you work: files sharing folders with the active, open and recently opened
+files (up to three folders deep, the more recent the more) and those files themselves rank above a slightly better match
+elsewhere, while a file named exactly as the query (`foo_bar` or `foo_bar.rb`) comes first wherever it is. On
+100,000 matching files it adds about 4 ms per query with ten recent files in different folders, nothing when off.
 Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three categories. Direct shortcuts are:
 
 | Search | Shortcut |
@@ -333,9 +426,12 @@ Double-tap bare **Shift** in the GUI, or press **Ctrl+K**, to search all three c
 | Symbols by name | Ctrl+Alt+Shift+N (VS Code: Ctrl+Shift+O) |
 | Actions by name | Ctrl+Shift+A or Ctrl+Shift+P (VS Code: Ctrl+Shift+P) |
 
-Tab / Shift+Tab cycles categories while keeping the query. Arrows, Page keys and Home/End select a
+Tab / Shift+Tab cycles categories while keeping the query. Left/Right move the query's caret, Ctrl+Left/Right or
+Alt+Left/Right (macOS's Option) by word and Cmd+Left/Right (GUI) to its ends; typing goes in at the caret, and Backspace /
+Delete take a character, with Ctrl, Alt or Cmd a word. Up/Down, Page keys and Home/End select a
 result; the wheel scrolls the popup without changing selection. Enter opens/runs the selected result and Esc returns to reading. Tabs and rows are clickable. File results distinguish
-identical basenames by path and accept `name:line[:column]`. Empty queries prefer open/recent files; search
+identical basenames by path and accept `name:line[:column]`. A pasted path to an existing file, absolute or from `~/`
+(quotes and a `:line[:column]` allowed), is the first row and opens that file, outside the project too. Empty queries prefer open/recent files; search
 keeps at most the best 100 results. Action rows show shortcuts, setting values and current disabled reasons.
 Long Unicode queries keep the typed tail visible. Search opens candidates only when selected.
 
@@ -359,6 +455,16 @@ usual. This also works when reading a single file without an open project. Libra
 visit them; only expanded folders are listed, in background jobs. Adding a library does not add files to the
 local project declaration index. The browsing root stays unchanged.
 
+In Ruby, Go to Definition (Ctrl/Cmd+click, F12) also lists declarations Ruby LSP's index misses, as RubyMine's
+Choose Declaration does: methods a gem or the project declares with ActiveSupport's `cattr_accessor`,
+`mattr_accessor`, `class_attribute` or `delegate`, or with `alias_method`, `define_method` and the `attr_*` macros
+(`perform_deliveries`, ActionMailer's `cattr_accessor` and Mail's `attr_accessor`). They are found by name in the
+bundle's gems (their `lib` and `app` folders, as Ruby LSP lists them) and the project's Ruby files, and added when
+Ruby LSP found nothing (then project `def`s too) or only declarations outside the project. Several are listed in the
+results panel by gem and version; one opens read-only. This is a match by name, not a resolution: every macro
+declaring the name is a candidate, including ones the receiver does not have, and a macro whose names continue on
+the next line is not read past its first line.
+
 Collapse and expand a library folder to refresh its listing after a dependency update or branch checkout.
 Listings are limited to 2,000 entries per directory and 20,000 overall, with a status message when truncated;
 the definition you followed remains visible. At the overall limit, following another definition releases old
@@ -370,7 +476,7 @@ sources are listed, since the protocol does not provide a directory listing. Reo
 server session for the text; after that session ends, follow the definition again.
 
 Holding Ctrl over a name underlines it and shows a hand pointer: a click there follows it. A right-click in the text
-opens a menu with every navigation action, Copy Path / Copy Path:Line, Open in Editor, Open with Default App,
+opens a menu with every navigation action, Copy Path / Copy Path:Line / Copy Reference, Open in Editor, Open with Default App,
 Compare With… and Split Right / Split Down (Close Split once split). The call hierarchy lists callers (Tab:
 callees) in the results panel, a level loading as it unfolds (Right/Left). Type Hierarchy (Ctrl+H) lists the subtypes of the type at
 the caret the same way (Tab: supertypes). It comes from the server's own type hierarchy where it has one (JDT LS,
@@ -391,14 +497,24 @@ Automatic suggestions stay closed after Enter and on empty or indentation-only l
 A snippet suggestion expands with the file's indentation and Tab then visits its placeholders until Escape, a caret move, another tab or Undo ends it
 ([snippets](../research/code-snippets.md)). Definitions come from installed language servers (see [provider compatibility](providers.md)); explicit
 provider settings live in `$XDG_CONFIG_HOME/lenz-code/providers.json`.
+Until you trust an opened folder, Lenz Code is in **Restricted** mode there and runs no code from it: language servers
+that run a project's code (its build scripts, its Bundler setup, its TypeScript plugins) and the project's own
+formatters stay off, while highlighting, search, Markdown, Git views and the other servers keep working. The first time
+one would start, one dialog asks whether you trust the folder's authors (Stay Restricted is the default; Tab moves the
+focus to Trust and Enter takes it); the answer is remembered, every open window follows it, and the status bar's
+**Restricted** item opens the dialog again. Trusted, a folder's own programs are found only inside it, but Cargo and
+RuboCop still read configuration from the folders above it ([folder trust](providers.md#project-tools-and-folder-trust)).
 Completion rows show their kinds, separate adjacent kind groups and emphasize matching text while preserving
 the server's ranking. Their documentation renders Markdown and syntax-highlighted code, with scrolling instead
 of a short truncated excerpt. Wheel over the documentation, or use Alt+PageUp/PageDown/Home/End, to read it;
 changing the selected suggestion starts its documentation at the top.
 The toolbar keeps navigation and the branch selector above the tabs, with a visible app menu. Find and comparison actions live in their menus and shortcuts.
-The footer separates language-server status, the current message, cursor position and Commands.
-Long messages end with an ellipsis; click the message or use **Status details…** (Shift+F2)
-for a wrapped, scrollable snapshot. Ctrl+C copies the complete snapshot. Routine server-memory
+The footer separates language-server status, the current message, cursor position and Commands; only a cell that
+shows something is a control (the position opens Go to Line). Long messages end with an ellipsis; click the message,
+**Details** at the right (in windows wide enough for it) or use **Status details…** (Shift+F2) for a wrapped,
+scrollable snapshot: what needs attention first, then **File**,
+**Project** and **Language server**, one labelled line each (the home folder shown as `~`). Ctrl+C copies the
+complete snapshot; a Copy button says "Copied" when it has. Routine server-memory
 samples stay in details so they do not continually change the footer.
 
 Click the LSP footer status or press F2
@@ -478,10 +594,16 @@ Files over 5 MiB or 100,000 lines open in large-file mode: read in full, without
 
 The explorer is its own panel left of the files panel (the tabs sit over the text). The toolbar's first button, or
 Ctrl+B, shows and hides it; Ctrl+Shift+E focuses it. Its target button selects the opened file, opening the folders
-above it. Opening a folder whose only entry is a folder opens that one too, down to a folder with more. Folders list
+above it. With **Explorer: Always Select Opened File** on (the command menu or Find Action; off by default, remembered)
+it does so by itself whenever the active file changes: opening a file, switching tabs, Back/Forward or a definition;
+a hidden explorer stays hidden and shows that file selected when it opens. Opening a folder whose only entry is a folder opens that one too, down to a folder with more. Folders list
 before files; the command menu's "Explorer: All by Name" switches to plain name order ("Explorer: Folders First" back) (bytewise:
 capitals first), saved in `$XDG_CONFIG_HOME/lenz-code/settings.json`. Explorer rows and tabs show the Git status
 letter (M, A, D, R, U, C) apart from the `●` unsaved mark, as in the [terminal editor](tui.md).
+The explorer, the file finder (Shift Shift) and Find in Files share one inventory of the project's files. Folders the
+ignore rules exclude (`target/`, `node_modules/`, `.venv/`; `.gitignore`, `.ignore` and `.git/info/exclude`, also outside
+Git) are not entered, but every file in a folder that is entered is listed, ignored or not: `.env`, `.env.local` and
+other hidden or ignored files show beside `.env.example`.
 
 A single click selects a directory. Click its arrow or double-click its name to expand or collapse it;
 keyboard Left/Right and Enter remain available in both frontends.
@@ -492,7 +614,12 @@ is open. Without a project it starts an untitled document; the first Save asks f
 Escape cancels without writing.
 
 **New Scratch File…** and **Scratch Files…** in the File menu create and reopen durable personal files outside
-projects. Their in-app name prompt uses the extension to choose the language. They use ordinary Save and draft recovery, remain available
+projects. New Scratch File lists the kinds of file, as IntelliJ does: Plain text, JSON, Ruby and PostgreSQL first, then
+every language Lenz reads by name (Bash to Zig, ERB and HAML templates, CSV, Dockerfile, environment files); typing
+filters by name or extension and Enter creates the next free `scratch_N.<extension>` (`scratch_1.rb`, `scratch_2.sql`…),
+opened in that language, a PostgreSQL or DuckDB one with that SQL dialect. Each kind shows its file-type icon, as the
+explorer and the tabs do, while **File Icons** is on (a Nerd Font glyph in the terminal editor). On macOS Cmd+Shift+N opens it, as in
+IntelliJ's macOS keymap. They use ordinary Save and draft recovery, remain available
 across projects and restarts, and live in `$XDG_STATE_HOME/lenz-code/scratch-files` (default
 `~/.local/state/lenz-code/scratch-files`). Closing a tab keeps its file; there are no scratch run/debug controls.
 Right-click a tab for **Close All Tabs**, **Close Other Tabs**, **Close Tabs to Left** and **Close Tabs to Right**
@@ -551,8 +678,20 @@ the second one, or press Space on each; marked entries show a ✓. Escape in the
 them.
 
 **Git Branches…** (Git menu, Ctrl+Shift+\`, or a click on the branch in the top bar) lists **New Branch…**,
-**Checkout Tag or Revision…**, then the **Recent**, **Local**, **Remote** and **Tags** branches and, with more than one,
-the **Worktrees**; typing filters. Enter checks out the highlighted branch (a remote one as a local branch tracking it,
+**Checkout Tag or Revision…**, then separate **Recent branches**, **Local branches**, **Remote branches**, **Tags**
+and (with more than one) **Worktrees** sections, each heading with its size; typing filters, and shows every match.
+Each row is one line: a mark (`●` the current branch or worktree, `★` a favorite, `⎇` a branch, `◆` a tag, `⧉` a
+worktree), the name — cut in the middle when it is too long, and shown in full at the foot while highlighted — and, on
+the right, a local branch's distance from its upstream and the upstream (`↑2 ↓1  origin/main`, or `gone`), a remote
+branch's remote, or a worktree's folder and changes. The distances are read after the lists, so they appear a moment
+later, and they compare with the remote branches as of your last `git fetch`: Lenz Code never fetches by itself.
+The current branch comes first in Local branches, then your favorites (**Add to Favorites** in a row's actions; they
+are kept per repository, so every worktree shows them, and starred remote branches lead Remote branches). Branches
+sharing a folder (`feature/login`, `feature/search`) gather under a **▸ feature/** row: Enter or → opens it, ← closes
+it, and it stays open for the rest of the session; typing lists every match by its whole name. A long section shows
+its first rows and **Show N more…**, which lists the rest. The last inventory appears immediately on reopening
+while metadata refreshes in the background. Choosing a branch does not scan every worktree's changed files.
+Enter checks out the highlighted branch (a remote one as a local branch tracking it,
 a tag or revision on a detached HEAD) or opens the highlighted worktree as the folder; → or a right-click lists a row's
 other actions (New Branch from Here…, Open in New Window). Your uncommitted changes go along when git allows. When they
 would be overwritten, a dialog lists the files: **Smart Checkout** stashes them, checks out and puts them back (a
@@ -563,6 +702,11 @@ index refresh and annotations blame again. The top bar shows the branch (or the 
 switch made elsewhere within a few seconds. Checkouts run git as your terminal would, with the repository's hooks and
 filters; everything else Lenz Code asks git keeps them off.
 
+On macOS, Command-Q and the application menu's Quit request closure of all Code
+windows through the shared Save/Discard/Cancel protocol. The red window button
+closes its own window, dismissing transient pickers and presenting any file or
+running-terminal question immediately; an active decision remains available.
+
 The Git menu also compares the working tree as it is (uncommitted and untracked files included) in Lenz Diff:
 **Show Local Changes** against the last commit (what the next commit would hold); **Compare with Branch, Tag or
 Revision…** against one picked from a list of branches and tags, or any revision typed; **Compare with Base Branch**
@@ -570,14 +714,16 @@ against the base branch as it is now (your local `main` or `master`, else the re
 `origin/main` or `origin/master`; Lenz never fetches); **Show Changes Since Branch Start** against the point the current branch split from that base, so
 only what the branch changes, not the base's later updates; **Compare with Worktree…** lists the other worktrees and compares the two folders. A row's actions in Git
 Branches… add **Compare with Working Tree** (branches, tags and worktrees) and **Show Changes Since Branching from
-Here** (other branches). Folder comparisons inside a repository skip what git ignores (`target/`, `node_modules/`); submodules and nested
-repositories are compared by their own ignore rules.
+Here** (other branches). Folder comparisons inside a repository skip what the folders' `.gitignore` files or your own global
+excludes ignore (`target/`, `node_modules/`); submodules and nested repositories are compared by their own `.gitignore` files. A
+compared folder's `.git/info/exclude` and repository-local `core.excludesFile` hide nothing, since they are never compared, and a
+`.gitignore` that ignores itself is still listed.
 
 The gutter also marks the draft's own changes. Left of the line numbers, a line the draft modifies shows **M** in the
 modified-file blue and a line it adds shows **A** in the added-file green; a second cell shows **D** where the draft
 deleted lines just above, with their count in **Status details…**. The letters are the identification, so a terminal
 without colour, or `NO_COLOR`, loses nothing. The baseline is named and never guessed: tracked files are compared
-against **HEAD**'s version of the file (`vs HEAD (main · a1b2c3c)`, in the status bar and in Status details), new and
+against **HEAD**'s version of the file (`vs HEAD (main · a1b2c3c)`, in Status details), new and
 untracked files against nothing — every line is added, labelled `new file (untracked)` or `new file (added to Git)` —
 and files outside Git against the last confirmed save. Unsaved edits count, so saving a tracked file leaves its
 repository markers and only a new HEAD clears them; outside Git, Save becomes the new baseline. The caret's line names
@@ -617,6 +763,11 @@ that commit's other lines; in the terminal the status line shows the caret line'
 commit in Lenz Diff against its first parent, and **Copy Revision**; both are also in the right-click menu. Annotating
 an earlier revision, choosing what the column shows and a commit log are not available.
 
+**Inline Blame** (View menu, or Find Action) shows the caret line's last commit faintly after the line's end, as
+`Author, YYYY-MM-DD • summary` (“Not committed yet” for a changed line), without the annotation column. It is off by
+default and remembered; it follows the caret in the active tab, hides over a selection and gives way to a problem shown
+on that line. While it is on, the shown tabs are blamed as for annotations, again after each change.
+
 Find (Ctrl+F) opens a box over the pane's text: matches are tinted as you type and the counter says which one is
 selected (at most 10,000 are listed); Enter / Shift+Enter or F3 / Shift+F3 step, Alt+Enter lists every match in the
 results panel, Escape closes. Alt+C, Alt+W and Alt+R (or the box's Aa, W and .* toggles) match case, whole words or a
@@ -636,7 +787,9 @@ Soft Wrap (Alt+Z, remembered) wraps long lines at the pane's width; continuation
 carry no number. Large files, images and previews do not wrap.
 
 Sticky Scroll pins the first lines of the declarations around the top line over each pane's text (at most five, the
-innermost kept; Rust `impl` blocks and Markdown sections count); a click goes there. A breadcrumb bar under each pane's
+innermost kept; Rust `impl` blocks and Markdown sections count); a click goes there. A jump (a definition, Go to Line,
+Back/Forward) lands with its line below them, also deep in nested modules and once a newly opened file's declarations
+arrive. A breadcrumb bar under each pane's
 tabs shows the file's path in the project, then the declarations holding the caret: a folder or file shows in the
 explorer, a declaration gets the caret, and the `›` after a crumb lists a folder's entries, the files beside a file,
 or the declarations beside a declaration (type to filter, Enter goes there). Ctrl+Shift+. gives the bar the keys (Left /
@@ -668,8 +821,9 @@ back. It shares Find Files' icons, secondary paths and fuzzy name/path matching,
 heading. Recent Locations (Ctrl+Alt+E) lists where navigation went from and to, and where a file was left (a place
 within five lines of a listed one replaces it). In each list, typing filters, Enter or a click goes there (a history step), Delete
 removes the entry, and files that no longer exist show "missing". The reader keeps 50 recent files and 30 recent
-locations per folder and every bookmark, in `$XDG_STATE_HOME/lenz-code/projects/` (one file per folder, at most 4 MiB,
-saved a second after the last change and at exit); without a folder they last until the reader closes. Two windows
+locations per folder and every bookmark, in the private (0700) `$XDG_STATE_HOME/lenz-code/projects/` (one 0600
+file per folder, at most 4 MiB, saved a second after the last change and at exit); without a folder they last until
+the reader closes. Two windows
 on one folder merge their places when either saves; a window shows the other's changes after its own next save. A
 places file from another reader version is left as it is, and places are then not saved. An unreadable file is kept
 beside it as `.json.unreadable`.
@@ -692,7 +846,11 @@ cannot make bookmarks unreadable.
 Project search (Ctrl+Shift+F) opens a centered dialog that takes the same options (literal and case-insensitive by
 default); a click on a field focuses it and a click on an option toggles it, and an invalid regular expression is
 shown there and not searched. It reopens with the last query selected, so typing replaces it; Ctrl+A selects a
-field, Backspace clears a selection and Ctrl+Backspace (Ctrl+W in a terminal) drops the last word. Tab moves to its files field:
+field, Backspace or Delete clears a selection, and Left/Right leave it at its start or end. Each field edits at its
+caret as Search Everywhere's query does: Left/Right by character, Ctrl+Left/Right or Alt+Left/Right (macOS's Option) by
+word, Home/End (and Cmd+Left/Right in the GUI) to its ends; typing and a paste go in at the caret (the GUI's Ctrl+V
+takes the clipboard's first line), and Backspace / Delete take a character, with Ctrl, Alt or Cmd a word (Ctrl+W or Ctrl+H in a terminal too).
+Tab moves to its files field, its caret at the end:
 comma-separated
 globs, any case, `!` to exclude (`*.rs, src/, !*.test.ts`); a name without `/` matches at any depth, a path with `/`
 from the root, and a folder means everything in it. Matches list as a tree in the explorer's order (folders before
@@ -723,9 +881,11 @@ search that is still running (**Stop Search**, keeping what it found so far), th
 is hidden the status bar shows **Results (N)**; a click there shows it again. A new search or usages list shows
 itself, and **Close Results** discards the results.
 
-Markdown files open as their source. **Preview / Source** sits at the right edge of each file pane's header
-and controls that pane's document, including in split views. Ctrl+Shift+V and the command menu remain available
-when the pane is too narrow for the button. Switching preserves the reading line, and a file switched to its
+Markdown files open as their source. A two-icon switch floats at the top-right of each file pane, as in
+IntelliJ: source on the left, preview on the right, the shown one highlighted and each named on hover (in the
+terminal, a **Preview / Source** button in the same corner). It controls that pane's document, including in split
+views, and sits under the find box while that is open. Ctrl+Shift+V and the command menu remain available when
+the pane is too small for it. Switching preserves the reading line, and a file switched to its
 preview opens that way again. The preview shows local raster images only: inside the
 browsing root, or beside the Markdown file when it is outside the root, resolved through symlinks, at most 64 per
 document and 64 MiB each. Remote, missing and outside images say why in place. Folded callouts are shown open. A
@@ -777,3 +937,28 @@ its retained text, **Clear** removes it, and **Hide** or Escape collapses the pa
 input to the editor. The latest 256 entries are kept in memory, up to 8 KiB each, with UTC timestamps;
 they survive file switches but are not saved between sessions. New entries follow the bottom when
 scrolled there. This is application activity, not an unrestricted capture of every child process's output.
+
+
+Search and popup fields support selection, copy/cut/paste, character/word movement, Home/End and Shift-selection in both interfaces. See [text input controls and terminal clipboard behavior](../tui.md#text-in-searches-and-dialogs). Reader branch-row actions use Alt+Enter while a filter is nonempty; F6 forgets a recent item/bookmark or resets a keybinding.
+
+### Project replacement and symbol rename
+
+Run **Search in Project…** with the desired query, file filter and match options, then
+choose **Replace…** above the results or **Replace in Project…** from Commands. Enter the replacement and press Enter
+for a preview. Replacement text is literal, including `$1`; an empty value deletes matches.
+The search must be complete and current before a replacement can be prepared.
+
+**Rename Symbol…** asks the active file's language server to rename the symbol at the
+caret. Enter the new name to preview its proposed changes. Availability depends on the
+server's rename support and readiness. Rename accepts text edits to project files;
+file creation/moves/deletion, annotated edits and projected template sources are refused.
+
+In either preview, **Previous/Next** (`P`/`N`) selects a file, **Include/exclude** (Space)
+changes whether it will be applied, **Apply** (`A`) edits the selected drafts, and Escape
+cancels, including while the preview is being prepared. Excluding files from a symbol rename may leave references inconsistent.
+The preview supports at most 100 files, 10,000 edits, 4 MiB per file and 32 MiB of source
+and replacement text. The selected file appears first; very long preview text is truncated
+with a notice, so narrow the search to inspect a smaller change set. A changed draft, project or disk file refuses application; prepare
+another preview to review current contents. Apply edits drafts; normal Save, Save As and an enabled
+**Save When Leaving a File** control when those drafts reach disk. Undo in an affected file
+reverts that file's replacement in one step.

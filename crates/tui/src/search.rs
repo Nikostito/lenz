@@ -11,11 +11,12 @@ use ratatui::{
     layout::Rect,
     style::Modifier,
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 use std::sync::Arc;
 
 pub struct Search {
+    pub(crate) input_cursor:lenz::field_edit::Cursor,
     pub model: ChangeSetSearch,
     pub closed: bool,
     pub focused: bool,
@@ -39,6 +40,7 @@ impl Search {
 
     pub fn open(set: Arc<ChangeSet>, changed_only: bool, options: lenz::find::FindOptions) -> Self {
         Self {
+            input_cursor:Default::default(),
             model: ChangeSetSearch::new(String::new(), changed_only, options),
             closed: false,
             focused: true,
@@ -96,17 +98,15 @@ impl Search {
             self.hit = Some(hit);
         }
     }
-    fn type_text(&mut self, text: &str) {
-        let mut query = self.model.query().to_string();
-        for character in lenz::document::one_line(text).chars() {
-            if query.len() >= 4096 {
-                break;
-            }
-            query.push(character);
-        }
-        self.execute(SearchCommand::Query(query));
+    fn edit_field(&mut self,command:lenz::field_edit::Command){
+        let mut query=self.model.query().to_string();
+        let out=self.input_cursor.execute_limited(&mut query,command,4096);
+        if out.changed{self.execute(SearchCommand::Query(query));}
+        if let Some(text)=out.copy{let _=crate::clipboard::copy(&text);}
     }
+    fn type_text(&mut self,text:&str){self.edit_field(lenz::field_edit::Command::Insert(text.into()));}
     pub fn handle(&mut self, event: Event) -> bool {
+        if self.model.editing() && let Event::Key(key)=&event && key.kind!=KeyEventKind::Release && let Some(command)=lenz_terminal_ui::command(*key){self.edit_field(command);return true;}
         match event {
             Event::Resize(width, height) => {
                 self.size = Rect::new(0, 0, width, height);
@@ -227,11 +227,15 @@ impl Search {
                 4.min(area.height.saturating_sub(2)),
             );
             let text = self.prompt_text();
+            let title = text.lines().next().unwrap_or("Find in Change Set").split(": ").next().unwrap_or("Find in Change Set");
             frame.render_widget(Clear, popup);
             frame.render_widget(
-                Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(format!("\n{}{}",text.lines().nth(1).unwrap_or_default(),self.model.query_error().map_or(String::new(),|e|format!(" · {e}")))).style(crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg))).block(crate::chrome::pane(title,palette,true)),
                 popup,
             );
+            let inner=Rect::new(popup.x+1,popup.y+1,popup.width.saturating_sub(2),popup.height.saturating_sub(2).min(1));
+            let base=crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg));
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:self.model.query(),cursor:self.input_cursor,area:inner,active:true},base,base.bg(crate::chrome::color(palette.selected_bg)));
             return;
         }
         let panel = self.panel(area);
@@ -260,7 +264,7 @@ impl Search {
             .map(|row| match row {
                 PanelRow::File(index, count) => Line::styled(
                     format!("▾ {} ({count})", safe(&self.set.comparisons[*index].path)),
-                    crate::chrome::style_with(palette).fg(crate::chrome::color(palette.accent)),
+                    crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg)).fg(crate::chrome::color(palette.accent)),
                 ),
                 PanelRow::Hit(index) => {
                     let hit = &self.model.hits()[*index];
@@ -278,10 +282,10 @@ impl Search {
                         ),
                         if selected {
                             crate::chrome::style_with(palette)
-                                .bg(crate::chrome::color(palette.selected_bg))
+                                .bg(crate::chrome::color(palette.menu_selected(palette.status_bg)))
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            crate::chrome::style_with(palette)
+                            crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg))
                         },
                     )
                 }
@@ -289,10 +293,8 @@ impl Search {
             .collect();
         frame.render_widget(Clear, panel);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
+            Paragraph::new(lines).style(crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg))).block(
+                crate::chrome::pane(title, palette, true)
                     .title_bottom("F3/Shift-F3 results · Tab comparison · / edit · Esc closes"),
             ),
             panel,

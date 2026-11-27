@@ -169,14 +169,17 @@ impl Viewer {
             div()
                 .absolute()
                 .size_full()
+                .bg(lenz_gpui::popup::scrim())
                 .flex()
                 .items_center()
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(
-                    div()
+                    lenz_gpui::popup::dialog(div(), p)
                         .id("discard-confirmation")
+                        // the window's own font, as every other popup
+                        .text_size(px(font_size())).font_family(self.font.family.clone())
                         .w(px(560.))
                         .max_w_full()
                         .max_h_full()
@@ -185,9 +188,6 @@ impl Viewer {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .bg(rgb(p.status_bg))
-                        .border_1()
-                        .border_color(rgb(p.border))
                         .text_color(rgb(p.fg))
                         .child(question)
                         .child(
@@ -213,7 +213,7 @@ impl Viewer {
                                     div()
                                         .id("discard-confirm")
                                         .p_2()
-                                        .bg(rgb(p.selected_bg))
+                                        .bg(rgb(lenz_gpui::popup::selected(p)))
                                         .child("Discard (Enter)")
                                         .on_mouse_down(
                                             MouseButton::Left,

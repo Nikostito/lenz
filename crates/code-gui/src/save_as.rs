@@ -15,31 +15,26 @@ impl ReaderView {
 
     /// File prompts own all input; the core still validates and writes, including the captured Save As tab.
     pub(super) fn file_prompt_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let Some(Modal::SaveAs { input, selected, error, .. } | Modal::NewScratch { input, selected, error } | Modal::RenameTerminal { input, selected, error, .. }) = &mut self.modal else { return false };
+        let Some(Modal::SaveAs { input, selected, error, .. } | Modal::RenameTerminal { input, selected, error, .. } | Modal::WorkspaceInput { input, selected, error, .. }) = &mut self.modal else { return false };
         let key = ev.keystroke.key.as_str();
         let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
         if key == "escape" { self.modal = None; cx.notify(); return true; }
         if key == "enter" {
             let command = match &mut self.modal {
                 Some(Modal::SaveAs { tab, dir, input, error, .. }) => {
-                    if input.trim().is_empty() { *error = Some("Enter the new file's path".into()); None }
+                    if input.is_empty() { *error = Some("Enter the new file's path".into()); None }
                     else {
-                        let input = input.trim();
-                        let path = input.strip_prefix("~/").and_then(|rest| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))).unwrap_or_else(|| PathBuf::from(input));
-                        Some(Command::SaveAs { tab: *tab, path: if path.is_absolute() { path } else { dir.join(path) } })
+                        Some(Command::SaveAs { tab: *tab, path: code_core::open_path::expand(input, dir) })
                     }
+                }
+                Some(Modal::WorkspaceInput { rename, input, error, .. }) => {
+                    if *rename && input.is_empty() { *error = Some("Enter the new symbol name".into()); None }
+                    else { Some(if *rename { Command::RenameSymbol(input.clone()) } else { Command::PreviewProjectReplace(input.clone()) }) }
                 }
                 Some(Modal::RenameTerminal { id, input, error, .. }) => {
                     match self.session.terminal_rename_refusal(*id, input) {
                         Some(why) => { *error = Some(why); None }
                         None => Some(Command::Terminal(code_core::terminal::Command::Rename { id: *id, label: input.clone() })),
-                    }
-                }
-                Some(Modal::NewScratch { input, error, .. }) => {
-                    let name = input.trim();
-                    match code_core::create::name_refusal(name) {
-                        Some(why) => { *error = Some(why); None }
-                        None => Some(Command::NewScratch(name.into())),
                     }
                 }
                 _ => None,
@@ -85,14 +80,19 @@ impl ReaderView {
     pub(super) fn prompt_new_scratch(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Err(why) = self.session.scratch_files() { self.dispatch(Command::Notice(format!("Scratch files: {why}")), cx); return; }
         self.modal_scroll.set(0);
-        self.modal = Some(Modal::NewScratch { input: "scratch.txt".into(), selected: true, error: None });
+        self.modal = Some(Modal::NewScratch { query: String::new(), at: 0 });
         cx.notify();
     }
 
     pub(super) fn prompt_scratch_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         match self.session.scratch_files() {
-            Ok(files) => { self.modal_scroll.set(0); self.modal = Some(Modal::ScratchFiles { files, at: 0 }); cx.notify(); }
+            Ok(files) => { self.modal_scroll.set(0); self.modal = Some(Modal::ScratchFiles { files, query: String::new(), at: 0 }); cx.notify(); }
             Err(why) => self.dispatch(Command::Notice(format!("Scratch files: {why}")), cx),
         }
     }
+}
+
+pub(super) fn matching_scratch_files<'a>(files: &'a [std::path::PathBuf], query: &str) -> impl Iterator<Item = &'a std::path::PathBuf> + 'a + use<'a> {
+    let query = query.to_lowercase();
+    files.iter().filter(move |path| path.file_name().is_some_and(|name| name.to_string_lossy().to_lowercase().contains(&query)))
 }

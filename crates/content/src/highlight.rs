@@ -17,7 +17,7 @@
 //! | Kotlin | [tree-sitter-kotlin-sg 0.4.1](https://github.com/ast-grep/tree-sitter-kotlin) | MIT | bundled |
 //! | C# | [tree-sitter-c-sharp 0.23.5](https://github.com/tree-sitter/tree-sitter-c-sharp) | MIT | bundled |
 //! | Python | [tree-sitter-python 0.25.0](https://github.com/tree-sitter/tree-sitter-python) | MIT | bundled |
-//! | Ruby | [tree-sitter-ruby 0.23.1](https://github.com/tree-sitter/tree-sitter-ruby) | MIT | bundled |
+//! | Ruby | [tree-sitter-ruby 0.23.1 + upstream ad907a6](https://github.com/tree-sitter/tree-sitter-ruby) | MIT | bundled; heredoc scanner fix from upstream |
 //! | PHP | [tree-sitter-php 0.24.2](https://github.com/tree-sitter/tree-sitter-php) | MIT | bundled |
 //! | Lua | [tree-sitter-lua 0.5.0](https://github.com/tree-sitter-grammars/tree-sitter-lua) | MIT | bundled |
 //! | Bash | [tree-sitter-bash 0.25.1](https://github.com/tree-sitter/tree-sitter-bash) | MIT | bundled |
@@ -28,7 +28,7 @@
 //! | JSON | [tree-sitter-json 0.24.8](https://github.com/tree-sitter/tree-sitter-json) | MIT | bundled |
 //! | YAML | [tree-sitter-yaml 0.7.2](https://github.com/tree-sitter-grammars/tree-sitter-yaml) | MIT | bundled |
 //! | TOML | [tree-sitter-toml-ng 0.7.0](https://github.com/tree-sitter-grammars/tree-sitter-toml) | MIT | bundled |
-//! | SQL | [tree-sitter-sequel 0.3.11](https://github.com/derekstride/tree-sitter-sql) | MIT | bundled |
+//! | SQL | [tree-sitter-sequel 0.3.13](https://github.com/derekstride/tree-sitter-sql) | MIT | bundled |
 //! | Markdown | [tree-sitter-md 0.5.3](https://github.com/tree-sitter-grammars/tree-sitter-markdown) | MIT | blocks + paragraph inline offsets |
 //! | Dockerfile | [tree-sitter-containerfile 0.9.2](https://github.com/wharflab/tree-sitter-containerfile) | MIT | bundled |
 //! | Makefile | [tree-sitter-make 1.1.1](https://github.com/tree-sitter-grammars/tree-sitter-make) | MIT | bundled |
@@ -43,9 +43,9 @@
 //! Not done yet: injections (HTML/JS/CSS inside PHP, HTML `<script>`/`<style>`, code in Markdown
 //! fences), and `locals` queries.
 
-use std::{cmp::Reverse, ops::{ControlFlow, Range}, path::Path, sync::{mpsc, Arc, OnceLock}};
+use std::{cmp::Reverse, ops::{ControlFlow, Range}, path::Path, sync::{mpsc, Arc, OnceLock}, time::{Duration, Instant}};
 
-use tree_sitter::{ParseOptions, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{ParseOptions, Parser, Query, QueryCursor, QueryCursorOptions, StreamingIterator, Tree};
 
 mod env;
 mod markdown;
@@ -69,6 +69,19 @@ const HIGHLIGHT_CHUNK: usize = 256;
 /// resolved). `None` when `current` says the work is no longer wanted; the first problem otherwise.
 pub fn check_xml(text: &str, current: &dyn Fn() -> bool) -> Option<Result<(), SyntaxError>> {
     xml::check(text, current)
+}
+
+/// How long one parse and its queries may hold a syntax worker. A 1.8 MB Rust file parses and highlights in about
+/// 0.3 s; a document still unfinished after this is shown as plain text, with a limited syntax note.
+const PARSE_LIMIT: Duration = Duration::from_secs(10);
+
+/// In-progress matches a query cursor keeps; past it the earliest are dropped instead of growing without bound.
+const MATCH_LIMIT: u32 = 1024;
+
+/// `current`, until `limit` from now.
+fn within(limit: Duration, current: &dyn Fn() -> bool) -> impl Fn() -> bool + '_ {
+    let deadline = Instant::now() + limit;
+    move || current() && Instant::now() < deadline
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,10 +185,14 @@ pub enum Capture {
     Emphasis,
 }
 
+/// What a document stopped at [`PARSE_LIMIT`] says, the same in every view that shows it.
+pub const LIMIT_NOTE: &str = "Syntax limit: this file took too long to parse and is shown without highlighting";
+
 /// One document's highlights. No syntax tree or duplicate source text survives the background job.
 pub struct Parsed {
     offsets: Vec<usize>,
     spans: Vec<Span>,
+    limited: bool,
 }
 
 struct Span {
@@ -185,6 +202,9 @@ struct Span {
 }
 
 /// Only lives while a document's highlights are being built.
+/// One line's highlighted byte ranges.
+type LineSpans = Vec<(Range<usize>, Capture)>;
+
 struct SyntaxTree<'a> {
     lang: Language,
     text: &'a str,
@@ -479,6 +499,25 @@ fn release_freed_memory() {
 }
 
 fn parse_now(lang: Language, text: &str, current: &dyn Fn() -> bool, want: Want) -> Option<Syntax> {
+    parse_within(lang, text, current, want, PARSE_LIMIT)
+}
+
+/// [`parse_now`], giving the document plain text once it takes longer than `limit`.
+fn parse_within(lang: Language, text: &str, current: &dyn Fn() -> bool, want: Want, limit: Duration) -> Option<Syntax> {
+    let deadline = Instant::now() + limit;
+    match parse_bounded(lang, text, &|| current() && Instant::now() < deadline, want) {
+        None if current() && Instant::now() >= deadline => Some(Syntax {
+            parsed: Parsed::limited_plain(text),
+            folds: want.folds.then(Folds::default),
+            declarations: tags(lang).filter(|_| want.declarations).map(|_| Declarations { items: Vec::new(), syntax_errors: true }),
+            errors: Some(vec![SyntaxError { range: 0..0, limited: true,
+                message: LIMIT_NOTE.into() }]),
+        }),
+        syntax => syntax,
+    }
+}
+
+fn parse_bounded(lang: Language, text: &str, current: &dyn Fn() -> bool, want: Want) -> Option<Syntax> {
     if !current() { return None; }
     // YAML that Rails reads through ERB: its tags masked for the grammar, their Ruby highlighted as Ruby.
     if lang == Language::Yaml && let Some(found) = yaml_erb::parse(text, current, want, |l, t, w| parse_grammar(l, t, current, w)) {
@@ -513,11 +552,11 @@ fn parse_grammar(lang: Language, text: &str, current: &dyn Fn() -> bool, want: W
     let markdown = if lang == Language::Markdown { markdown::inline(text, &line_starts, &tree, current)? } else { Vec::new() };
     let syntax = SyntaxTree { lang, text, line_starts, tree, markdown };
     let n = syntax.line_starts.len();
-    let mut parsed = Parsed { offsets: Vec::with_capacity(n + 1), spans: Vec::new() };
+    let mut parsed = Parsed { offsets: Vec::with_capacity(n + 1), spans: Vec::new(), limited: false };
     // Bound temporary query captures and per-byte paint; a full-file query can dwarf the tree.
     for start in (0..n).step_by(HIGHLIGHT_CHUNK) {
         if !current() { return None; }
-        for line in syntax.spans(start..(start + HIGHLIGHT_CHUNK).min(n)) {
+        for line in syntax.spans(start..(start + HIGHLIGHT_CHUNK).min(n), current)? {
             parsed.offsets.push(parsed.spans.len());
             parsed.spans.extend(line.into_iter().map(|(r, capture)| Span { start: r.start as u32, end: r.end as u32, capture }));
         }
@@ -536,6 +575,21 @@ fn parse_grammar(lang: Language, text: &str, current: &dyn Fn() -> bool, want: W
 }
 
 impl Parsed {
+    /// Shown as plain text because highlighting took longer than [`PARSE_LIMIT`] ([`LIMIT_NOTE`]).
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
+
+    /// `text` as plain text, its highlighting stopped at [`PARSE_LIMIT`].
+    pub fn limited_plain(text: &str) -> Parsed {
+        Parsed { offsets: vec![0; crate::lines::line_starts(text).len() + 1], spans: Vec::new(), limited: true }
+    }
+
+    /// The note a view's per-file notices carry when any of its panes' highlights stopped at the limit.
+    pub fn limit_note<'a>(panes: impl IntoIterator<Item = Option<&'a Parsed>>) -> Option<&'static str> {
+        panes.into_iter().flatten().any(Parsed::limited).then_some(LIMIT_NOTE)
+    }
+
     pub fn bytes(&self) -> usize {
         self.offsets.capacity() * size_of::<usize>() + self.spans.capacity() * size_of::<Span>()
     }
@@ -560,27 +614,33 @@ impl Parsed {
 
 impl SyntaxTree<'_> {
     /// For each line in `lines` (clamped to the text), the highlighted byte ranges within that
-    /// line (excluding its `\n` / `\r\n`), sorted and non-overlapping.
-    pub fn spans(&self, lines: Range<usize>) -> Vec<Vec<(Range<usize>, Capture)>> {
+    /// line (excluding its `\n` / `\r\n`), sorted and non-overlapping; `None` once `current` says stop (a window
+    /// holding one huge line is one query).
+    pub fn spans(&self, lines: Range<usize>, current: &dyn Fn() -> bool) -> Option<Vec<LineSpans>> {
         let n = self.line_starts.len();
         let lines = lines.start.min(n)..lines.end.min(n);
         if lines.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let bounds: Vec<Range<usize>> = lines.clone().map(|l| self.line(l)).collect();
         let window = self.line_starts[lines.start]..self.line_starts.get(lines.end).copied().unwrap_or(self.text.len());
 
-        let Some(cfg) = config(self.lang) else { return vec![Vec::new(); lines.len()] };
+        let Some(cfg) = config(self.lang) else { return Some(vec![Vec::new(); lines.len()]) };
         let mut found = Vec::new();
         let mut cursor = QueryCursor::new();
+        cursor.set_match_limit(MATCH_LIMIT);
         cursor.set_byte_range(window.clone());
-        let mut captures = cursor.captures(&cfg.query, self.tree.root_node(), self.text.as_bytes());
+        let mut progress = |_: &tree_sitter::QueryCursorState| if current() { ControlFlow::Continue(()) } else { ControlFlow::Break(()) };
+        let options = QueryCursorOptions::new().progress_callback(&mut progress);
+        let mut captures = cursor.captures_with_options(&cfg.query, self.tree.root_node(), self.text.as_bytes(), options);
         while let Some((m, i)) = captures.next() {
             let c = m.captures()[*i];
             if let Some(paint) = cfg.captures[c.index as usize] {
                 found.push((c.node.byte_range(), paint));
             }
         }
+        drop(captures);
+        if !current() { return None; }
         let first = self.markdown.partition_point(|span| span.end_before <= window.start);
         found.extend(self.markdown[first..].iter().take_while(|span| span.range.start < window.end)
             .filter(|span| span.range.end > window.start).map(|span| (span.range.clone(), Some(span.capture))));
@@ -589,7 +649,8 @@ impl SyntaxTree<'_> {
         found.sort_by_key(|(r, _)| (r.start, Reverse(r.end)));
 
         let mut paint: Vec<Vec<Option<Capture>>> = bounds.iter().map(|b| vec![None; b.len()]).collect();
-        for (range, capture) in found {
+        for (k, (range, capture)) in found.into_iter().enumerate() {
+            if k % 4096 == 4095 && !current() { return None; }
             let first = self.line_starts.partition_point(|&s| s <= range.start) - 1;
             for l in first.max(lines.start)..lines.end {
                 let b = &bounds[l - lines.start];
@@ -602,7 +663,7 @@ impl SyntaxTree<'_> {
                 }
             }
         }
-        paint.into_iter().map(runs).collect()
+        Some(paint.into_iter().map(runs).collect())
     }
 
     fn line(&self, l: usize) -> Range<usize> {
@@ -794,7 +855,7 @@ const PAIRS: &[(&str, &str)] = &[("{", "}"), ("(", ")"), ("[", "]"), ("\"", "\""
 /// block's inside before the whole, then each enclosing node with a different range, up to the whole text. One parse
 /// on the syntax pool, inside its arena; no tree outlives the call. `None` once `current` says the work is obsolete.
 pub fn selection_steps_while(lang: Language, text: Arc<str>, range: Range<usize>, current: impl Fn() -> bool + Send + 'static) -> Option<Vec<Range<usize>>> {
-    on_worker(move || steps_now(lang, &text, range, &current))
+    on_worker(move || steps_now(lang, &text, range, &within(PARSE_LIMIT, &current)))
 }
 
 fn steps_now(lang: Language, text: &str, range: Range<usize>, current: &dyn Fn() -> bool) -> Option<Vec<Range<usize>>> {
@@ -1240,7 +1301,7 @@ pub fn has_type_relations(lang: Language) -> bool {
 /// once `current` says the work is obsolete.
 pub fn type_relations_while(lang: Language, text: Arc<str>, current: impl Fn() -> bool + Send + 'static) -> Option<Vec<Relation>> {
     relations(lang)?;
-    on_worker(move || relations_now(lang, &text, &current))
+    on_worker(move || relations_now(lang, &text, &within(PARSE_LIMIT, &current)))
 }
 
 fn relations_now(lang: Language, text: &str, current: &dyn Fn() -> bool) -> Option<Vec<Relation>> {
@@ -1256,7 +1317,9 @@ fn relations_now(lang: Language, text: &str, current: &dyn Fn() -> bool) -> Opti
     let mut out = Vec::new();
     {
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&rel.query, tree.root_node(), text.as_bytes());
+        cursor.set_match_limit(MATCH_LIMIT);
+        let mut progress = |_: &tree_sitter::QueryCursorState| if current() { ControlFlow::Continue(()) } else { ControlFlow::Break(()) };
+        let mut matches = cursor.matches_with_options(&rel.query, tree.root_node(), text.as_bytes(), QueryCursorOptions::new().progress_callback(&mut progress));
         while let Some(m) = matches.next() {
             let node = |index: u32| m.captures().iter().find(|c| c.index == index).map(|c| c.node);
             let (Some(sub), Some(site)) = (node(rel.sub), node(rel.site)) else { continue };
@@ -1303,7 +1366,7 @@ fn relations_now(lang: Language, text: &str, current: &dyn Fn() -> bool) -> Opti
 /// says the work is obsolete.
 pub fn declarations_while(lang: Language, text: Arc<str>, current: impl Fn() -> bool + Send + 'static) -> Option<Declarations> {
     tags(lang)?;
-    on_worker(move || declarations_now(lang, &text, &current))
+    on_worker(move || declarations_now(lang, &text, &within(PARSE_LIMIT, &current)))
 }
 
 fn declarations_now(lang: Language, text: &str, current: &dyn Fn() -> bool) -> Option<Declarations> {
@@ -1330,7 +1393,9 @@ fn declarations_in(tags: &Tags, lang: Language, text: &str, tree: &tree_sitter::
     let mut found: Vec<Declaration> = Vec::new();
     {
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&tags.query, tree.root_node(), text.as_bytes());
+        cursor.set_match_limit(MATCH_LIMIT);
+        let mut progress = |_: &tree_sitter::QueryCursorState| if current() { ControlFlow::Continue(()) } else { ControlFlow::Break(()) };
+        let mut matches = cursor.matches_with_options(&tags.query, tree.root_node(), text.as_bytes(), QueryCursorOptions::new().progress_callback(&mut progress));
         let mut seen = 0usize;
         while let Some(m) = matches.next() {
             seen += 1;
@@ -1385,6 +1450,8 @@ fn declarations_in(tags: &Tags, lang: Language, text: &str, tree: &tree_sitter::
             });
         }
     }
+    // a query stopped part way found only some of them
+    if !current() { return None; }
     let syntax_errors = tree.root_node().has_error();
     // Source order; one record per name (combined queries may match a declaration twice); nesting depth and parent.
     found.sort_by_key(|d| (d.name_range.start, d.name_range.end));
@@ -1999,7 +2066,7 @@ mod tests {
             line_starts: crate::lines::line_starts(&src),
             markdown: Vec::new(),
         };
-        let whole = tree.spans(0..n);
+        let whole = tree.spans(0..n, &|| true).unwrap();
         assert_eq!(p.spans(0..n), whole, "chunk boundaries preserve the original full-tree highlighting");
         assert_eq!(whole.len(), n);
         for window in [1000..1060, 1003..1004, 1004..1063, n - 5..n] {
@@ -2332,6 +2399,39 @@ mod tests {
     fn rust_impl_for_dyn_has_no_subtype_and_keeps_the_rest() {
         let text = "impl Show for dyn Other {}\nimpl Show for &dyn Other {}\nimpl Show for Plain {}\n";
         assert_eq!(pairs(Language::Rust, text), vec![p("Plain", "Show")]);
+    }
+
+    #[test]
+    fn a_parse_past_its_time_limit_gives_plain_text_with_a_note() {
+        // deeply nested brackets on one huge line: harmless, but slow to parse in full
+        let text = format!("fn f() {{ let x = {}1{}; }}\n", "(".repeat(400_000), ")".repeat(400_000));
+        let limit = Duration::from_millis(20);
+        let started = Instant::now();
+        let syntax = parse_within(Language::Rust, &text, &|| true, Want { folds: true, declarations: true }, limit).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped near the limit: {:?}", started.elapsed());
+        assert!(syntax.parsed.spans.is_empty() && syntax.parsed.limited());
+        assert_eq!(syntax.parsed.spans(0..9).len(), crate::lines::line_starts(&text).len(), "every line, plain");
+        assert_eq!(syntax.folds, Some(Folds::default()));
+        let errors = syntax.errors.unwrap();
+        assert!(errors.len() == 1 && errors[0].limited && errors[0].message.starts_with("Syntax limit"), "{errors:?}");
+        // an obsolete document still answers nothing, and a normal one is unchanged
+        assert!(parse_within(Language::Rust, &text, &|| false, Want::default(), limit).is_none());
+        let normal = parse_within(Language::Rust, "fn main() { let x = 1; }\n", &|| true, Want::default(), PARSE_LIMIT).unwrap();
+        assert_eq!(normal.parsed.capture_at(0, 0), Some(Capture::Keyword));
+        assert_eq!(normal.errors, Some(Vec::new()));
+        assert!(!normal.parsed.limited());
+        assert_eq!(Parsed::limit_note([None, Some(&normal.parsed)]), None);
+        assert_eq!(Parsed::limit_note([Some(&normal.parsed), Some(&syntax.parsed)]), Some(LIMIT_NOTE));
+        assert_eq!(errors[0].message, LIMIT_NOTE);
+    }
+
+    #[test]
+    fn a_ruby_heredoc_with_a_long_word_ends_at_that_word() {
+        let word = "W".repeat(300);
+        let text = format!("x = <<~{word}\n  body\n{word}\ny = 42\n");
+        let parsed = parse(Language::Ruby, &text);
+        assert_eq!(parsed.capture_at(1, 2), Some(Capture::String));
+        assert_eq!(parsed.capture_at(3, 4), Some(Capture::Number), "the code after the heredoc is code");
     }
 
     #[test]

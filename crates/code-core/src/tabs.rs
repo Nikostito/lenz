@@ -130,7 +130,7 @@ pub struct Tab {
     /// While the preview of an edited version is being made: the last preview shown, which stays on screen, and the
     /// edits made since its version (each edit set in order), which carry its positions to the current text.
     pub(crate) held: Option<HeldPreview>,
-    /// Annotate with Git Blame, while on: kept across releases, made again for new content.
+    /// Annotate with Git Blame or inline blame, while on: kept across releases, made again for new content.
     pub(crate) blame: Option<crate::blame::Blame>,
     /// Shown from a recovered draft: it stays named as recovered until it is saved, discarded or reloaded.
     pub(crate) recovered: bool,
@@ -395,7 +395,7 @@ impl Tab {
             preview_source: self.preview_source.clone(),
             held: self.held.clone(),
             // Its own annotations, blamed for itself once shown.
-            blame: self.blame.as_ref().map(|_| crate::blame::Blame::new()),
+            blame: self.blame.as_ref().map(|b| if b.column { crate::blame::Blame::new() } else { crate::blame::Blame::inline() }),
             recovered: self.recovered,
         }
     }
@@ -418,6 +418,12 @@ impl Tab {
     pub(crate) fn is_file(&self) -> bool { self.read_only_side().is_none() && self.retrieved.is_none() && !self.untitled() }
     pub fn title(&self) -> String {
         if let Some(side) = self.comparison_side { return side.label().into(); }
+        if let Some(location) = crate::archive::Location::from_uri(&self.source) {
+            let leaf = location.member_name().and_then(|name| std::path::Path::new(name).file_name()).unwrap_or_default().to_string_lossy();
+            let outer = location.members.iter().rev().nth(1).map(std::path::Path::new).unwrap_or(&location.container);
+            let archive = outer.file_name().unwrap_or_default().to_string_lossy();
+            return format!("{} · {}", leaf.chars().take(120).collect::<String>(), archive.chars().take(80).collect::<String>());
+        }
         self.display.file_name().map_or_else(|| self.display.display().to_string(), |n| n.to_string_lossy().into_owned())
     }
     /// Whether an SVG shows its source text (else it is rendered).
@@ -484,16 +490,19 @@ impl Tab {
     }
     /// The annotation column's width in cells (0 while Annotate with Git Blame is off).
     pub fn annotation_cols(&self) -> usize {
-        if self.blame.is_some() { crate::blame::ANNOTATION_COLS } else { 0 }
+        if self.annotating() { crate::blame::ANNOTATION_COLS } else { 0 }
     }
+    /// Annotate with Git Blame is on: its column shows (inline blame alone keeps no column).
+    pub fn annotating(&self) -> bool { self.blame.as_ref().is_some_and(|b| b.column) }
+    fn annotations(&self) -> Option<&crate::blame::Blame> { self.blame.as_ref().filter(|b| b.column) }
     /// Current attribution state while annotations are enabled.
-    pub fn blame_status(&self) -> Option<crate::blame::Status<'_>> { self.blame.as_ref().map(crate::blame::Blame::status) }
+    pub fn blame_status(&self) -> Option<crate::blame::Status<'_>> { self.annotations().map(crate::blame::Blame::status) }
     /// Line `line`'s blame annotation, once git has reached it.
     pub fn annotation(&self, line: usize) -> Option<crate::blame::Annotation<'_>> {
         self.annotation_with_width(line, crate::blame::ANNOTATION_COLS)
     }
     pub fn annotation_with_width(&self, line: usize, width: usize) -> Option<crate::blame::Annotation<'_>> {
-        crate::blame::annotation(self.blame.as_ref()?, line, width)
+        crate::blame::annotation(self.annotations()?, line, width)
     }
     /// For source a language server returned (not a file): where it came from.
     pub fn retrieved(&self) -> Option<&crate::semantics::VirtualSource> {
@@ -742,6 +751,13 @@ impl History {
     /// `from` (a file or a folder) was moved to `to`: Back and Forward reach everything inside it at its new path.
     pub(crate) fn rename_tree(&mut self, from: &std::path::Path, to: &std::path::Path) {
         for at in self.entries.iter_mut() {
+            if let Some(mut location) = crate::archive::Location::from_uri(&at.source) {
+                if let Ok(rest) = location.container.strip_prefix(from) {
+                    location.container = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+                    at.source = location.to_uri();
+                }
+                continue;
+            }
             if let Ok(rest) = at.source.strip_prefix(from) { at.source = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) }; }
         }
     }

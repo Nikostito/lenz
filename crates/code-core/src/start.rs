@@ -29,13 +29,22 @@ pub fn home() -> Option<PathBuf> {
 
 /// `path` for people: its last component, and the folder holding it with the home folder as `~`.
 pub fn place(path: &Path, home: Option<&Path>) -> (String, String) {
+    let shown = shown(path);
+    let path = shown.as_path();
     let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
     let location = path.parent().map(|parent| tilde(parent, home)).unwrap_or_default();
     (name, location)
 }
 
-/// `path` with the home folder shown as `~`.
+/// The path a person reads for `path`: an entry inside an archive as `archive.zip!/entry`, any other path as it is.
+pub fn shown(path: &Path) -> PathBuf {
+    crate::archive::Location::from_uri(path).map_or_else(|| path.to_path_buf(), |location| PathBuf::from(location.display_path()))
+}
+
+/// `path` with the home folder shown as `~` (an archive entry as `archive.zip!/entry`).
 pub fn tilde(path: &Path, home: Option<&Path>) -> String {
+    let shown = shown(path);
+    let path = shown.as_path();
     match home.and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!("~/{}", rest.display()),
@@ -89,6 +98,8 @@ pub fn recent_projects(recent: &[PathBuf], query: &str, home: Option<&Path>, bra
 /// The git branch checked out in the repository holding `root` (or `detached` and a short commit), read from its
 /// `HEAD` file without running git: the nearest `.git` folder, or a worktree's `.git` file naming its folder.
 pub fn git_branch(root: &Path) -> Option<String> {
+    // An archive entry has no repository: and its URI, not being an absolute path, must not reach the current folder's.
+    if !root.is_absolute() || crate::archive::Location::from_uri(root).is_some() { return None; }
     let dot = root.ancestors().take(64).map(|dir| dir.join(".git")).find(|dot| dot.exists())?;
     let git_dir = if dot.is_file() {
         let text = std::fs::read_to_string(&dot).ok()?;

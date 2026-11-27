@@ -62,7 +62,8 @@ pub fn resolve(file: &Path, project: Option<Indent>, language: Option<Language>)
         (Some((Some(n), from)), _) => (n, Origin::EditorConfig(from)),
         (Some((None, _)), _) if tab.is_some() => tab.clone().unwrap_or((4, Origin::Default)),
         (_, Some(Indent::Spaces(n))) => (n, Origin::Project),
-        _ => (if spaces_only || language == Some(Language::Sql) { 2 } else { 4 }, Origin::Default),
+        // Ruby's convention (RuboCop's default, RubyMine's) is two spaces, as SQL's here.
+        _ => (if spaces_only || matches!(language, Some(Language::Sql | Language::Ruby)) { 2 } else { 4 }, Origin::Default),
     };
     let tab_width = tab.unwrap_or_else(|| size.clone());
     Resolved { style, size, tab_width }
@@ -346,6 +347,16 @@ mod tests {
         assert_eq!((configured.style, configured.size), ((Style::Space, Origin::Language), (4, Origin::EditorConfig(root.join(".editorconfig")))));
         let rust = resolve(&root.join("main.rs"), None, Some(Language::Rust));
         assert_eq!(rust.style.0, Style::Tab, "other languages keep EditorConfig's tabs");
+    }
+
+    #[test]
+    fn ruby_indents_two_spaces_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruby = resolve(&dir.path().join("a.rb"), None, Some(Language::Ruby));
+        assert_eq!((ruby.style.0, ruby.size.0), (Style::Space, 2));
+        assert_eq!(resolve(&dir.path().join("a.py"), None, Some(Language::Python)).size.0, 4);
+        write(dir.path(), ".editorconfig", "root = true\n[*.rb]\nindent_size = 4\n");
+        assert_eq!(resolve(&dir.path().join("a.rb"), None, Some(Language::Ruby)).size.0, 4, "EditorConfig still decides");
     }
 
     #[test]

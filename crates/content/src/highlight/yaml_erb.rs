@@ -119,7 +119,7 @@ pub(super) fn parse(text: &str, current: &dyn Fn() -> bool, want: Want, grammar:
 fn merge(text: &str, yaml: &Parsed, ruby: Option<&Parsed>, tags: &[Tag]) -> Parsed {
     let starts = crate::lines::line_starts(text);
     let n = yaml.offsets.len().saturating_sub(1);
-    let mut out = Parsed { offsets: Vec::with_capacity(n + 1), spans: Vec::new() };
+    let mut out = Parsed { offsets: Vec::with_capacity(n + 1), spans: Vec::new(), limited: yaml.limited };
     let mut first = 0;
     for line in 0..n {
         out.offsets.push(out.spans.len());

@@ -24,7 +24,7 @@ use code_core::{
 use code_core::text::{EditKind, SnapshotKey};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -51,6 +51,7 @@ pub(crate) enum Prompt {
     /// Open Folder in New Project Tab: the folder a new project view opens.
     OpenFolderInProjectTab,
     TerminalPath,
+    WorkspaceInput { rename: bool },
     RenameTerminal { id: code_core::terminal::Id },
     /// Save As: the destination path for this tab's document.
     SaveAs(code_core::tabs::TabId),
@@ -67,6 +68,8 @@ pub(crate) enum Prompt {
     Compare(PathBuf),
     WorkspaceRoot,
     SqlMetadata,
+    /// Maven Profiles…: the active profiles, typed as a list.
+    MavenProfiles,
     ServerRuntime,
     RecentRoots,
     Navigation,
@@ -95,12 +98,13 @@ pub(crate) enum Prompt {
     NewBranch { from: Option<String>, checkout: bool },
     /// Checkout Tag or Revision (`input`).
     Revision,
-    /// Every command's chord: type to filter, Enter captures a new shortcut, Delete restores the preset.
+    /// Every command's chord: type to filter, Enter captures a new shortcut, F6 restores the preset.
     Keymap,
 }
 /// What a details prompt is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Details {
+    Workspace,
     Terminal(u64),
     Install,
     Sql,
@@ -116,6 +120,10 @@ pub(crate) enum Details {
     Recovered,
     /// A project chosen while this tab has another open: here, in a new project tab, or not at all.
     OpenProject,
+    /// The folder-trust dialog: Escape stays restricted; Enter takes the focused choice (Stay Restricted unless Tab
+    /// moved the focus just before). No letter trusts: without the kitty keyboard protocol, Alt+T arrives as Escape
+    /// then T.
+    Trust,
 }
 pub(crate) struct Modal {
     pub kind: Prompt,
@@ -130,11 +138,16 @@ pub(crate) struct Modal {
     pub capture: Option<CommandId>,
     /// The focused field's text is selected, so typing replaces it (a terminal's label, a reopened search's query).
     pub selected: bool,
+    /// Search Everywhere's caret in `input` (a byte offset; `None` at the end). Other prompts type at the end.
+    pub caret: Option<usize>,
+    pub editors: [Option<lenz_content::field_edit::Cursor>; 2],
 }
 #[derive(Clone)]
 pub(crate) struct Choice {
     pub label: String,
     pub detail: Option<String>,
+    /// A nonselectable heading rendered before the first consecutive choice in this section.
+    pub section: Option<&'static str>,
     pub disabled: Option<&'static str>,
     pub target: ChoiceTarget,
 }
@@ -146,6 +159,8 @@ pub(crate) enum ChoiceTarget {
     Path(PathBuf),
     Theme(String),
     Place(Place),
+    /// New Scratch File's kind ([`code_core::scratch::KINDS`] index).
+    ScratchKind(usize),
     Sibling {
         pane: u8,
         crumb: usize,
@@ -185,6 +200,10 @@ pub(crate) struct TabStrip { pub first: usize, pub last: usize, pub shown: Optio
 pub(crate) struct App {
     /// `LENZ_ICONS=nerd|plain` for this run, over the File Icons setting until that is toggled here.
     pub icons_override: Option<bool>,
+    /// macOS's keys: with macOS Word Motion on, Alt (Option)+Left/Right move by word in the text.
+    pub mac_keys: bool,
+    /// The last Always Select Opened File ticket acted on.
+    follow_seen: u64,
     pub session: Session,
     pub modal: Option<Modal>,
     pub focus: Focus,
@@ -252,6 +271,8 @@ pub(crate) struct App {
     hover: Option<Hover>,
     double_shift: DoubleShift,
     pub(crate) preview_selection: Option<(TabId, PreviewSource, Selection)>,
+    /// A dialog's or the activity log's Copy just copied: its button says "Copied" until the next key or click.
+    pub(crate) copied: bool,
     pub(crate) preview_scroll: HashMap<TabId, (PreviewSource, usize)>,
 }
 impl App {
@@ -262,6 +283,8 @@ impl App {
         let mut app = Self {
             // Unit tests read plain labels unless they choose glyphs (the default has its own test).
             icons_override: if cfg!(test) { Some(false) } else { std::env::var("LENZ_ICONS").ok().map(|v| v == "nerd") },
+            mac_keys: cfg!(target_os = "macos"),
+            follow_seen: 0,
             session: Session::with_text_input(config, enabled),
             modal: None,
             focus: Focus::Text,
@@ -310,6 +333,7 @@ impl App {
             hover: None,
             double_shift: DoubleShift::default(),
             preview_selection: None,
+            copied: false,
             preview_scroll: HashMap::new(),
         };
         if let Some(path) = path {
@@ -373,6 +397,19 @@ impl App {
         }
     }
 
+    /// Always Select Opened File: highlight the active file's row and scroll to it, once per ticket; a hidden explorer
+    /// stays hidden.
+    pub(crate) fn sync_follow(&mut self) {
+        let Some((path, ticket)) = self.session.state().tree_follow() else { return };
+        if ticket <= self.follow_seen { return; }
+        self.follow_seen = ticket;
+        if let Some(at) = self.session.state().tree_rows().position(|r| r.path == path) {
+            self.tree_at = at;
+            self.tree_seen = usize::MAX;
+            self.tree_top = self.tree_top.min(at);
+        }
+    }
+
     /// Show and select the row the session asked for, once per ticket.
     pub(crate) fn sync_reveal(&mut self) {
         let Some((path, ticket)) = self.session.state().tree_reveal() else { return };
@@ -383,6 +420,9 @@ impl App {
             self.tree_seen = usize::MAX; // revealed even if it was already the highlight
             self.tree_shown = true;
             self.tree_top = self.tree_top.min(at);
+            if self.session.state().archive_tree().is_virtual(&path) && !self.session.state().archive_tree().is_member(&path) {
+                self.focus = Focus::Tree;
+            }
         }
     }
 
@@ -429,6 +469,7 @@ impl App {
             command,
             Command::Open(_)
                 | Command::OpenRetained(_)
+                | Command::OpenArchiveEntry(_)
                 | Command::NewScratch(_)
                 | Command::OpenScratch(_)
                 | Command::ActivateTree { .. }
@@ -477,6 +518,7 @@ impl App {
             self.tree_at = self.session.state().active_in_tree().and_then(|path| self.session.state().tree_rows().position(|r| r.path == path)).unwrap_or(0);
         }
         self.sync_reveal();
+        self.sync_follow();
         if let Some(plan) = effect.external { self.start(plan.launch,plan.toast); }
         if let Some(copy) = effect.copy {
             self.copy = Some(copy);
@@ -544,13 +586,45 @@ impl App {
     }
     pub fn apply(&mut self, completion: Completion) -> bool {
         let theme = self.highlighted_theme();
+        let branch_selection = matches!(&completion, Completion::Branches { .. }).then(|| {
+            self.modal.as_ref().and_then(|m| {
+                let (query, row) = match &m.kind {
+                    Prompt::Branches => (&m.input, m.at),
+                    Prompt::BranchMenu { query, row, .. } => (query, *row),
+                    _ => return None,
+                };
+                self.session.state().branch_rows(query).into_iter().nth(row)
+                    .map(|r| (query.clone(), r.section, r.target))
+            })
+        }).flatten();
         let tree_path = self.session.state().tree_rows().nth(self.tree_at).map(|r| r.path.clone());
+        let tree_parent = tree_path.as_deref().and_then(|path| self.session.state().archive_tree().parent(path));
         let tree_revision = self.session.state().tree_revision();
         let restoring = self.pending_explorer.is_some();
         let results_id = self.session.state().results().map(|r| r.id());
         let preview_positions = self.preview_positions();
         let workspace = self.session.state().workspace_revision();
         let mut effect = self.session.dispatch(completion);
+        // A cached list can refresh while the user is selecting a row. Follow the target, not the old
+        // numeric index; Recent and Local may contain the same branch. Hit rows belong to the old paint
+        // until the next draw and must not activate a different branch in the refreshed list.
+        if effect.repaint && let Some((query, section, target)) = branch_selection {
+            let rows = self.session.state().branch_rows(&query);
+            let at = rows.iter().position(|r| r.section == section && r.target == target)
+                .or_else(|| rows.iter().position(|r| r.target == target));
+            if let Some(m) = self.modal.as_mut() {
+                match &mut m.kind {
+                    Prompt::Branches => {
+                        m.at = at.unwrap_or(0);
+                        if at.is_none() { m.top = 0; }
+                        m.reveal_selection = true;
+                    }
+                    Prompt::BranchMenu { row, .. } => *row = at.unwrap_or(0),
+                    _ => {}
+                }
+            }
+            self.layout.modal_items.clear();
+        }
         if let Some(ticket) = self.session.external_ready() {
             let delivery = self.session.dispatch(Command::TakeExternal { ticket });
             effect.repaint |= delivery.repaint;
@@ -566,9 +640,11 @@ impl App {
             self.tree_at = self.session.state().active_in_tree().and_then(|path| self.session.state().tree_rows().position(|r| r.path == path)).unwrap_or(0);
         } else if !restoring && let Some(path) = tree_path
             && self.session.state().tree_rows().nth(self.tree_at).is_none_or(|r| r.path != path) {
-            self.tree_at = self.session.state().tree_rows().position(|r| r.path == path).unwrap_or(0);
+            self.tree_at = self.session.state().tree_rows().position(|r| r.path == path)
+                .or_else(|| tree_parent.and_then(|parent| self.session.state().tree_rows().position(|row| row.path == parent))).unwrap_or(0);
         }
         self.sync_reveal();
+        self.sync_follow();
         if self.session.state().results().map(|r| r.id()) != results_id {
             self.results_at = 0;
             self.results_top = 0;
@@ -589,10 +665,13 @@ impl App {
     }
     pub(crate) fn show_documentation(&mut self) {
         // The core's commit popup opens, follows and closes its dialog.
-        for (kind, title, now) in [(Details::Commit, "Commit", self.session.commit_text()), (Details::Checkout, "Checkout", self.session.checkout_text())] {
+        for (kind, title, now) in [(Details::Workspace, "Edit Preview · A applies · Esc cancels · 1–9 toggle files", self.session.workspace_preview().map(|p|p.text())), (Details::Commit, "Commit", self.session.commit_text()), (Details::Checkout, "Checkout", self.session.checkout_text()), (Details::Trust, code_core::session::TRUST_TITLE, self.session.trust_text())] {
             match (now, self.modal.as_mut()) {
                 (Some(text), Some(Modal { kind: Prompt::Details { kind: k, body, .. }, .. })) if *k == kind => *body = text,
-                (None, Some(Modal { kind: Prompt::Details { kind: k, .. }, .. })) if *k == kind => self.modal = None,
+                (None, Some(Modal { kind: Prompt::Details { kind: k, .. }, .. })) if *k == kind => {
+                    if kind == Details::Workspace { self.focus = Focus::Text; }
+                    self.modal = None;
+                },
                 (Some(body), None) => self.prompt(Prompt::Details { title, body, logo: false, kind }),
                 _ => {}
             }
@@ -616,7 +695,21 @@ impl App {
     pub fn nerd_icons(&self) -> bool {
         self.icons_override.unwrap_or_else(|| self.session.state().file_icons())
     }
+    /// `label`, or "Copied" for a Copy button that just copied.
+    pub(crate) fn copy_label(&self, label: &'static str) -> &'static str {
+        if self.copied && matches!(label, "Copy" | "Copy Revision") { "Copied" } else { label }
+    }
+
     pub fn run(&mut self, id: CommandId) {
+        if matches!(id, CommandId::CopyRevision | CommandId::CopyActivityLog | CommandId::CopyServerDetails) && self.session.disabled(id).is_none() {
+            self.run_command(id);
+            self.copied = true;
+            return;
+        }
+        self.run_command(id);
+    }
+
+    fn run_command(&mut self, id: CommandId) {
         if id == CommandId::PasteTerminalPath && let Some(command) = self.terminal_path_target.take() {
             if let Some(why) = self.session.disabled(id) { return self.dispatch(Command::Notice(why.into())); }
             match command {
@@ -797,6 +890,7 @@ impl App {
             InterfaceAction::QuitAll => { self.quit_all = true; return; }
             InterfaceAction::Open => Prompt::Open,
             InterfaceAction::PasteTerminalPath => Prompt::TerminalPath,
+            InterfaceAction::WorkspaceInput { rename } => Prompt::WorkspaceInput { rename },
             InterfaceAction::RenameTerminal(id) => Prompt::RenameTerminal { id },
             InterfaceAction::NewScratch => Prompt::NewScratch,
             InterfaceAction::ScratchFiles => {
@@ -918,6 +1012,7 @@ impl App {
             }
             InterfaceAction::ConfigureSqlMetadata => Prompt::SqlMetadata,
             InterfaceAction::WorkspaceRoot => Prompt::WorkspaceRoot,
+            InterfaceAction::MavenProfiles => Prompt::MavenProfiles,
             InterfaceAction::LanguageServer => Prompt::LanguageServer,
             InterfaceAction::EditingPreferences => Prompt::Details { title: "Editing preferences", body: self.session.editing_preferences_details(), logo: false, kind: Details::Text },
             InterfaceAction::SqlDialect => Prompt::Details { title: "SQL dialect", body: self.session.sql_dialect_details(), logo: false, kind: Details::Sql },
@@ -987,6 +1082,7 @@ impl App {
                     .unwrap_or_default();
             }
             Prompt::SqlMetadata => input = self.session.sql_metadata_source().into(),
+            Prompt::MavenProfiles => input = self.session.maven_project().map(|p| p.active.join(", ")).unwrap_or_default(),
             Prompt::WorkspaceRoot => {
                 input = self
                     .session
@@ -1001,24 +1097,28 @@ impl App {
                 let (dir, name) = self.session.save_as_start();
                 input = dir.join(name.unwrap_or_default()).display().to_string();
             }
+            Prompt::WorkspaceInput { rename } => input = if rename { self.session.find_seed() } else { self.session.replace_text().to_owned() },
             Prompt::RenameTerminal { id, .. } => input = self.session.state().terminal().tabs().iter().find(|tab| tab.id() == id).map_or(String::new(), |tab| tab.label().into()),
             Prompt::PasteEntry(ref request) => input = self.session.paste_entry_start(request),
             Prompt::Relocate { kind, ref from } => input = self.session.relocate_start(kind, from),
             Prompt::ConfirmDelete { removal, ref from } => error = self.session.delete_refusal(removal, from),
             _ => {}
         }
-        let selected = matches!(kind, Prompt::RenameTerminal { .. } | Prompt::Search) && !input.is_empty();
+        let selected = matches!(kind, Prompt::WorkspaceInput { .. } | Prompt::RenameTerminal { .. } | Prompt::Search) && !input.is_empty();
+        let at = if kind == Prompt::LanguageServer { self.session.language_server_initial_action() } else { 0 };
         self.modal = Some(Modal {
             kind,
             input,
             secondary,
             secondary_focus: false,
-            at: 0,
+            at,
             top: 0,
             reveal_selection: true,
             error,
             capture: None,
             selected,
+            caret: None,
+            editors: [None; 2],
         });
         if self
             .modal
@@ -1128,9 +1228,12 @@ impl App {
                 Prompt::Details { kind: Details::OpenProject, .. } => self.choose_open_project(code_core::projects::OpenChoice::Cancel),
                 Prompt::Details { kind: Details::Close, .. } => self.choose_close(code_core::close::Choice::Cancel),
                 Prompt::Details { kind: Details::Recovered, .. } => self.choose_recovery(code_core::recovery::Choice::Later),
+                Prompt::Details { kind: Details::Workspace, .. } => self.dispatch(Command::CancelWorkspaceEdit),
                 Prompt::Details { kind: Details::Change, .. } => self.dispatch(Command::CloseChange),
                 Prompt::Details { kind: Details::Commit, .. } => self.dispatch(Command::CloseCommit),
                 Prompt::Details { kind: Details::Checkout, .. } => self.dispatch(Command::CheckoutChoice(code_core::branches::CheckoutChoice::Cancel)),
+                // Dismissed: the folder stays restricted, as Escape chooses.
+                Prompt::Details { kind: Details::Trust, .. } => self.dispatch(Command::TrustChoice(code_core::session::TrustChoice::StayRestricted)),
                 Prompt::Branches | Prompt::BranchMenu { .. } => self.dispatch(Command::CloseBranches),
                 Prompt::Details { .. } if self.session.state().documentation().is_some() => {
                     self.dispatch(Command::CloseDocumentation)
@@ -1176,6 +1279,7 @@ impl App {
         let simple = |label: String, target| Choice {
             label,
             detail: None,
+            section: None,
             disabled: None,
             target,
         };
@@ -1186,6 +1290,7 @@ impl App {
                     MenuEntry::Command(id) => Some(Choice {
                         label: id.label().into(),
                         detail: None,
+                        section: None,
                         disabled: self.session.disabled(*id),
                         target: ChoiceTarget::Action(*id),
                     }),
@@ -1200,9 +1305,10 @@ impl App {
                         model
                             .choices(&modal.input)
                             .into_iter()
-                            .map(|(label, path)| Choice {
+                            .map(|(label, detail, path)| Choice {
                                 label,
-                                detail: None,
+                                detail,
+                                section: None,
                                 disabled: self.session.disabled(CommandId::ServerRuntime),
                                 target: ChoiceTarget::ServerRuntime(path),
                             })
@@ -1216,8 +1322,9 @@ impl App {
             }
             Prompt::LanguageServer => self.session.language_server_rows().into_iter()
                 .filter_map(|(label, action)| action.map(|id| Choice {
-                    label,
+                    label: if self.copied && id == CommandId::CopyServerDetails { "Copied".into() } else { label },
                     detail: None,
+                    section: None,
                     disabled: self.session.disabled(id),
                     target: ChoiceTarget::Action(id),
                 })).collect(),
@@ -1229,6 +1336,7 @@ impl App {
                     // A separator reads as a line; it is passed over and does nothing.
                     label: if r.target == MenuTarget::Separator { "─".repeat(24) } else { r.label },
                     detail: None,
+                    section: None,
                     disabled: r.disabled,
                     target: match r.target {
                         MenuTarget::Run(id) => ChoiceTarget::Action(id),
@@ -1238,16 +1346,17 @@ impl App {
                 .collect(),
             Prompt::Commands => self
                 .session
-                .actions()
+                .command_menu()
                 .into_iter()
                 .map(|a| Choice {
                     label: format!(
                         "{}: {}{}",
                         a.id.group().label(),
-                        a.on.map_or("", |on| if on { "✓ " } else { "○ " }),
+                        code_core::chrome::toggle_mark(a.on),
                         a.label
                     ),
                     detail: a.disabled.map(str::to_owned),
+                    section: None,
                     disabled: a.disabled,
                     target: ChoiceTarget::Action(a.id),
                 })
@@ -1261,6 +1370,7 @@ impl App {
                 .map(|r| Choice {
                     label: format!("{} — {}{}", r.label, r.chords, r.note.map_or_else(String::new, |note| format!(" ({note})"))),
                     detail: None,
+                    section: None,
                     disabled: None,
                     target: ChoiceTarget::Keymap(r.command),
                 })
@@ -1277,7 +1387,7 @@ impl App {
                 self.folder_suggestions(&modal.input).into_iter().enumerate().map(|(i, path)| {
                     let (name, location) = code_core::start::place(&path, home.as_deref());
                     let exact = i == 0 && path == self.resolve_path(&modal.input);
-                    Choice { label: format!("{name}/"), detail: Some(if exact { format!("open · {location}") } else { location }), disabled: None, target: ChoiceTarget::Path(path) }
+                    Choice { label: format!("{name}/"), detail: Some(if exact { format!("open · {location}") } else { location }), disabled: None, section: None, target: ChoiceTarget::Path(path) }
                 }).collect()
             }
             Prompt::Themes => std::iter::once(simple(
@@ -1291,6 +1401,15 @@ impl App {
                     .map(|e| simple(e.label.clone(), ChoiceTarget::Theme(e.id.clone()))),
             )
             .collect(),
+            Prompt::NewScratch => code_core::scratch::matching(&modal.input)
+                .into_iter()
+                .map(|i| {
+                    let kind = &code_core::scratch::KINDS[i];
+                    // Its kind's file-type icon, as the explorer shows it (when Nerd Font icons are on).
+                    let label = lenz_content::file_icons::file(&format!("scratch.{}", kind.extension)).label(self.nerd_icons(), kind.label).into_owned();
+                    Choice { label, detail: Some(format!(".{}", kind.extension)), section: None, disabled: None, target: ChoiceTarget::ScratchKind(i) }
+                })
+                .collect(),
             Prompt::Places(list) => self
                 .session
                 .state()
@@ -1299,6 +1418,7 @@ impl App {
                 .map(|r| Choice {
                     label: r.label,
                     detail: Some(r.detail),
+                    section: None,
                     disabled: r.missing.then_some("File is missing"),
                     target: ChoiceTarget::Place(r.place),
                 })
@@ -1308,7 +1428,14 @@ impl App {
                 .state()
                 .branch_rows(&modal.input)
                 .into_iter()
-                .map(|r| simple(code_core::branches::row_text(&r), ChoiceTarget::Branch(r.target)))
+                .map(|r| Choice {
+                    label: code_core::branches::row_text(&r),
+                    // drawn right-aligned on the row's line, never appended and wrapped
+                    detail: (!r.detail.is_empty()).then_some(r.detail.clone()),
+                    section: (!r.section.is_empty()).then_some(r.section),
+                    disabled: None,
+                    target: ChoiceTarget::Branch(r.target),
+                })
                 .collect(),
             Prompt::BranchMenu { ref target, .. } => self
                 .session
@@ -1333,7 +1460,7 @@ impl App {
         };
         if matches!(
             modal.kind,
-            Prompt::Places(_) | Prompt::ServerRuntime | Prompt::Themes | Prompt::Branches | Prompt::BranchMenu { .. }
+            Prompt::Places(_) | Prompt::NewScratch | Prompt::ServerRuntime | Prompt::Themes | Prompt::Branches | Prompt::BranchMenu { .. }
                 // These filter themselves: by name or location, or by the path typed.
                 | Prompt::RecentRoots | Prompt::OpenFolder | Prompt::OpenFolderInProjectTab
         ) || query.is_empty()
@@ -1353,16 +1480,18 @@ impl App {
                 Prompt::Commands => "Commands · type to filter",
                 Prompt::Context { .. } | Prompt::Menu(_) => "",
                 Prompt::Open => "Open file · enter path",
+                Prompt::WorkspaceInput { rename: true } => "Rename symbol · new name · Enter previews · Esc cancels",
+                Prompt::WorkspaceInput { rename: false } => "Replace in Project · literal replacement · Enter previews · empty deletes · Esc cancels",
                 Prompt::RenameTerminal { .. } => "Rename terminal tab · Enter renames · Esc cancels",
                 Prompt::TerminalPath => "Paste path into terminal · Enter pastes · no Enter is sent to the shell",
-                Prompt::NewScratch => "New scratch file · name with extension chooses language · Enter creates · Esc cancels",
+                Prompt::NewScratch => "New scratch file · type to filter · Enter creates the next scratch_N file · Esc cancels",
                 Prompt::ScratchFiles(_) => "Personal scratch files · type to filter · Enter opens · Esc cancels",
                 Prompt::SaveAs(_) => "Save As · enter the new file's path",
                 Prompt::Create { kind, dir } => {
                     let where_ = if dir.is_empty() { "the project root" } else { dir.as_str() };
                     return format!("{} in {where_} · Enter creates · Esc cancels", kind.label());
                 }
-                Prompt::PasteEntry(request) => return format!("Paste {} in {} · saved contents · edit name · Ctrl+A clears · Enter copies · Esc cancels", request.source().display(), if request.folder().is_empty() { "the project root" } else { request.folder() }),
+                Prompt::PasteEntry(request) => return format!("Paste {} in {} · saved contents · edit name · Ctrl+A selects all · Enter copies · Esc cancels", request.source().display(), if request.folder().is_empty() { "the project root" } else { request.folder() }),
                 Prompt::Relocate { kind, from } => {
                     return format!("{} {from} · type {} · Enter · Esc cancels · references are not changed", kind.label(), kind.asks());
                 }
@@ -1373,9 +1502,10 @@ impl App {
                 Prompt::OpenFolderInProjectTab => "Open folder in a new project tab · type a path",
                 Prompt::Compare(_) => code_core::external::COMPARISON_PROMPT,
                 Prompt::SqlMetadata => self.session.sql_metadata_prompt(),
+                Prompt::MavenProfiles => return self.session.maven_profiles_prompt(),
                 Prompt::WorkspaceRoot => "Workspace root · empty restores discovery",
                 Prompt::ServerRuntime => {
-                    "Server runtime executable / install folder · Enter saves and restarts"
+                    "Language server runtime · type a path or choose · Enter restarts the server with it"
                 }
                 Prompt::RecentRoots => "Open recent project · type to filter",
                 Prompt::Navigation => "Search Everywhere · Tab scope · ↑↓ select · Enter open",
@@ -1385,16 +1515,16 @@ impl App {
                 Prompt::Symbols => "Workspace symbols · Tab: declarations",
                 Prompt::GoTo => "Go to line · line:column",
                 Prompt::Themes => "Theme",
-                Prompt::Places(PlaceList::Bookmarks) => "Bookmarks · Delete forgets",
-                Prompt::Places(PlaceList::RecentFiles) => "Recent files · Delete forgets",
-                Prompt::Places(PlaceList::RecentLocations) => "Recent locations · Delete forgets",
+                Prompt::Places(PlaceList::Bookmarks) => "Bookmarks · F6 forgets",
+                Prompt::Places(PlaceList::RecentFiles) => "Recent files · F6 forgets",
+                Prompt::Places(PlaceList::RecentLocations) => "Recent locations · F6 forgets",
                 Prompt::Mnemonic => "Bookmark key · press 0–9 or A–Z",
                 Prompt::Keymap if self.modal.as_ref().is_some_and(|m| m.capture.is_some()) => {
                     "Keymap · press the new shortcut (Esc cancels)"
                 }
                 Prompt::Keymap => {
                     return format!(
-                        "Keymap: {} · type to filter · Enter rebinds · Delete restores the preset · Esc closes",
+                        "Keymap: {} · type to filter · Enter rebinds · F6 restores the preset · Esc closes",
                         self.session.keymap().preset().label()
                     );
                 }
@@ -1405,9 +1535,9 @@ impl App {
                     let Some(b) = self.session.state().branches() else { return String::new() };
                     return match b.state_text() {
                         Some(state) => format!("{} · {state}", b.heading()),
-                        None if b.worktrees_only => format!("{} · type to filter · Enter compares · → more", b.heading()),
+                        None if b.worktrees_only => format!("{} · type to filter · Enter compares · Alt+Enter actions", b.heading()),
                         None if b.revisions_only => format!("{} · type to filter or a revision · Enter compares", b.heading()),
-                        None => format!("{} · type to filter · Enter checks out · → more", b.heading()),
+                        None => format!("{} · type to filter · Enter checks out · Alt+Enter actions", b.heading()),
                     };
                 }
                 Prompt::BranchMenu { .. } => "Actions · ← back",
@@ -1419,6 +1549,10 @@ impl App {
         })
     }
     pub fn handle(&mut self, event: Event) -> bool {
+        // "Copied" lasts until the next key or click (the terminal redraws only on input).
+        if matches!(&event, Event::Key(k) if k.kind == KeyEventKind::Press) || matches!(&event, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_))) {
+            self.copied = false;
+        }
         match event {
             Event::Key(key) => {
                 // foot with a two-group layout (us,gr) reports a Shift press as Shift but its release as Caps Lock.
@@ -1477,6 +1611,10 @@ impl App {
                 if self.log_focus && self.modal.is_none() && !self.session.state().terminal().focused() { return false; }
                 if self.modal.is_some() {
                     self.double_shift.key(false);
+                    // Pasted into the folder-trust dialog: its focus goes back to Stay Restricted.
+                    if matches!(self.modal.as_ref().map(|m| &m.kind), Some(Prompt::Details { kind: Details::Trust, .. })) {
+                        self.dispatch(Command::TrustFocus(code_core::session::FocusMove::Reset));
+                    }
                     self.edit_prompt(&text, false);
                 } else if self.session.state().terminal().focused() {
                     self.terminal_command(code_core::terminal::Command::Paste(text));
@@ -1521,59 +1659,10 @@ impl App {
         }
         true
     }
-    fn edit_prompt(&mut self, text: &str, backspace: bool) {
-        let Some(modal) = &mut self.modal else { return };
-        if matches!(
-            modal.kind,
-            Prompt::Help
-                | Prompt::Details { .. }
-                | Prompt::Mnemonic
-                | Prompt::Context { .. }
-                | Prompt::Menu(_)
-                | Prompt::LanguageServer
-                | Prompt::Themes
-                | Prompt::ConfirmDelete { .. }
-        ) {
-            return;
-        }
-        let target = if modal.secondary_focus {
-            &mut modal.secondary
-        } else {
-            &mut modal.input
-        };
-        if std::mem::take(&mut modal.selected) {
-            target.clear();
-        } else if backspace {
-            target.pop();
-        }
-        if !backspace {
-            target.extend(text.chars().filter(|c| !c.is_control()));
-        }
-        modal.at = 0;
-        modal.top = 0;
-        modal.reveal_selection = true;
-        modal.error = None;
-        let (kind, query, replacement, replacing) =
-            (modal.kind.clone(), modal.input.clone(), modal.secondary.clone(), modal.secondary_focus);
-        match kind {
-            Prompt::Navigation => {
-                if let Some(search) = self.session.state().navigation() {
-                    self.dispatch(Command::SearchEverywhere {
-                        scope: search.scope,
-                        query,
-                    });
-                }
-            }
-            // The replacement field only edits remembered text; Enter in it replaces (see `accept`).
-            Prompt::Find if replacing => self.dispatch(Command::SetReplaceText(replacement)),
-            Prompt::Find => self.dispatch(Command::Find(query)),
-            Prompt::Declarations => self.dispatch(Command::FindDeclarations(query)),
-            Prompt::Symbols => self.dispatch(Command::Symbols(query)),
-            _ => {}
-        }
-    }
+    fn edit_prompt(&mut self, text: &str, backspace: bool) { self.type_field(text, backspace); }
     // Callers require an open modal; branches that dismiss or replace it return before accessing it again.
     fn modal_key(&mut self, key: KeyEvent) {
+        if self.field_key(key) { return; }
         let kind = self.modal.as_ref().unwrap().kind.clone();
         if let Prompt::Details { kind: Details::Terminal(ticket), .. } = kind
             && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
@@ -1632,7 +1721,17 @@ impl App {
             return;
         }
         // The Git Branches popup: Right opens the highlighted row's actions; in them Left or Esc goes back.
-        if kind == Prompt::Branches && key.code == KeyCode::Right {
+        // a folder opens on → and closes on ←, as a tree's do
+        if kind == Prompt::Branches && matches!(key.code, KeyCode::Right | KeyCode::Left) {
+            let at = self.modal.as_ref().map_or(0, |m| m.at);
+            if let Some(row) = self.session.state().branch_rows(&self.modal.as_ref().map_or(String::new(), |m| m.input.clone())).get(at).cloned()
+                && let code_core::branches::BranchTarget::Folder(section, name) = row.target
+            {
+                if row.open == (key.code == KeyCode::Left) { self.dispatch(Command::ToggleBranchFolder(section, name)); }
+                return;
+            }
+        }
+        if kind == Prompt::Branches && (key.code == KeyCode::Right || key.code == KeyCode::Enter && alt) {
             return self.open_branch_menu(self.modal.as_ref().map_or(0, |m| m.at));
         }
         if matches!(kind, Prompt::BranchMenu { .. }) && key.code == KeyCode::Right {
@@ -1660,6 +1759,31 @@ impl App {
                 m.secondary_focus = !(matches!(key.code, KeyCode::BackTab) || key.modifiers.contains(KeyModifiers::SHIFT));
             }
             return;
+        }
+        // The folder-trust dialog may open while the user types: Escape stays restricted, and Enter takes the focused
+        // choice, Stay Restricted unless Tab moved the focus just before (any other key puts it back). No letter
+        // trusts: a terminal without the kitty keyboard protocol sends Alt+T as Escape then T, which a quick Escape
+        // and T also make. Only its scrolling keys go on; nothing reaches behind it.
+        if matches!(kind, Prompt::Details { kind: Details::Trust, .. }) {
+            use code_core::session::{FocusMove, TrustChoice};
+            match key.code {
+                KeyCode::Tab if !control && !alt && !key.modifiers.contains(KeyModifiers::SHIFT) => return self.dispatch(Command::TrustFocus(FocusMove::Next)),
+                KeyCode::Tab | KeyCode::BackTab if !control && !alt => return self.dispatch(Command::TrustFocus(FocusMove::Previous)),
+                KeyCode::Enter | KeyCode::Esc => {}
+                _ => { self.dispatch(Command::TrustFocus(FocusMove::Reset)); }
+            }
+            let choice = match key.code {
+                // Alt+Enter is Escape then Enter: Escape's choice.
+                KeyCode::Enter if !alt && !control => self.session.trust_focus(),
+                KeyCode::Enter | KeyCode::Esc => Some(TrustChoice::StayRestricted),
+                _ => None,
+            };
+            if let Some(choice) = choice.filter(|c| self.session.trust_choices().iter().any(|(_, d)| d == c)) {
+                // Answered: the core closes its dialog.
+                self.modal = None;
+                return self.dispatch(Command::TrustChoice(choice));
+            }
+            if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End) || control || alt { return; }
         }
         // A delete confirmation takes Enter and Escape only: nothing types into it or reaches behind it.
         if matches!(kind, Prompt::ConfirmDelete { .. }) && !matches!(key.code, KeyCode::Enter | KeyCode::Esc) { return; }
@@ -1711,7 +1835,8 @@ impl App {
         }
         if matches!(kind, Prompt::Details {kind:Details::Install,..}) && !control && !alt {
             match key.code {
-                KeyCode::Char('s'|'S') | KeyCode::Enter => return self.run(CommandId::StartServerInstall),
+                KeyCode::Char('s'|'S') | KeyCode::Enter => return self.run(self.session.server_install_start_action()),
+                KeyCode::Char('r'|'R') if self.session.server_install_actions().contains(&CommandId::ServerRuntime) => return self.run(CommandId::ServerRuntime),
                 KeyCode::Char('c'|'C') => return self.run(CommandId::CancelServerInstall),
                 KeyCode::Char('d'|'D') => return self.run(CommandId::ServerDetails),
                 _ => {}
@@ -1725,6 +1850,15 @@ impl App {
                 _=>None,
             };
             if let Some(choice)=choice { self.choose_close(choice); return; }
+        }
+        if matches!(kind, Prompt::Details { kind: Details::Workspace, .. }) && !control && !alt {
+            match key.code {
+                KeyCode::Char(c @ ('n'|'N'|'p'|'P')) => { if let Some(m) = &mut self.modal { m.top = 0; } self.dispatch(Command::MoveWorkspaceFile(if matches!(c, 'n'|'N') { 1 } else { -1 })); return; }
+                KeyCode::Char(' ') => { self.dispatch(Command::ToggleCurrentWorkspaceFile); return; }
+                KeyCode::Char('a'|'A') => { self.dispatch(Command::ApplyWorkspaceEdit); return; }
+                KeyCode::Char(c @ '1'..='9') => { self.dispatch(Command::ToggleWorkspaceFile((c as u8 - b'1') as usize)); return; }
+                _ => {}
+            }
         }
         if matches!(kind,Prompt::Details {kind:Details::Change,..}) && !control && !alt {
             match key.code { KeyCode::Char('d'|'D') => return self.run(CommandId::ShowChangeDiff),KeyCode::Char('r'|'R') => return self.run(CommandId::RevertChange),_=>{} }
@@ -1745,6 +1879,7 @@ impl App {
             && control && !alt && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
             self.dispatch(Command::CopyText(body.clone()));
+            self.copied = true;
             return;
         }
         // As in the GUI: Left or Escape goes back from a group to the groups, Right opens a group.
@@ -1778,6 +1913,37 @@ impl App {
             }
             return;
         }
+        // Search Everywhere's query and Search in Project's fields: arrows by character, Ctrl or Alt (macOS's Option)
+        // by word, and in Search in Project Home/End to the ends (Search Everywhere's pick rows); Backspace and Delete,
+        // with Ctrl or Alt a word (Ctrl+Backspace reaches a terminal as Ctrl+H, Ctrl+W or a modified Backspace).
+        if matches!(kind, Prompt::Navigation | Prompt::Search) {
+            use code_core::line_edit::Edit;
+            let recent = kind == Prompt::Navigation && self.session.state().navigation().is_some_and(|s| s.scope == Scope::Recent);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let edit = match key.code {
+                KeyCode::Home if kind == Prompt::Search && !control && !shift => Some(Edit::Start),
+                KeyCode::End if kind == Prompt::Search && !control && !shift => Some(Edit::End),
+                KeyCode::Left if control || alt => Some(Edit::WordLeft),
+                KeyCode::Right if control || alt => Some(Edit::WordRight),
+                KeyCode::Left => Some(Edit::Left),
+                KeyCode::Right => Some(Edit::Right),
+                KeyCode::Backspace if control || alt => Some(Edit::BackspaceWord),
+                KeyCode::Char('w' | 'h') if control && !alt => Some(Edit::BackspaceWord),
+                KeyCode::Backspace => Some(Edit::Backspace),
+                KeyCode::Delete if !recent && (control || alt) => Some(Edit::DeleteWord),
+                KeyCode::Delete if !recent => Some(Edit::Delete),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                let Some(modal) = self.modal.as_mut() else { return };
+                let field = if modal.secondary_focus { &mut modal.secondary } else { &mut modal.input };
+                let mut caret = modal.caret.map_or(field.len(), |c| code_core::line_edit::clamp(field, c));
+                let changed = code_core::line_edit::apply_selected(field, &mut caret, &mut modal.selected, edit);
+                modal.caret = Some(caret);
+                if changed { self.edit_prompt("", false); }
+                return;
+            }
+        }
         if kind == Prompt::Navigation && control {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             let scope = match (key.code, shift, alt) {
@@ -1796,10 +1962,22 @@ impl App {
             if !shift && !alt && matches!(key.code, KeyCode::Char('a' | 'A')) {
                 if let Some(modal) = &mut self.modal {
                     modal.input.clear();
+                    modal.caret = None;
                 }
                 self.edit_prompt("", false);
                 return;
             }
+        }
+        if alt && matches!(key.code, KeyCode::Home | KeyCode::End)
+            && matches!(kind, Prompt::Navigation | Prompt::Commands | Prompt::Branches | Prompt::Declarations | Prompt::Symbols | Prompt::Places(_) | Prompt::Keymap | Prompt::ScratchFiles(_) | Prompt::ServerRuntime | Prompt::Siblings { .. } | Prompt::Themes | Prompt::RecentRoots | Prompt::LanguageServer | Prompt::Menu(_) | Prompt::Context { .. } | Prompt::BranchMenu { .. })
+        {
+            let count = self.modal_len();
+            if let Some(modal) = self.modal.as_mut() {
+                modal.at = if key.code == KeyCode::Home { 0 } else { count.saturating_sub(1) };
+                modal.reveal_selection = true;
+            }
+            self.clamp();
+            return;
         }
         if alt {
             let command = match key.code {
@@ -1868,6 +2046,7 @@ impl App {
                 let m = self.modal.as_mut().unwrap();
                 m.secondary_focus = !m.secondary_focus;
                 m.selected = false;
+                m.caret = None;
             }
             KeyCode::Tab if matches!(kind, Prompt::Declarations | Prompt::Symbols) => {
                 let m = self.modal.as_mut().unwrap();
@@ -1878,7 +2057,7 @@ impl App {
                 };
                 self.edit_prompt("", false);
             }
-            KeyCode::Delete if kind == Prompt::Navigation => {
+            KeyCode::Delete | KeyCode::F(6) if kind == Prompt::Navigation => {
                 if self
                     .session
                     .state()
@@ -1890,7 +2069,7 @@ impl App {
                     self.dispatch(Command::ForgetNavigation { revision, index });
                 }
             }
-            KeyCode::Delete if matches!(kind, Prompt::Places(_)) => {
+            KeyCode::Delete | KeyCode::F(6) if matches!(kind, Prompt::Places(_)) => {
                 if let Some(choice) = self.choices().get(self.modal.as_ref().unwrap().at)
                     && let ChoiceTarget::Place(place) = &choice.target
                 {
@@ -1898,7 +2077,7 @@ impl App {
                 }
                 self.clamp();
             }
-            KeyCode::Delete if kind == Prompt::Keymap => {
+            KeyCode::Delete | KeyCode::F(6) if kind == Prompt::Keymap => {
                 let at = self.modal.as_ref().map(|m| m.at);
                 let choices = self.choices();
                 let command = at.and_then(|at| choices.get(at)).and_then(|c| match c.target {
@@ -1955,15 +2134,9 @@ impl App {
                 let Some(m) = self.modal.as_mut() else { return };
                 m.selected = !if m.secondary_focus { &m.secondary } else { &m.input }.is_empty();
             }
-            // Ctrl+Backspace reaches a terminal as Ctrl+H, Ctrl+W or a modified Backspace.
-            KeyCode::Backspace | KeyCode::Char('w' | 'h') if control && kind == Prompt::Search => {
-                let Some(m) = self.modal.as_mut() else { return };
-                if !std::mem::take(&mut m.selected) { code_core::search::drop_word(if m.secondary_focus { &mut m.secondary } else { &mut m.input }); }
-                else if m.secondary_focus { m.secondary.clear() } else { m.input.clear() }
-                self.edit_prompt("", false);
-            }
             KeyCode::Char('u') if control => {
                 let m = self.modal.as_mut().unwrap();
+                m.caret = None;
                 if m.secondary_focus {
                     m.secondary.clear();
                 } else {
@@ -2007,6 +2180,7 @@ impl App {
                 }
             }
             (BranchAction::Open | BranchAction::OpenInNewWindow, _) => {}
+            (BranchAction::ToggleFavorite, t) => if let Some(rev) = t.rev() { self.dispatch(Command::ToggleFavoriteBranch(rev)) },
         }
     }
     /// Runs Lenz Diff on a Git comparison in this terminal, or shows why not.
@@ -2075,7 +2249,7 @@ impl App {
             },
             Prompt::Compare(left) => {
                 let exe = self.exe();
-                let launch = match input.trim().is_empty() {
+                let launch = match input.is_empty() {
                     true => Err("Enter a file or folder path".to_string()),
                     false => self.session.compare_launch(&left, &self.resolve_path(&input), &exe, true),
                 };
@@ -2093,13 +2267,14 @@ impl App {
                 }
             }
             Prompt::NewScratch => {
-                let name = input.trim().to_owned();
-                if let Some(why) = code_core::create::name_refusal(&name) {
-                    if let Some(modal) = self.modal.as_mut() { modal.error = Some(why); }
-                } else { self.close_modal(); self.dispatch(Command::NewScratch(name)); }
+                if let Some(Choice { target: ChoiceTarget::ScratchKind(kind), .. }) = self.choices().get(at).cloned() {
+                    self.close_modal();
+                    self.focus = Focus::Text;
+                    self.dispatch(Command::NewScratchFile(kind));
+                }
             }
             Prompt::SaveAs(tab) => {
-                if input.trim().is_empty() {
+                if input.is_empty() {
                     if let Some(modal) = self.modal.as_mut() { modal.error = Some("Enter the new file's path".into()); }
                 } else {
                     let path = self.resolve_path(&input);
@@ -2143,6 +2318,10 @@ impl App {
                     }
                 }
             }
+            Prompt::WorkspaceInput { rename } => {
+                if rename && input.is_empty() { if let Some(m) = &mut self.modal { m.error = Some("Enter the new symbol name".into()); } }
+                else { self.close_modal(); self.dispatch(if rename { Command::RenameSymbol(input) } else { Command::PreviewProjectReplace(input) }); }
+            }
             Prompt::RenameTerminal { id, .. } => {
                 if let Some(why) = self.session.terminal_rename_refusal(id, &input) {
                     if let Some(modal) = self.modal.as_mut() { modal.error = Some(why); }
@@ -2152,7 +2331,7 @@ impl App {
                 }
             }
             Prompt::TerminalPath => {
-                if input.trim().is_empty() {
+                if input.is_empty() {
                     if let Some(modal) = &mut self.modal { modal.error = Some("Enter a file or folder path".into()); }
                 }
                 else {
@@ -2167,14 +2346,10 @@ impl App {
                     _ => None,
                 };
                 let path = chosen.unwrap_or_else(|| self.resolve_path(&input));
-                let folder = matches!(kind, Prompt::OpenFolder | Prompt::OpenFolderInProjectTab);
-                if (input.trim().is_empty() && !path.is_dir())
-                    || !path.exists()
-                    || (folder && !path.is_dir())
-                    || (kind == Prompt::Open && !path.is_file())
-                {
-                    self.modal.as_mut().unwrap().error =
-                        Some("Enter an existing file or folder path".into());
+                let target = if kind == Prompt::Open { code_core::open_path::Kind::File } else { code_core::open_path::Kind::Folder };
+                // Nothing typed opens only a recent project chosen from the list.
+                if (input.trim().is_empty() && !path.is_dir()) || target.validate(path.clone()).is_err() {
+                    self.modal.as_mut().unwrap().error = Some("Enter an existing file or folder path".into());
                 } else {
                     self.close_modal();
                     if kind == Prompt::OpenFolderInProjectTab {
@@ -2205,8 +2380,12 @@ impl App {
                 self.close_modal();
                 self.dispatch(Command::ConfigureSqlMetadata(input));
             }
+            Prompt::MavenProfiles => {
+                self.close_modal();
+                self.dispatch(Command::SetMavenProfiles(input));
+            }
             Prompt::WorkspaceRoot => {
-                let path = (!input.trim().is_empty()).then(|| self.resolve_path(&input));
+                let path = (!input.is_empty()).then(|| self.resolve_path(&input));
                 if path.as_ref().is_some_and(|p| !p.is_dir()) {
                     self.modal.as_mut().unwrap().error =
                         Some("Workspace root must be a folder".into());
@@ -2269,6 +2448,22 @@ impl App {
                     modal.error = None;
                 }
             }
+            // A section's Show more row lists the rest of it; the highlight stays on the first row it brings in.
+            Prompt::Branches if let Some(ChoiceTarget::Branch(code_core::branches::BranchTarget::More(section))) = self.choices().get(at).map(|c| c.target.clone()) => {
+                self.dispatch(Command::ExpandBranches(section));
+            }
+            // A folder row opens or closes; the highlight stays on it.
+            Prompt::Branches if let Some(ChoiceTarget::Branch(code_core::branches::BranchTarget::Folder(section, name))) = self.choices().get(at).map(|c| c.target.clone()) => {
+                self.dispatch(Command::ToggleBranchFolder(section, name));
+            }
+            // A star changes the list, not the repository: back to the list, on the same branch where it moved.
+            Prompt::BranchMenu { ref query, row, .. } if let Some(ChoiceTarget::BranchAction(target, code_core::branches::BranchAction::ToggleFavorite)) = self.choices().get(at).map(|c| c.target.clone()) => {
+                let query = query.clone();
+                if let Some(rev) = target.rev() { self.dispatch(Command::ToggleFavoriteBranch(rev)); }
+                let at = self.session.state().branch_rows(&query).iter().position(|r| r.target == target).unwrap_or(row);
+                self.prompt(Prompt::Branches);
+                if let Some(m) = self.modal.as_mut() { (m.input, m.at) = (query, at); }
+            }
             // Enter on the current branch or worktree does nothing (its other actions are in its menu), as in the GUI.
             Prompt::Branches if self.choices().get(at).is_some_and(|c| matches!(&c.target, ChoiceTarget::Branch(t) if !matches!(t, code_core::branches::BranchTarget::Action(_)) && self.session.branch_enter(t).is_none())) => {}
             _ => {
@@ -2293,7 +2488,10 @@ impl App {
                     ChoiceTarget::Action(id) => self.run(id),
                     // Asks where when this tab already has a project open.
                     ChoiceTarget::Path(path) if kind == Prompt::RecentRoots => self.dispatch(Command::OpenProject(path)),
-                    ChoiceTarget::Path(path) if matches!(kind, Prompt::ScratchFiles(_)) => self.dispatch(Command::OpenScratch(path)),
+                    ChoiceTarget::Path(path) if matches!(kind, Prompt::ScratchFiles(_)) => {
+                        self.focus = Focus::Text;
+                        self.dispatch(Command::OpenScratch(path));
+                    }
                     ChoiceTarget::Path(path) => self.dispatch(Command::Open(path)),
                     ChoiceTarget::Theme(id) => {
                         if let Some(theme) = ThemeSelection::from_id(&id) {
@@ -2301,6 +2499,10 @@ impl App {
                         }
                     }
                     ChoiceTarget::Place(place) => self.dispatch(Command::GoToPlace(place)),
+                    ChoiceTarget::ScratchKind(kind) => {
+                        self.focus = Focus::Text;
+                        self.dispatch(Command::NewScratchFile(kind));
+                    }
                     ChoiceTarget::Branch(target) => match target {
                         code_core::branches::BranchTarget::Action(id) => self.run(id),
                         t => {
@@ -2320,7 +2522,10 @@ impl App {
                                     self.focus = Focus::Tree;
                                 }
                                 SiblingTarget::File(path) => {
-                                    if let Some(project) = self.session.state().project() {
+                                    if let Some(location) = code_core::archive::Location::from_uri(Path::new(path.as_ref())) {
+                                        self.focus = Focus::Text;
+                                        self.dispatch(Command::OpenArchiveEntry(location));
+                                    } else if let Some(project) = self.session.state().project() {
                                         self.dispatch(Command::Open(project.root().join(&*path)));
                                     }
                                 }
@@ -2338,21 +2543,10 @@ impl App {
         }
     }
     fn resolve_path(&self, input: &str) -> PathBuf {
-        let input = input.trim();
-        if let Some(rest) = input.strip_prefix("~/")
-            && let Some(home) = std::env::var_os("HOME")
-        {
-            return PathBuf::from(home).join(rest);
-        }
-        let path = PathBuf::from(input);
-        if path.is_relative() {
-            self.session.state().project().map_or_else(
-                || std::env::current_dir().unwrap_or_default().join(&path),
-                |p| p.root().join(&path),
-            )
-        } else {
-            path
-        }
+        let cwd = self.session.state().project().map_or_else(
+            || std::env::current_dir().unwrap_or_default(), |p| p.root().to_owned(),
+        );
+        code_core::open_path::expand(input, &cwd)
     }
     #[cfg(test)]
     pub(crate) fn enable_draft_input_for_test(&mut self) { self.session.enable_text_input_for_test(); }
@@ -2401,6 +2595,17 @@ impl App {
             KeyCode::Char('x' | 'v') if control && !other && !(key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SHIFT)) => {
                 if !self.session.text_input_enabled() { return false; }
                 self.run(if key.code == KeyCode::Char('x') { CommandId::Cut } else { CommandId::Paste }); true
+            }
+            // Cmd+Backspace, where the terminal reports Cmd (the kitty keyboard protocol), deletes the lines the
+            // selections touch, as in the GUI and IntelliJ's macOS keymap. Most macOS terminals send it as Ctrl+U
+            // instead (iTerm2's Natural Text Editing, Ghostty), so on macOS Ctrl+U in the text does the same.
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) && !control && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SHIFT) => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
+            }
+            KeyCode::Char('u') if control && !other && !key.modifiers.contains(KeyModifiers::SHIFT) && CMD_BACKSPACE_IS_CTRL_U => {
+                if self.draft_target().is_none() { return false; }
+                self.run(CommandId::DeleteLine); true
             }
             // Ctrl (where the terminal reports it with Backspace) or Alt deletes to the word stop, as IntelliJ's
             // Ctrl+Backspace / Ctrl+Delete; a Ctrl+Backspace sent as Ctrl+H or Ctrl+W stays that key's command.
@@ -2487,6 +2692,10 @@ impl App {
             _ => return false,
         };
         self.remember_explorer();
+        if matches!(&input, Search::Activate) && self.session.state().tree_rows().nth(self.tree_at)
+            .is_some_and(|row| self.session.state().archive_tree().is_member(&row.path)) {
+            self.focus = Focus::Text;
+        }
         self.dispatch(Command::ExplorerSearch(input));
         true
     }
@@ -2502,7 +2711,7 @@ impl App {
             .map(|r| {
                 let path = code_core::start::tilde(&r.path, home.as_deref());
                 let detail = match r.branch { Some(b) => format!("{folder} {path}  {branch} {b}"), None => format!("{folder} {path}") };
-                Choice { label: r.name, detail: Some(detail), disabled: None, target: ChoiceTarget::Path(r.path) }
+                Choice { label: r.name, detail: Some(detail), disabled: None, section: None, target: ChoiceTarget::Path(r.path) }
             })
             .collect()
     }
@@ -2527,6 +2736,9 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() && self.session.workspace_busy() {
+            self.dispatch(Command::CancelWorkspaceEdit); return;
+        }
         // The welcome screen: Up/Down choose a row, Enter runs it.
         if self.modal.is_none() && !self.log_focus && self.focus == Focus::Text && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter) && !self.session.state().start_items().is_empty()
@@ -2633,6 +2845,13 @@ impl App {
             }
             return;
         }
+        // macOS Word Motion: Option+Left/Right move by word in the text, as in the desktop app; Back and Forward stay in
+        // the menus then. A terminal sending Option+arrows as Esc b / Esc f (Terminal.app's default) reaches Lenz as
+        // Alt+B / Alt+F. Off (the default), Alt+Left/Right stay Back/Forward.
+        if self.mac_keys && self.session.state().mac_word_motion() && alt && !ctrl && !shift && self.focus == Focus::Text && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+            self.dispatch(Command::MoveCaret(if key.code == KeyCode::Left { Motion::WordLeft } else { Motion::WordRight }));
+            return;
+        }
         let action = match (key.code, ctrl, shift, alt) {
             (KeyCode::F(10), _, _, _) | (KeyCode::Char(':'), false, _, _) => {
                 self.prompt(Prompt::Commands);
@@ -2701,6 +2920,10 @@ impl App {
             return;
         }
         if key.code == KeyCode::Esc {
+            let archive_parent = if self.focus == Focus::Tree && self.session.state().active().is_none() {
+                self.session.state().tree_rows().nth(self.tree_at)
+                    .filter(|row| self.session.state().archive_tree().is_virtual(&row.path)).map(|row| row.path.clone())
+            } else { None };
             if self.session.state().documentation().is_some() {
                 self.dispatch(Command::CloseDocumentation);
             } else if self.session.state().asking().is_some() {
@@ -2712,6 +2935,8 @@ impl App {
             } else if self.focus == Focus::Tree && !self.session.state().tree_marks().is_empty() {
                 // First the explorer's marks, as in the GUI; the next Esc leaves the explorer.
                 self.dispatch(Command::ClearTreeMarks);
+            } else if let Some(path) = archive_parent {
+                self.dispatch(Command::ArchiveTreeParent { path });
             } else if self.focus == Focus::Text && self.session.disabled(CommandId::CollapseSelections).is_none() {
                 // Several cursors go back to one before Esc means leaving the text.
                 self.run(CommandId::CollapseSelections);
@@ -2727,7 +2952,8 @@ impl App {
             return;
         }
         if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-            let mut available = vec![Focus::Text];
+            let browser_only = self.tree_shown && self.session.state().active().is_none() && !self.session.state().archive_tree().rows().is_empty();
+            let mut available = if browser_only { Vec::new() } else { vec![Focus::Text] };
             if self.tree_shown && self.session.state().has_tree() {
                 available.push(Focus::Tree);
             }
@@ -2882,13 +3108,20 @@ impl App {
     }
     fn tree_activate(&mut self, key: KeyCode) {
         let Some(row) = self.session.state().tree_rows().nth(self.tree_at).cloned() else { return };
+        let virtual_row = self.session.state().archive_tree().is_virtual(&row.path);
+        if key == KeyCode::Left && virtual_row && row.dir != Some(true) {
+            self.dispatch(Command::ArchiveTreeParent { path: row.path });
+            return;
+        }
         if let Some(open) = row.dir {
             if !(key == KeyCode::Left && !open || key == KeyCode::Right && open) {
                 self.dispatch(Command::ToggleDir(row.path.to_string()));
             }
         } else if key != KeyCode::Left {
+            // Browse/retry/up rows keep the explorer's keys. Opening an ordinary file gives them to
+            // the editor first, so a core archive-browser reveal can take them back when needed.
+            if !virtual_row || self.session.state().archive_tree().is_member(&row.path) { self.focus = Focus::Text; }
             self.dispatch(Command::ActivateTree { path: row.path, retain: false });
-            self.focus = Focus::Text;
         }
     }
     /// What Tab does in the results panel: the outline's other view, or the hierarchy's other direction.
@@ -3207,6 +3440,7 @@ impl App {
                     .position(|r| r.contains(point))
                     && let Some(modal) = &mut self.modal
                 {
+                    if modal.secondary_focus != (i == 1) { modal.caret = None; }
                     modal.secondary_focus = i == 1;
                     modal.selected = false;
                 } else if !self.layout.modal.contains(point) {
@@ -3266,6 +3500,17 @@ impl App {
                 return;
             }
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && let Some(Modal { kind: Prompt::Details { kind: Details::Trust, .. }, .. }) = &self.modal
+            {
+                if let Some(i) = self.layout.details_choices.iter().position(|b| b.contains(point))
+                    && let Some(&(_, c)) = self.session.trust_choices().get(i)
+                {
+                    self.modal = None;
+                    self.dispatch(Command::TrustChoice(c));
+                }
+                return;
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
                 && let Some(Modal { kind: Prompt::Details { kind: Details::Checkout, .. }, .. }) = &self.modal
             {
                 if let Some(i) = self.layout.details_choices.iter().position(|b| b.contains(point))
@@ -3278,6 +3523,13 @@ impl App {
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
                 && let Some(Modal { kind: Prompt::Details { body, kind, .. }, .. }) = &self.modal
             {
+                if *kind == Details::Workspace {
+                    if let Some(i) = self.layout.details_choices.iter().position(|r|r.contains(point)) {
+                        if i < 2 && let Some(m) = &mut self.modal { m.top = 0; }
+                        self.dispatch(match i { 0 => Command::MoveWorkspaceFile(-1), 1 => Command::MoveWorkspaceFile(1), 2 => Command::ToggleCurrentWorkspaceFile, 3 => Command::ApplyWorkspaceEdit, _ => Command::CancelWorkspaceEdit });
+                    }
+                    return;
+                }
                 if *kind == Details::Install {
                     if let Some(i) = self.layout.details_choices.iter().position(|rect| rect.contains(point)) {
                         if let Some(id) = self.session.server_install_actions().get(i).copied() { return self.run(id); }
@@ -3302,6 +3554,7 @@ impl App {
                 }
                 if self.layout.details_copy.contains(point) {
                     self.dispatch(Command::CopyText(body.clone()));
+                    self.copied = true;
                     return;
                 }
                 if self.layout.details_close.contains(point) {
@@ -3449,6 +3702,14 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
         ) {
             let drag = matches!(event.kind, MouseEventKind::Drag(_));
+            // A drag selection past its text's top or bottom scrolls it: the selection goes to the edge row first,
+            // then the text moves, so each further drag event takes in the rows that came into view.
+            let (x, y, edge) = match self.drag.and_then(|(pane, ..)| self.layout.panes.iter().find(|g| g.pane == pane)).map(|g| g.text).filter(|text| drag && text.height > 0 && text.width > 0) {
+                Some(text) if y < text.y => (x.clamp(text.x, text.right() - 1), text.y, Some(-2)),
+                Some(text) if y >= text.bottom() => (x.clamp(text.x, text.right() - 1), text.bottom() - 1, Some(2)),
+                _ => (x, y, None),
+            };
+            let point = ratatui::layout::Position::new(x, y);
             if !drag && self.layout.tree.contains(point) {
                 let row = self.tree_top + y.saturating_sub(self.layout.tree.y) as usize;
                 if row < self.session.state().tree_rows().count()
@@ -3467,7 +3728,8 @@ impl App {
                     self.remember_explorer();
                     let Some(entry) = self.session.state().tree_rows().nth(row) else { return };
                     let arrow = self.layout.tree.x + 1 + (entry.depth.min(20) * 2) as u16;
-                    let path = self.session.state().project().map(|p| p.root().join(&*entry.path));
+                    let path = if self.session.state().archive_tree().is_virtual(&entry.path) { Some(PathBuf::from(entry.path.as_ref())) }
+                        else { self.session.state().project().map(|p| p.root().join(&*entry.path)) };
                     let now = Instant::now();
                     let double = tree_click.is_some_and(|(when, prior)| path.as_ref() == Some(&prior) && now.duration_since(when) < Duration::from_millis(400));
                     if entry.dir.is_none() || x == arrow || double {
@@ -3638,6 +3900,7 @@ impl App {
                         anchor,
                         head: offset,
                     }));
+                    if let Some(rows) = edge { self.dispatch(Command::ScrollRows(rows)); }
                     self.focus = Focus::Text;
                     self.drag = Some((pane_id, id, version, anchor));
                     if !drag && event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3950,6 +4213,9 @@ impl App {
         }
     }
 }
+/// macOS terminals send Cmd+Backspace as Ctrl+U: there Ctrl+U in the text deletes the line, as Cmd+Backspace does.
+pub(crate) const CMD_BACKSPACE_IS_CTRL_U: bool = cfg!(target_os = "macos");
+
 /// A terminal key as the session keymap names it: its key and the modifiers that ran the binding. Terminals report
 /// shifted symbols for Shift+- = `_`, Shift+\\ = `|`, Shift+. = `>`; the keymap normalizes those itself.
 pub(crate) fn key_press(key: KeyEvent) -> Option<code_core::keymap::KeyPress> {

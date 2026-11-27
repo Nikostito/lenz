@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
+    io::{self, Read},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -454,14 +455,26 @@ impl ChangeSet {
     /// Comparison `c`'s changed members: paired by path, and files only on one side with the same content paired as
     /// renames, as plain directories are.
     fn archive_members(&self, c: &Comparison, [left_kind, right_kind]: [Option<archive::Kind>; 2]) -> Result<Vec<Comparison>, String> {
-        let list = |content: &Content, kind: Option<archive::Kind>| -> Result<BTreeMap<String, archive::Fingerprint>, String> {
-            let Some(kind) = kind else { return Ok(BTreeMap::new()) };
-            if self.size(content)? > archive::MAX_ARCHIVE {
+        let size = |content: &Content, kind: Option<archive::Kind>| -> Result<u64, String> {
+            let size = if kind.is_some() { self.size(content)? } else { 0 };
+            if size > archive::MAX_ARCHIVE {
                 return Err(format!("larger than {} MiB", archive::MAX_ARCHIVE >> 20));
             }
+            Ok(size)
+        };
+        let sizes = [size(&c.left, left_kind)?, size(&c.right, right_kind)?];
+        let list = |content: &Content, kind: Option<archive::Kind>| -> Result<BTreeMap<String, archive::Fingerprint>, String> {
+            let Some(kind) = kind else { return Ok(BTreeMap::new()) };
             archive::members(kind, &self.read(content)?)
         };
-        let (left, right) = (list(&c.left, left_kind)?, list(&c.right, right_kind)?);
+        let [left, right] = match [left_kind, right_kind] {
+            // two zips, both held at once: same-name members with the same stored bytes are never decompressed
+            [Some(archive::Kind::Zip), Some(archive::Kind::Zip)] if archive::pairs_zips(sizes) => {
+                archive::changed_zip_members(&self.read(&c.left)?, &self.read(&c.right)?)?
+            }
+            // one archive at a time
+            _ => [list(&c.left, left_kind)?, list(&c.right, right_kind)?],
+        };
         let member = |content: &Content, kind: Option<archive::Kind>, name: &str| match kind {
             Some(kind) => Content::Archived { archive: Box::new(content.clone()), kind, member: name.to_string() },
             None => Content::Empty,
@@ -602,7 +615,7 @@ fn diff_attrs(root: &Path, list: &[Comparison]) -> Result<Attrs, String> {
             "unset" => DiffAttr::Binary,
             "unspecified" => continue,
             driver => match (textconv.get(driver), binary.get(driver)) {
-                (Some(command), _) if !command.is_empty() => DiffAttr::Textconv(command.clone()),
+                // first: Lenz runs a textconv command itself, and must never run the repository's
                 _ if untrusted.textconv.iter().any(|t| t == driver) => {
                     skipped.insert(path.to_owned(), not_run("textconv driver", driver));
                     match binary.get(driver) {
@@ -611,6 +624,7 @@ fn diff_attrs(root: &Path, list: &[Comparison]) -> Result<Attrs, String> {
                         None => continue,
                     }
                 }
+                (Some(command), _) if !command.is_empty() => DiffAttr::Textconv(command.clone()),
                 (Some(_), _) => continue, // set empty: no textconv
                 (None, Some(true)) => DiffAttr::Binary,
                 (None, Some(false)) => DiffAttr::Text,
@@ -657,10 +671,13 @@ pub(crate) fn list_git(
             .map(|f| git::path_text(f).map(str::to_owned)).collect()
     };
 
-    let mut diff = vec!["diff", "--raw", "-z", "--no-abbrev", "-M", "--no-relative", "--no-color"];
+    // `dirty`: git would otherwise run `status` inside each nested repository, under that repository's own config
+    let mut diff = vec!["diff", "--raw", "-z", "--no-abbrev", "-M", "--no-relative", "--no-color", "--ignore-submodules=dirty"];
     if cached {
         diff.push("--cached");
     }
+    // revisions are never options, whatever named them
+    diff.push("--end-of-options");
     diff.extend(revs.iter().map(String::as_str));
     diff.extend(&pathspec);
     let raw = fields(&git::run(cwd, &diff)?)?;
@@ -728,7 +745,7 @@ pub(crate) fn list_git(
 
     if worktree {
         let untracked_files = if untracked { "--untracked-files=all" } else { "--untracked-files=no" };
-        let mut args = vec!["status", "--porcelain=v2", "-z", untracked_files];
+        let mut args = vec!["status", "--porcelain=v2", "-z", "--ignore-submodules=dirty", untracked_files];
         args.extend(&pathspec);
         let status = fields(&git::run(cwd, &args)?)?;
         let mut status = status.into_iter();
@@ -757,7 +774,9 @@ pub(crate) fn list_git(
     list.retain(|c| !unmerged.contains(&c.path));
     for path in unmerged {
         let file = root.join(&path);
-        let right = if file.symlink_metadata().is_ok() { Content::File(file) } else { Content::Empty };
+        // a path under a working-tree folder link is not the working-tree file
+        let inside = file.symlink_metadata().is_ok() && crate::write::check_repository_path(root, &file, true).is_ok();
+        let right = if inside { Content::File(file) } else { Content::Empty };
         let left = Content::Blob(format!("HEAD:{path}"));
         list.push(Comparison { old_path: path.clone(), path, status: Status::Conflicted, left, right });
     }
@@ -771,7 +790,7 @@ fn list_plain(cwd: &Path, left: &Path, right: &Path) -> Result<Vec<Comparison>, 
     match (lm.is_dir(), rm.is_dir()) {
         (true, true) => diff_dirs(&l, &r),
         (false, false) => {
-            if fs::read(&l).map_err(io_error(left))? == fs::read(&r).map_err(io_error(right))? {
+            if same_file_content(&l, &r)? {
                 return Ok(Vec::new());
             }
             // `git difftool` hands a missing Side over as /dev/null.
@@ -792,15 +811,18 @@ fn list_plain(cwd: &Path, left: &Path, right: &Path) -> Result<Vec<Comparison>, 
 /// Pairs by relative path; files only on one side with byte-identical content become renames.
 fn diff_dirs(l: &Path, r: &Path) -> Result<Vec<Comparison>, String> {
     let (left, right) = (files(l)?, files(r)?);
-    let read = |p: &PathBuf| fs::read(p).map_err(io_error(p));
+    let mut streams = FileStreams::default();
     let file = |p: &PathBuf| Content::File(p.clone());
     let mut list = Vec::new();
-    // ponytail: keyed by whole contents, so every deleted file is held in memory; hash + verify if trees get huge.
-    let mut deleted: HashMap<Vec<u8>, Vec<&String>> = HashMap::new();
+    // Fingerprints only find candidates: compare bytes before declaring a rename, even after a collision.
+    // A bounded tiny-file cache avoids reopening ordinary small renames for verification; it cannot grow
+    // with the total contents of a large folder.
+    let mut deleted: HashMap<(u64, u32), Vec<RenameCandidate<'_>>> = HashMap::new();
+    let mut small_budget = SMALL_FILE_BUDGET;
     let mut gone = Vec::new();
     for (rel, lp) in &left {
         match right.get(rel) {
-            Some(rp) if read(lp)? != read(rp)? => list.push(Comparison {
+            Some(rp) if !streams.same(lp, rp)? => list.push(Comparison {
                 old_path: rel.clone(),
                 path: rel.clone(),
                 status: Status::Modified,
@@ -810,17 +832,35 @@ fn diff_dirs(l: &Path, r: &Path) -> Result<Vec<Comparison>, String> {
             Some(_) => {}
             None => {
                 gone.push(rel);
-                let bytes = read(lp)?;
+                let identity = streams.identity(lp, small_budget.min(SMALL_FILE_LIMIT))?;
                 // Like git, never pair empty files as renames.
-                if !bytes.is_empty() {
-                    deleted.entry(bytes).or_default().push(rel);
+                if identity.fingerprint.0 != 0 {
+                    small_budget -= identity.small.as_ref().map_or(0, Vec::len);
+                    deleted.entry(identity.fingerprint).or_default().push(RenameCandidate { path: rel, small: identity.small });
                 }
             }
         }
     }
     let mut renamed = BTreeSet::new();
     for (rel, rp) in right.iter().filter(|(rel, _)| !left.contains_key(*rel)) {
-        let from = if deleted.is_empty() { None } else { deleted.get_mut(&read(rp)?).and_then(|v| v.pop()) };
+        let mut from = None;
+        if !deleted.is_empty() {
+            let identity = streams.identity(rp, SMALL_FILE_LIMIT)?;
+            if let Some(candidates) = deleted.get_mut(&identity.fingerprint) {
+                // Match the last byte-identical old path, as the previous content-keyed index did.
+                // Keep nonmatching collision candidates available for later added files.
+                for index in (0..candidates.len()).rev() {
+                    let same = match (&candidates[index].small, &identity.small) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => streams.same(&left[candidates[index].path], rp)?,
+                    };
+                    if same {
+                        from = Some(candidates.remove(index).path);
+                        break;
+                    }
+                }
+            }
+        }
         let (old_path, status, left_side) = match from {
             Some(old) => {
                 renamed.insert(old);
@@ -842,9 +882,80 @@ fn diff_dirs(l: &Path, r: &Path) -> Result<Vec<Comparison>, String> {
     Ok(list)
 }
 
+/// Read a full bounded chunk (or the final suffix), retrying interrupted reads. A short read need not mean EOF.
+fn read_chunk(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut used = 0;
+    while used < buffer.len() {
+        match reader.read(&mut buffer[used..]) {
+            Ok(0) => break,
+            Ok(n) => used += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(used)
+}
+
+/// Small-file verification retains at most this content budget in the entire rename index.
+const SMALL_FILE_BUDGET: usize = 1 << 20;
+const SMALL_FILE_LIMIT: usize = 4 << 10;
+struct RenameCandidate<'a> {
+    path: &'a String,
+    small: Option<Vec<u8>>,
+}
+struct FileIdentity {
+    fingerprint: (u64, u32),
+    small: Option<Vec<u8>>,
+}
+/// Scratch storage reused for the entire folder inventory, independent of file sizes and counts.
+struct FileStreams {
+    left: [u8; 64 << 10],
+    right: [u8; 64 << 10],
+}
+impl Default for FileStreams {
+    fn default() -> Self { Self { left: [0; 64 << 10], right: [0; 64 << 10] } }
+}
+impl FileStreams {
+    /// Content identity for rename candidates. Its size counts actual streamed bytes, not a possibly stale stat.
+    fn identity(&mut self, path: &Path, small_limit: usize) -> Result<FileIdentity, String> {
+        let small_limit = small_limit.min(SMALL_FILE_LIMIT);
+        let mut file = fs::File::open(path).map_err(io_error(path))?;
+        let mut crc = crc32fast::Hasher::new();
+        let mut size = 0;
+        loop {
+            let n = read_chunk(&mut file, &mut self.left).map_err(io_error(path))?;
+            crc.update(&self.left[..n]);
+            size += n as u64;
+            if n < self.left.len() {
+                let small = (size != 0 && size <= small_limit as u64).then(|| self.left[..n].to_vec());
+                return Ok(FileIdentity { fingerprint: (size, crc.finalize()), small });
+            }
+        }
+    }
+
+    /// Exact comparison with bounded memory, including the initial unchanged-file check before opening a view.
+    fn same(&mut self, left: &Path, right: &Path) -> Result<bool, String> {
+        let mut l = fs::File::open(left).map_err(io_error(left))?;
+        let mut r = fs::File::open(right).map_err(io_error(right))?;
+        // Read actual bytes: devices and proc-like files can report zero length while returning content.
+        loop {
+            let ln = read_chunk(&mut l, &mut self.left).map_err(io_error(left))?;
+            let rn = read_chunk(&mut r, &mut self.right).map_err(io_error(right))?;
+            if self.left[..ln] != self.right[..rn] { return Ok(false); }
+            if ln < self.left.len() { return Ok(true); }
+        }
+    }
+}
+
+fn same_file_content(left: &Path, right: &Path) -> Result<bool, String> {
+    FileStreams::default().same(left, right)
+}
+
 /// Every file of a compared folder by `/`-separated relative path: inside a git work tree (and not itself ignored)
 /// the files git lists, tracked and untracked but not ignored, and those of its submodules and nested repositories;
-/// else every file under it.
+/// else every file under it. Only rules the comparison shows (in-tree `.gitignore` files, listed even when they
+/// ignore themselves) or the user's own global excludes skip a file: never `.git/info/exclude` or a
+/// repository-local `core.excludesFile`, which arrive with the compared folder's `.git` and are never compared.
 fn files(root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
     // `git difftool -d` exports GIT_DIR and GIT_WORK_TREE, and git would then list that repository's files for
     // its temporary folders.
@@ -852,15 +963,39 @@ fn files(root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
     if env("GIT_DIR") || env("GIT_WORK_TREE") || !git::may_be_in_repository(root) {
         return walk(root);
     }
+    let global = user_excludes_file(root).map(|file| format!("--exclude-from={}", file.display()));
+    let excludes = ["--exclude-per-directory=.gitignore"].into_iter().chain(global.as_deref());
+    let listing: Vec<&str> = ["ls-files", "-co", "-z"].into_iter().chain(excludes.clone()).collect();
     // Fails outside a work tree (and inside `.git`); lists nothing in an ignored folder such as `target/`.
-    let out = match git::run(root, &["ls-files", "-co", "--exclude-standard", "-z"]) {
+    let mut out = match git::run(root, &listing) {
         Ok(out) if !out.is_empty() || git::run(root, &["check-ignore", "-q", "."]).is_err() => out,
         _ => return walk(root),
     };
+    // A `.gitignore` that ignores itself would hide its rules; `--directory` keeps git out of ignored folders.
+    let ignored: Vec<&str> = ["ls-files", "-o", "-i", "--directory", "-z"].into_iter().chain(excludes)
+        .chain(["--", ".gitignore", ":(glob)**/.gitignore"]).collect();
+    match git::run(root, &ignored) {
+        Ok(more) => out.extend(more.split(|&b| b == 0).filter(|e| e.ends_with(b".gitignore")).flat_map(|e| [e, b"\0"]).flatten()),
+        Err(_) => return walk(root),
+    }
     let mut files = BTreeMap::new();
+    // Folders below `root` reached through a symlink, by relative path: each folder is looked at once.
+    let mut linked: HashMap<PathBuf, bool> = HashMap::new();
+    fn through_link(root: &Path, dir: &Path, linked: &mut HashMap<PathBuf, bool>) -> bool {
+        if dir.as_os_str().is_empty() { return false; }
+        if let Some(&known) = linked.get(dir) { return known; }
+        let link = through_link(root, dir.parent().unwrap_or(Path::new("")), linked)
+            || root.join(dir).symlink_metadata().is_ok_and(|m| m.is_symlink());
+        linked.insert(dir.to_path_buf(), link);
+        link
+    }
     for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
         let rel = git::path_text(entry)?.trim_end_matches('/').to_string();
         let path = root.join(&rel);
+        // like walk(), never list a file through a folder symlink below the compared folder
+        if through_link(root, Path::new(&rel).parent().unwrap_or(Path::new("")), &mut linked) {
+            continue;
+        }
         if path.is_file() {
             files.insert(rel, path);
         } else if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
@@ -870,6 +1005,35 @@ fn files(root: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
         // Else a deleted tracked file, or a link to a folder.
     }
     Ok(files)
+}
+
+/// The user's own excludes file, as git finds it: `core.excludesFile` from the global, system or command-line config
+/// (never the compared repository's), else `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`; `None` unless it
+/// exists, since `ls-files --exclude-from` fails on a missing file.
+fn user_excludes_file(root: &Path) -> Option<PathBuf> {
+    let out = git::run(root, &["config", "--show-scope", "--type=path", "-z", "--get-all", "core.excludesFile"]).unwrap_or_default();
+    let file = match users_excludes_value(&out) {
+        Some(value) => PathBuf::from(git::path_text(value).ok()?),
+        None => {
+            let base = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+            base.join("git/ignore")
+        }
+    };
+    (!file.as_os_str().is_empty() && root.join(&file).is_file()).then(|| root.join(file))
+}
+
+/// The last `core.excludesFile` the user set, from `git config --show-scope -z --get-all` output
+/// (`<scope>\0<value>\0` per entry): a repository's own (`local`, `worktree`) value is skipped.
+fn users_excludes_value(out: &[u8]) -> Option<&[u8]> {
+    let mut fields = out.split(|&b| b == 0);
+    let mut configured = None;
+    while let (Some(scope), Some(value)) = (fields.next(), fields.next()) {
+        if matches!(scope, b"global" | b"system" | b"command") {
+            configured = Some(value);
+        }
+    }
+    configured
 }
 
 /// Every file under `root` by `/`-separated relative path, `.git` aside. Symlinks are read through, never descended
@@ -1273,6 +1437,37 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_is_never_a_git_diff_option() {
+        let r = repo();
+        write(r.path(), "f", "a\n");
+        commit_all(r.path(), "1");
+        write(r.path(), "f", "b\n");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("written");
+        let rev = format!("--output={}", target.display());
+        assert!(ChangeSet::load(&git_spec(false, &[&format!("{rev}^1"), &rev], &[], false), r.path()).is_err());
+        assert!(ChangeSet::load(&git_spec(false, &[&rev], &[], false), r.path()).is_err());
+        assert!(!target.exists() && !elsewhere.path().join("written^1").exists(), "git diff wrote a file");
+    }
+
+    #[test]
+    fn a_nested_repositorys_own_config_runs_nothing_on_load() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ran = elsewhere.path().join("ran");
+        let hook = elsewhere.path().join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let r = crate::git::testing::nested_with_fsmonitor(&hook);
+        let set = load(r.path(), git_spec(false, &[], &[], true));
+        assert!(!ran.exists(), "git ran status inside the nested repository");
+        assert!(set.comparisons.is_empty(), "{:?}", listing(&set));
+        assert!(crate::conflicts::list(r.path()).unwrap().is_empty());
+        assert!(!ran.exists());
+        crate::git::testing::try_git(r.path(), &["status"]);
+        assert!(ran.exists(), "git itself runs it");
+    }
+
+    #[test]
     fn a_textconv_driver_turns_a_side_into_text() {
         let r = repo();
         crate::git::trust(r.path()); // as if the driver were in the user's global config
@@ -1521,6 +1716,68 @@ mod tests {
     }
 
     #[test]
+    fn exclude_rules_inside_a_compared_folder_s_git_hide_nothing() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        for side in ["left", "right"] {
+            write(d.path(), &format!("{side}/a.txt"), "a\n");
+        }
+        write(d.path(), "right/evil.sh", "touch marker\n");
+        write(d.path(), "right/lib/evil2.sh", "touch marker\n");
+        git(&d.path().join("right"), &["init", "-q"]);
+        write(d.path(), "right/.git/info/exclude", "evil.sh\n");
+        write(d.path(), "right/.git/hide", "evil2.sh\n");
+        std::fs::OpenOptions::new().append(true).open(d.path().join("right/.git/config")).unwrap()
+            .write_all(b"[core]\n\texcludesFile = .git/hide\n").unwrap();
+        let set = plain(d.path(), "left", "right").unwrap();
+        assert_eq!(listing(&set), [("evil.sh", Status::Added), ("lib/evil2.sh", Status::Added)]);
+    }
+
+    #[test]
+    fn only_the_user_s_own_excludes_file_is_used() {
+        use std::io::Write;
+        assert_eq!(users_excludes_value(b"system\0/etc/ignore\0global\0/home/u/ignore\0local\0.git/hide\0"), Some(&b"/home/u/ignore"[..]));
+        assert_eq!(users_excludes_value(b"local\0.git/hide\0worktree\0x\0"), None);
+        assert_eq!(users_excludes_value(b"command\0/c\0"), Some(&b"/c"[..]));
+        assert_eq!(users_excludes_value(b""), None);
+        // the repository's own value never reaches the listing
+        let r = repo();
+        write(r.path(), ".git/hide", "a.txt\n");
+        std::fs::OpenOptions::new().append(true).open(r.path().join(".git/config")).unwrap()
+            .write_all(b"[core]\n\texcludesFile = .git/hide\n").unwrap();
+        assert_ne!(user_excludes_file(r.path()), Some(r.path().join(".git/hide")));
+    }
+
+    #[test]
+    fn a_gitignore_that_ignores_itself_is_listed_with_what_it_hides() {
+        let r = repo();
+        write(r.path(), ".gitignore", "target/\n");
+        write(r.path(), "drop1/a.txt", "a\n");
+        write(r.path(), "drop2/a.txt", "a\n");
+        write(r.path(), "drop2/.gitignore", "/.gitignore\n/evil.sh\n");
+        write(r.path(), "drop2/evil.sh", "touch marker\n");
+        // a .gitignore inside an ignored folder hides nothing more and stays out of the listing
+        write(r.path(), "drop2/build/.gitignore", "*\n");
+        write(r.path(), "drop2/.gitignore", "/.gitignore\n/evil.sh\nbuild/\n");
+        let set = plain(r.path(), "drop1", "drop2").unwrap();
+        assert_eq!(listing(&set), [(".gitignore", Status::Added)]);
+    }
+
+    #[test]
+    fn a_folder_symlink_inside_a_compared_work_tree_is_not_listed_through() {
+        let r = repo();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "target", "victim\n");
+        write(r.path(), "right/ln/target", "tracked\n");
+        commit_all(r.path(), "1");
+        std::fs::remove_dir_all(r.path().join("right/ln")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), r.path().join("right/ln")).unwrap();
+        write(r.path(), "left/ln/target", "left text\n");
+        let set = plain(r.path(), "left", "right").unwrap();
+        assert_eq!(listing(&set), [("ln/target", Status::Deleted)]);
+    }
+
+    #[test]
     fn plain_folders_never_compare_dot_git() {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "l/.git", "gitdir: /somewhere\n");
@@ -1552,6 +1809,146 @@ mod tests {
         );
         assert_eq!(set.comparisons[4].old_path, "old/moved.txt");
         assert_eq!(texts(&set, 4), pair("same bytes\n", "same bytes\n"));
+    }
+
+    #[test]
+    fn directory_renames_verify_hash_collisions_and_keep_duplicate_pairing_order() {
+        // Equal-size, different binary contents with the same CRC-32. A fingerprint must never be the verdict.
+        let a = [33, 90, 232, 108, 111, 206, 0, 228];
+        let b = [252, 81, 220, 85, 53, 59, 68, 216];
+        assert_ne!(a, b);
+        assert_eq!(crc32fast::hash(&a), crc32fast::hash(&b));
+        let d = tempfile::tempdir().unwrap();
+        for (name, bytes) in [("l/a.bin", a), ("l/b.bin", b), ("l/c.bin", a),
+                              ("r/one.bin", a), ("r/two.bin", a), ("r/three.bin", b)] {
+            write(d.path(), name, bytes);
+        }
+        // The first new file gets the last identical old path; a collision skipped while finding it remains
+        // available for its own match. Empty files retain the existing add/delete behavior (covered above).
+        let set = plain(d.path(), "l", "r").unwrap();
+        let pairs = set.comparisons.iter().map(|c| (c.old_path.as_str(), c.path.as_str(), &c.status)).collect::<Vec<_>>();
+        assert_eq!(pairs, [
+            ("c.bin", "one.bin", &Status::Renamed { similarity: 100 }),
+            ("b.bin", "three.bin", &Status::Renamed { similarity: 100 }),
+            ("a.bin", "two.bin", &Status::Renamed { similarity: 100 }),
+        ]);
+        for c in &set.comparisons { assert_eq!(set.read(&c.left).unwrap(), set.read(&c.right).unwrap()); }
+
+        // A colliding addition with no identical old bytes must remain an addition plus a deletion.
+        write(d.path(), "l2/old.bin", a);
+        write(d.path(), "r2/new.bin", b);
+        let set = plain(d.path(), "l2", "r2").unwrap();
+        assert_eq!(listing(&set), [("new.bin", Status::Added), ("old.bin", Status::Deleted)]);
+    }
+
+    #[test]
+    fn streamed_file_comparison_checks_chunk_boundaries_suffixes_and_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let l = d.path().join("left");
+        let r = d.path().join("right");
+        let original = vec![0xC7; (128 << 10) + 7];
+        fs::write(&l, &original).unwrap();
+        fs::write(&r, &original).unwrap();
+        assert!(same_file_content(&l, &r).unwrap());
+        for at in [0, (64 << 10) - 1, 64 << 10, 128 << 10, original.len() - 1] {
+            let mut changed = original.clone();
+            changed[at] ^= 1;
+            fs::write(&r, &changed).unwrap();
+            assert!(!same_file_content(&l, &r).unwrap(), "changed byte {at}");
+        }
+        fs::write(&r, &original[..original.len() - 1]).unwrap();
+        assert!(!same_file_content(&l, &r).unwrap());
+        let missing = d.path().join("missing");
+        assert!(same_file_content(&l, &missing).unwrap_err().contains("missing"));
+        assert!(FileStreams::default().identity(&missing, 0).err().unwrap().contains("missing"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streamed_plain_files_use_actual_procfs_and_device_bytes_not_reported_lengths() {
+        let proc = Path::new("/proc/self/cmdline");
+        let metadata = fs::metadata(proc).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 0);
+        let bytes = fs::read(proc).unwrap();
+        assert!(!bytes.is_empty());
+        let d = tempfile::tempdir().unwrap();
+        let copy = d.path().join("cmdline-copy");
+        fs::write(&copy, &bytes).unwrap();
+        assert!(same_file_content(proc, &copy).unwrap());
+        assert!(same_file_content(&copy, proc).unwrap());
+        assert!(plain(d.path(), "/proc/self/cmdline", "cmdline-copy").unwrap().comparisons.is_empty());
+        let identity = FileStreams::default().identity(proc, SMALL_FILE_LIMIT).unwrap();
+        assert_eq!(identity.fingerprint, (bytes.len() as u64, crc32fast::hash(&bytes)));
+
+        let empty = d.path().join("empty");
+        fs::write(&empty, []).unwrap();
+        assert!(same_file_content(Path::new("/dev/null"), &empty).unwrap());
+        assert!(plain(d.path(), "/dev/null", "empty").unwrap().comparisons.is_empty());
+    }
+
+    #[test]
+    fn tiny_file_cache_exhaustion_keeps_streamed_rename_verification_exact() {
+        let d = tempfile::tempdir().unwrap();
+        let count = SMALL_FILE_BUDGET / SMALL_FILE_LIMIT + 2;
+        for i in 0..count {
+            let mut bytes = vec![b'X'; SMALL_FILE_LIMIT];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            write(d.path(), &format!("l/{i:04}.bin"), &bytes);
+            write(d.path(), &format!("r/moved-{i:04}.bin"), &bytes);
+        }
+        // These old paths sort after the entries that exhaust the cache. Their CRC collision still needs
+        // byte verification, and rejecting the colliding addition must not consume the real rename.
+        let a = [33, 90, 232, 108, 111, 206, 0, 228];
+        let b = [252, 81, 220, 85, 53, 59, 68, 216];
+        write(d.path(), "l/zz-old.bin", a);
+        write(d.path(), "r/zz-collision.bin", b);
+        write(d.path(), "r/zz-moved.bin", a);
+        let set = plain(d.path(), "l", "r").unwrap();
+        assert_eq!(set.comparisons.len(), count + 2);
+        assert_eq!(set.comparisons.iter().filter(|c| matches!(c.status, Status::Renamed { .. })).count(), count + 1);
+        assert_eq!(set.comparisons.iter().find(|c| c.path == "zz-collision.bin").unwrap().status, Status::Added);
+        let moved = set.comparisons.iter().find(|c| c.path == "zz-moved.bin").unwrap();
+        assert_eq!(moved.old_path, "zz-old.bin");
+        assert_eq!(set.read(&moved.left).unwrap(), set.read(&moved.right).unwrap());
+    }
+
+    #[test]
+    fn bounded_read_retries_interruptions_and_fills_across_short_reads() {
+        struct ShortRead { bytes: &'static [u8], interrupted: bool }
+        impl Read for ShortRead {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted { self.interrupted = true; return Err(io::ErrorKind::Interrupted.into()); }
+                let n = out.len().min(self.bytes.len()).min(3);
+                out[..n].copy_from_slice(&self.bytes[..n]);
+                self.bytes = &self.bytes[n..];
+                Ok(n)
+            }
+        }
+        let mut reader = ShortRead { bytes: b"binary\0suffix", interrupted: false };
+        let mut buffer = [0; 10];
+        assert_eq!(read_chunk(&mut reader, &mut buffer).unwrap(), 10);
+        assert_eq!(&buffer, b"binary\0suf");
+        assert_eq!(read_chunk(&mut reader, &mut buffer).unwrap(), 3);
+        assert_eq!(&buffer[..3], b"fix");
+        assert_eq!(read_chunk(&mut reader, &mut buffer).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_renames_follow_file_links_but_leave_unpaired_duplicates_deleted() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "source.bin", b"linked\0contents");
+        fs::create_dir(d.path().join("l")).unwrap();
+        fs::create_dir(d.path().join("r")).unwrap();
+        symlink(d.path().join("source.bin"), d.path().join("l/a.bin")).unwrap();
+        fs::hard_link(d.path().join("source.bin"), d.path().join("l/b.bin")).unwrap();
+        fs::hard_link(d.path().join("source.bin"), d.path().join("r/new.bin")).unwrap();
+        let set = plain(d.path(), "l", "r").unwrap();
+        assert_eq!(listing(&set), [("a.bin", Status::Deleted), ("new.bin", Status::Renamed { similarity: 100 })]);
+        assert_eq!(set.comparisons[1].old_path, "b.bin");
+        assert_eq!(set.read(&set.comparisons[1].left).unwrap(), b"linked\0contents");
     }
 
     #[cfg(unix)]

@@ -2,17 +2,39 @@
 use std::path::{Path, PathBuf};
 use super::{java, provider};
 
+/// Starts `command`, again a few times while its program is "Text file busy" (ETXTBSY): a file Lenz Code or an
+/// installer has just written stays open for writing in any child another thread forked meanwhile, until that child
+/// execs. Every other error is returned at once.
+pub fn spawn(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    retry_busy(|| command.spawn(), std::thread::sleep)
+}
+
+/// `attempt` up to five times while it fails with ETXTBSY, waiting 15, 30, 60 then 120 ms (225 ms in all) between.
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>, mut wait: impl FnMut(std::time::Duration)) -> std::io::Result<T> {
+    let mut delay = std::time::Duration::from_millis(15);
+    for _ in 1..5 {
+        match attempt() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => wait(delay),
+            done => return done,
+        }
+        delay *= 2;
+    }
+    attempt()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
     #[default]
     Java,
     PyrightNode,
+    /// An existing Node runtime, including before its managed server has been installed.
+    Node(&'static str),
 }
 
 impl Kind {
-    pub fn label(self) -> &'static str { match self { Self::Java => "Java", Self::PyrightNode => "Node.js" } }
-    pub fn input_label(self) -> &'static str { match self { Self::Java => "Java executable / JDK folder", Self::PyrightNode => "Node.js executable / install folder" } }
-    pub fn provider(self) -> &'static str { match self { Self::Java => "jdtls", Self::PyrightNode => "pyright" } }
+    pub fn label(self) -> &'static str { match self { Self::Java => "Java", Self::PyrightNode | Self::Node(_) => "Node.js" } }
+    pub fn input_label(self) -> &'static str { match self { Self::Java => "Java executable / JDK folder", Self::PyrightNode | Self::Node(_) => "Node.js executable / install folder" } }
+    pub fn provider(self) -> &'static str { match self { Self::Java => "jdtls", Self::PyrightNode => "pyright", Self::Node(provider) => provider } }
 }
 
 #[derive(Default)]
@@ -24,29 +46,64 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn choices(&self, input: &str) -> Vec<(String, Option<PathBuf>)> {
-        let entered = (!input.trim().is_empty()).then(|| PathBuf::from(input.trim()));
-        let mut choices = vec![
-            ("Save entered path and restart".into(), entered),
-            (format!("Restore automatic {} selection and restart", self.kind.label()), None),
-        ];
-        choices.extend(self.candidates.iter().map(|p| (format!("Use {} and restart", p.display()), Some(p.clone()))));
+    /// What the chooser is for: "Java runtime for Eclipse JDT LS".
+    pub fn title(&self) -> String {
+        let server = provider::PROVIDERS.iter().find(|p| p.id == self.kind.provider()).map_or("the language server", |p| p.name);
+        format!("{} runtime for {server}", self.kind.label())
+    }
+
+    /// Each choice's name, where it lives (shown beside it, dimmer) and what it saves (`None`: automatic).
+    /// Choosing one saves it and restarts the server. The entered path leads once something is typed; the runtime in
+    /// use says so.
+    pub fn choices(&self, input: &str) -> Vec<(String, Option<String>, Option<PathBuf>)> {
+        let in_use = |path: Option<&PathBuf>| if path == self.configured.as_ref() { " · in use" } else { "" };
+        let entered = input.trim();
+        let mut choices = Vec::new();
+        if !entered.is_empty() {
+            choices.push(("Use the entered path".to_owned(), None, Some(PathBuf::from(entered))));
+        }
+        choices.push((format!("Automatic{}", in_use(None)), Some(format!("the first {} on PATH", self.kind.label())), None));
+        choices.extend(self.candidates.iter().map(|p| (format!("{}{}", runtime_name(p), in_use(Some(p))), runtime_location(p), Some(p.clone()))));
         choices
     }
+}
+
+/// The folder a runtime's install folder is in (`/usr/lib/jvm`), the home folder shown as `~`.
+fn runtime_location(path: &Path) -> Option<String> {
+    let name = runtime_name(path);
+    Some(shown_path(path.ancestors().find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == name))?.parent()?))
+}
+
+/// `path` with the home folder shown as `~`.
+pub fn shown_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.components().count() > 1);
+    match home.and_then(|h| path.strip_prefix(&h).ok().map(Path::to_owned)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// A runtime's short name: its install folder (`java-21-openjdk` for `/usr/lib/jvm/java-21-openjdk/bin/java`, and
+/// `temurin-21.jdk` for macOS's `…/temurin-21.jdk/Contents/Home/bin/java`).
+fn runtime_name(path: &Path) -> String {
+    let mut folder = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "bin")).and_then(Path::parent).or(path.parent());
+    if let Some(home) = folder.filter(|f| f.ends_with("Contents/Home")) { folder = home.parent().and_then(Path::parent); }
+    folder.and_then(Path::file_name).map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 pub fn configured(kind: Kind, settings: &provider::Settings) -> Option<PathBuf> {
     let settings = settings.providers.get(kind.provider())?;
     match kind {
         Kind::Java => settings.args.as_deref().and_then(java::configured),
-        Kind::PyrightNode => settings.node.clone(),
+        Kind::PyrightNode | Kind::Node(_) => settings.node.clone(),
     }
 }
 
 pub fn discover(kind: Kind, current: Option<PathBuf>) -> Vec<PathBuf> {
     match kind {
         Kind::Java => java::discover(current),
-        Kind::PyrightNode => {
+        Kind::PyrightNode | Kind::Node(_) => {
             let mut homes = Vec::new();
             if let Some(home) = std::env::var_os("MISE_DATA_DIR") {
                 homes.push(PathBuf::from(home).join("installs/node"));
@@ -61,7 +118,7 @@ pub fn discover(kind: Kind, current: Option<PathBuf>) -> Vec<PathBuf> {
             if let Some(home) = std::env::var_os("NVM_DIR") {
                 homes.push(PathBuf::from(home).join("versions/node"));
             }
-            discover_node(current, std::env::var_os("PATH").as_deref(), &homes)
+            discover_node(current, std::env::var_os("PATH").as_deref(), &homes, kind == Kind::PyrightNode)
         },
     }
 }
@@ -69,7 +126,8 @@ pub fn discover(kind: Kind, current: Option<PathBuf>) -> Vec<PathBuf> {
 pub fn save(kind: Kind, file: &Path, path: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
     match kind {
         Kind::Java => java::save(file, path),
-        Kind::PyrightNode => {
+        Kind::PyrightNode | Kind::Node(_) => {
+            if kind != Kind::PyrightNode && super::installer::node_package(kind.provider()).is_none() { return Err("This provider does not use Node.js".into()); }
             let path = path.as_deref().map(node_path).transpose()?;
             if let Some(path) = &path {
                 let version = version(path, "--version")?;
@@ -78,11 +136,11 @@ pub fn save(kind: Kind, file: &Path, path: Option<PathBuf>) -> Result<Option<Pat
                     return Err(format!("{} did not report a Node.js version (expected vMAJOR.MINOR.PATCH): {version}", path.display()));
                 }
             }
-            provider::update_settings(file, "pyright", "Node.js", |provider| {
+            provider::update_settings(file, kind.provider(), "Node.js", |provider| {
                 if let Some(path) = &path {
                     let custom = provider.get("executable").and_then(serde_json::Value::as_str)
                         .is_some_and(|name| name != "pyright-langserver");
-                    if !custom && !path.parent().is_some_and(|bin| bin.join(server_name()).is_file()) {
+                    if kind == Kind::PyrightNode && !custom && !path.parent().is_some_and(|bin| bin.join(server_name()).is_file()) {
                         return Err(format!("Pyright is not installed beside this Node.js executable ({}). Choose an existing Node.js installation containing Pyright, or use Install Language Server to install a managed Pyright, then choose its Node.js runtime.", path.display()));
                     }
                     provider.insert("node".into(), serde_json::json!(path));
@@ -114,13 +172,13 @@ fn node_path(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(node_name()))
 }
 
-fn discover_node(current: Option<PathBuf>, path: Option<&std::ffi::OsStr>, homes: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_node(current: Option<PathBuf>, path: Option<&std::ffi::OsStr>, homes: &[PathBuf], require_server: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut identities = Vec::new();
     let mut add = |path: PathBuf| {
         if paths.len() < 64
             && let Ok(path) = node_path(&path)
-            && path.parent().is_some_and(|bin| bin.join(server_name()).is_file())
+            && (!require_server || path.parent().is_some_and(|bin| bin.join(server_name()).is_file()))
             && let Ok(identity) = path.canonicalize()
             && !identities.contains(&identity)
         {
@@ -142,9 +200,13 @@ fn discover_node(current: Option<PathBuf>, path: Option<&std::ffi::OsStr>, homes
     paths
 }
 
-/// Bounded stdout and stderr, without shell startup files or a long-lived version process.
+/// Where a version is asked outside any project: the filesystem root, which only its administrator can write to, so
+/// that a version manager's shim (rustup, mise, pyenv) does not read a project's toolchain files to choose what runs.
+pub const NEUTRAL: &str = "/";
+
+/// Bounded stdout and stderr, without shell startup files or a long-lived version process; asked outside any project.
 pub fn version(path: &Path, flag: &str) -> Result<String, String> {
-    version_in(path, flag, &[], None)
+    version_in(path, flag, &[], Some(Path::new(NEUTRAL)))
 }
 
 pub fn version_in(path: &Path, flag: &str, env: &[(String, String)], cwd: Option<&Path>) -> Result<String, String> {
@@ -164,7 +226,7 @@ pub fn run_args_in(path: &Path, args: &[&str], env: &[(String, String)], cwd: Op
     if let Some(cwd) = cwd { command.current_dir(cwd); }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command.spawn().map_err(|e| format!("Cannot run {} {flags}: {e}", path.display()))?;
+    let mut child = spawn(&mut command).map_err(|e| format!("Cannot run {} {flags}: {e}", path.display()))?;
     fn capture(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -231,7 +293,7 @@ pub fn run_with_input_env(path: &Path, args: &[String], input: &str, cwd: &Path,
     command.args(args).envs(env.iter().map(|(k, v)| (k, v))).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command.spawn().map_err(|e| format!("cannot run {}: {e}", path.display()))?;
+    let mut child = spawn(&mut command).map_err(|e| format!("cannot run {}: {e}", path.display()))?;
     let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
         super::kill_group(&mut child);
         let _ = child.wait();
@@ -289,6 +351,37 @@ mod tests {
             .arg(&temporary).status().unwrap().success());
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::rename(temporary, path).unwrap();
+    }
+
+    fn busy<T>() -> std::io::Result<T> { Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy)) }
+
+    #[test]
+    fn busy_starts_are_retried_with_backoff_and_other_errors_are_not() {
+        let (mut tries, mut waited) = (0, Vec::new());
+        let started = retry_busy(|| { tries += 1; if tries < 3 { busy() } else { Ok(tries) } }, |d| waited.push(d.as_millis()));
+        assert_eq!((started.unwrap(), waited), (3, vec![15, 30]));
+        let (mut tries, mut waited) = (0, Vec::new());
+        let error = retry_busy(|| { tries += 1; busy::<()>() }, |d| waited.push(d.as_millis())).unwrap_err();
+        assert_eq!((error.kind(), tries, waited), (std::io::ErrorKind::ExecutableFileBusy, 5, vec![15, 30, 60, 120]));
+        let mut tries = 0;
+        let error = retry_busy(|| { tries += 1; Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound)) }, |_| panic!("no wait")).unwrap_err();
+        assert_eq!((error.kind(), tries), (std::io::ErrorKind::NotFound, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_script_still_open_for_writing_starts_once_it_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("server");
+        let mut file = std::fs::File::create(&script).unwrap();
+        std::io::Write::write_all(&mut file, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = std::process::Command::new(&script);
+        command.stdin(std::process::Stdio::null());
+        assert_eq!(command.spawn().unwrap_err().kind(), std::io::ErrorKind::ExecutableFileBusy, "busy while open for writing");
+        let closer = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(40)); drop(file); });
+        assert!(spawn(&mut command).unwrap().wait().unwrap().success());
+        closer.join().unwrap();
     }
 
     #[test]
@@ -367,8 +460,30 @@ mod tests {
             std::os::unix::fs::symlink(home.join("bin"), install.join("bin")).unwrap();
         }
         let path = std::env::join_paths([first.parent().unwrap(), first.parent().unwrap(), missing.parent().unwrap()]).unwrap();
-        let discovered = discover_node(Some(first.clone()), Some(&path), &homes);
-        assert_eq!(discovered, [first, second]);
+        let discovered = discover_node(Some(first.clone()), Some(&path), &homes, true);
+        assert_eq!(discovered, [first.clone(), second.clone()]);
+        let candidates = discover_node(Some(first.clone()), Some(&path), &homes, false);
+        assert_eq!(candidates.len(), 3, "setup can discover Node before a language server is installed");
+        assert!(candidates.contains(&first) && candidates.contains(&second) && candidates.contains(&missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_setup_can_choose_node_before_installing_its_server() {
+        let dir = tempfile::tempdir().unwrap(); let runtime = node(dir.path(), "echo v24.0.0");
+        std::fs::remove_file(runtime.parent().unwrap().join("pyright-langserver")).unwrap();
+        let file = dir.path().join("providers.json");
+        std::fs::write(&file, r#"{"providers":{"yaml-language-server":{"env":{"KEEP":"yes"}}}}"#).unwrap();
+        let kind = Kind::Node("yaml-language-server");
+        assert_eq!(save(kind, &file, Some(runtime.clone())).unwrap(), Some(runtime.clone()));
+        let settings = provider::Settings::read(&file);
+        assert_eq!(configured(kind, &settings), Some(runtime.clone()));
+        let yaml = provider::PROVIDERS.iter().find(|p| p.id == kind.provider()).unwrap();
+        let launch = settings.launch(yaml);
+        assert_eq!(std::env::split_paths(launch.path().unwrap()).next().as_deref(), runtime.parent());
+        assert!(launch.env.contains(&("KEEP".into(), "yes".into())));
+        save(kind, &file, None).unwrap();
+        assert!(configured(kind, &provider::Settings::read(&file)).is_none());
     }
 
     #[test]
@@ -418,4 +533,25 @@ mod tests {
 
 
 
+}
+
+#[cfg(test)]
+mod chooser_tests {
+    use super::*;
+
+    #[test]
+    fn choices_name_each_runtime_mark_the_one_in_use_and_offer_a_typed_path_first() {
+        let (j27, j21) = (PathBuf::from("/usr/lib/jvm/java-27-openjdk/bin/java"), PathBuf::from("/usr/lib/jvm/java-21-openjdk/bin/java"));
+        let model = Runtime { kind: Kind::Java, configured: Some(j21.clone()), candidates: vec![j27.clone(), j21.clone()], message: String::new() };
+        assert_eq!(model.title(), "Java runtime for Eclipse JDT LS");
+        assert_eq!(model.choices("")[1].1.as_deref(), Some("/usr/lib/jvm"), "where it lives, beside its name");
+        let names = |input: &str| model.choices(input).into_iter().map(|(name, _, path)| (name, path)).collect::<Vec<_>>();
+        assert_eq!(names(""), [("Automatic".into(), None), ("java-27-openjdk".into(), Some(j27.clone())), ("java-21-openjdk · in use".into(), Some(j21.clone()))]);
+        assert_eq!(names(" /opt/jdk/bin/java ")[0], ("Use the entered path".into(), Some(PathBuf::from("/opt/jdk/bin/java"))));
+        let automatic = Runtime { configured: None, ..model };
+        assert_eq!(automatic.choices("")[0].0, "Automatic · in use");
+        assert_eq!(runtime_name(Path::new("/opt/node")), "opt", "no bin folder: the parent");
+        assert_eq!(runtime_name(Path::new("/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java")), "temurin-21.jdk");
+        assert_eq!(runtime_location(Path::new("/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java")).as_deref(), Some("/Library/Java/JavaVirtualMachines"));
+    }
 }

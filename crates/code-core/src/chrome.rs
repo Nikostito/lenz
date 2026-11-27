@@ -54,6 +54,27 @@ pub fn about() -> String {
         .join("\n")
 }
 
+/// A setting's row where only text carries its state: "Soft Wrap (on)"; a command's label as it is.
+pub fn toggle_text(label: &str, on: Option<bool>) -> String {
+    match on {
+        Some(true) => format!("{label} (on)"),
+        Some(false) => format!("{label} (off)"),
+        None => label.to_string(),
+    }
+}
+
+/// [`toggle_text`] undone, for an adapter that draws the state as a mark: the label and the state it carried.
+pub fn toggle_split(text: &str) -> (&str, Option<bool>) {
+    if let Some(label) = text.strip_suffix(" (on)") { (label, Some(true)) }
+    else if let Some(label) = text.strip_suffix(" (off)") { (label, Some(false)) }
+    else { (text, None) }
+}
+
+/// A setting's state as a mark before its label: on, off, and nothing for a command.
+pub fn toggle_mark(on: Option<bool>) -> &'static str {
+    match on { Some(true) => "✓ ", Some(false) => "○ ", None => "" }
+}
+
 impl Session {
     /// Frequent actions in both toolbars. Overflow remains available in the command menu.
     pub fn toolbar(&self) -> Vec<(CommandId, &'static str)> {
@@ -71,14 +92,7 @@ impl Session {
     /// a parent link, direct commands and task submenus.
     pub fn menu(&self, group: Option<CommandGroup>) -> Vec<MenuRow> {
         let row = |label, disabled, target| MenuRow { label, disabled, target };
-        let commands = |g: CommandGroup| self.actions().into_iter().filter(move |a| a.id.group() == g).map(|a| {
-            let label = match a.on {
-                Some(true) => format!("{} (on)", a.label),
-                Some(false) => format!("{} (off)", a.label),
-                None => a.label.to_string(),
-            };
-            row(label, a.disabled, MenuTarget::Run(a.id))
-        });
+        let commands = |g: CommandGroup| self.actions().into_iter().filter(move |a| a.id.group() == g).map(|a| row(toggle_text(a.label, a.on), a.disabled, MenuTarget::Run(a.id)));
         let children = |g: CommandGroup| CommandGroup::ALL.iter().filter(move |child| child.parent() == Some(g)).map(|&child| row(format!("{} ›", child.label()), None, MenuTarget::Group(child)));
         match group {
             None => {
@@ -110,8 +124,13 @@ impl Session {
         if let Some(asking) = state.asking() {
             return format!("{asking} (Escape cancels)");
         }
-        if let Some(path) = state.loading() {
-            return format!("Loading {}…", path.display());
+        // Only a slow load is named (switching files loads for milliseconds), by its name, never its path.
+        if let Some(path) = state.slow_loading() {
+            let name = match crate::archive::Location::from_uri(path) {
+                Some(location) => location.member_name().map(|m| m.rsplit('/').next().unwrap_or(m).to_owned()),
+                None => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            };
+            return format!("Loading {}…", name.unwrap_or_default());
         }
         if let Some(notice) = state.notices().last() {
             return notice.clone();
@@ -129,6 +148,13 @@ impl Session {
             .filter(|p| matches!(p.status, Status::Missing(_) | Status::Failed(_)))
         {
             return provider_message(provider);
+        }
+        // Checked for syntax only: say so while nothing more specific is shown.
+        if let Some((profile, _)) = self.maven_suggestion() {
+            return format!("Outside the build: Maven profile {profile} adds its folder · F2 to include it");
+        }
+        if let Some(outside) = state.outside_build() {
+            return if outside.no_project { "Not in any project: syntax errors only · F2 for details".into() } else { "Outside the build's source folders: syntax errors only · F2 for details".into() };
         }
         if let Some(status) = state.active().and_then(|tab| tab.blame_status()) {
             match status {
@@ -151,10 +177,8 @@ impl Session {
         if let Some(marker) = self.caret_marker() {
             return marker;
         }
-        state.current_source().map_or_else(
-            || "No file open — Ctrl+O file, F10 commands".into(),
-            |d| shown_name(state, d),
-        )
+        // The open file's name is on its tab; the status bar names it only in details.
+        if state.active().is_some() || state.current_source().is_some() { String::new() } else { "No file open — Ctrl+O file, F10 commands".into() }
     }
 
     /// The live snippet's placeholder and what the keys do now, while Tab visits its placeholders rather than
@@ -177,11 +201,6 @@ impl Session {
         self.state().markers(tab.id())?.line_label(line)
     }
 
-    /// The active file's change-marker baseline, named (`HEAD (main · 1a2b3c4)`, a new file, or the last save).
-    pub fn markers_baseline(&self) -> Option<&crate::markers::Baseline> {
-        self.state().active().and_then(|tab| self.state().markers(tab.id()))?.baseline()
-    }
-
     /// The shown draft's baseline and what changed against it, for the status details.
     pub fn markers_details(&self) -> Option<String> {
         let markers = self.state().active().and_then(|tab| self.state().markers(tab.id()))?;
@@ -202,10 +221,17 @@ impl Session {
         {
             return format!("{}×{}", image.width, image.height);
         }
-        let position = match tab.selection().zip(self.state().view(tab.id()).map(|v| v.snapshot())) {
+        let view = self.state().view(tab.id());
+        let loading = view.is_none();
+        let position = match tab.selection().zip(view.map(|v| v.snapshot())) {
             Some((selection, document)) => {
-                format!("{}:{}", document.line_of(selection.head) + 1, document.column_at(selection.head) + 1)
+                let position = format!("{}:{}", document.line_of(selection.head) + 1, document.column_at(selection.head) + 1);
+                self.shown_position.borrow_mut().insert(tab.id(), (tab.source.clone(), position.clone()));
+                position
             }
+            // Its text is loading (a switch or a reload, milliseconds): its caret as last drawn, not a blink. A
+            // preview tab showing another file keeps its id, not its caret.
+            None if loading && tab.selection().is_some() && let Some((_, position)) = self.shown_position.borrow().get(&tab.id()).filter(|(source, _)| *source == tab.source) => position.clone(),
             None => format!("Line {}", tab.top_line() + 1),
         };
         self.state().vim_status().map_or_else(|| position.clone(), |mode| format!("{mode}  {position}"))
@@ -214,62 +240,61 @@ impl Session {
     /// Full status snapshot, built only when requested so background samples cannot move a details dialog.
     pub fn status_details(&self) -> String {
         let state = self.state();
-        let name = match (state.loading(), state.current_source()) {
-            (Some(path), _) => format!("Loading {}…", path.display()),
-            (None, Some(document)) => shown_name(state, document),
-            (None, None) => "No file open — Ctrl+O file, F10 commands".into(),
-        };
-        let project = state.project().map(|project| {
-            let root = project.root().display();
-            match project.coverage() {
-                Coverage::Scanning(n) => format!("{root}: scanning, {n} files so far"),
-                Coverage::Complete(n) if project.refreshing() => {
-                    format!("{root}: {n} files, refreshing")
-                }
-                Coverage::Complete(0) if project.skipped() == 0 => format!("{root}: no files"),
-                Coverage::Complete(n) if project.skipped() == 0 => format!("{root}: {n} files"),
-                Coverage::Complete(n) => format!(
-                    "{root}: {n} files; {} unreadable entries skipped",
-                    project.skipped()
-                ),
-                Coverage::Unavailable(error) => format!("{root}: unavailable ({error})"),
+        let shown = |p: &std::path::Path| crate::semantics::runtime::shown_path(p);
+        // What needs attention first: a question in progress and the notices, each on its own line.
+        let attention: Vec<String> = state.asking().map(|asking| format!("{asking} (Escape cancels)")).into_iter().chain(state.notices().iter().cloned()).collect();
+        let mut file = vec!["File".to_owned()];
+        match (state.loading(), state.current_source()) {
+            (Some(path), _) => file.push(format!("Loading: {}", crate::archive::Location::from_uri(path).map_or_else(|| shown(path), |location| location.display_path()))),
+            (None, Some(document)) if document.source_meta().archive().is_some() || state.active().is_some_and(|t| t.untitled()) => file.push(format!("Name: {}", shown_name(state, document))),
+            (None, Some(document)) => {
+                let path = document.source();
+                file.push(format!("Name: {}", path.file_name().map_or_else(|| shown(path), |n| n.to_string_lossy().into_owned())));
+                if let Some(folder) = path.parent() { file.push(format!("Folder: {}", shown(folder))); }
             }
-        });
+            (None, None) => file.push("Name: none open (Ctrl+O opens a file, F10 lists commands)".into()),
+        }
         let position = self.status_position();
-        let image = state
-            .active()
-            .filter(|t| !t.image_source())
-            .and_then(|t| state.view(t.id())?.snapshot().image())
-            .map(|image| {
-                format!(
-                    "{}×{} · {:?} · {} bytes{}",
-                    image.width,
-                    image.height,
-                    image.format,
-                    image.byte_size,
-                    if image.downscaled {
-                        " · downscaled"
-                    } else {
-                        ""
-                    }
-                )
-            });
-        state
-            .asking()
-            .map(|asking| format!("{asking} (Escape cancels)"))
-            .into_iter()
-            .chain(state.notices())
-            .chain([name])
-            .chain((!position.is_empty()).then_some(position))
-            .chain(self.markers_details())
-            .chain(state.results().filter(|r| r.results_kind() == crate::search::ResultsKind::ProjectSyntax).map(|r| format!("{}\nThe captured project inventory respects ignore rules; links outside the project, binary/lossy text, large files, environment files and SQL without a scan provider are not checked. Per-file findings and the total result list are bounded; known explorer badges retain at most 1024 paths. Cancel Project Syntax Check stops background work; Rerun Search checks again.{}", r.kind(), if r.limited() { " The result limit was reached; coverage is incomplete." } else { "" })))
-            .chain(state.terminal().active().map(|tab| format!("{} — {}\nInitial directory: {}\n{} terminal tabs{}", tab.label(), tab.status(), tab.cwd().display(), state.terminal().tabs().len(), tab.error().map_or(String::new(), |why| format!("\n{why}")))))
-            .chain(image)
+        if !position.is_empty() { file.push(format!("Position: {position}")); }
+        if let Some(changes) = self.markers_details() { file.push(format!("Changes: {changes}")); }
+        if let Some(image) = state.active().filter(|t| !t.image_source()).and_then(|t| state.view(t.id())?.snapshot().image()) {
+            file.push(format!("Image: {}×{} · {:?} · {} bytes{}", image.width, image.height, image.format, image.byte_size, if image.downscaled { " · downscaled" } else { "" }));
+        }
+        let project = state.project().map(|project| {
+            let files = match project.coverage() {
+                Coverage::Scanning(n) => format!("scanning, {n} so far"),
+                Coverage::Complete(n) if project.refreshing() => format!("{n}, refreshing"),
+                Coverage::Complete(0) if project.skipped() == 0 => "none".into(),
+                Coverage::Complete(n) if project.skipped() == 0 => n.to_string(),
+                Coverage::Complete(n) => format!("{n}; {} unreadable entries skipped", project.skipped()),
+                Coverage::Unavailable(error) => format!("unavailable ({error})"),
+            };
+            format!("Project\nFolder: {}\nFiles: {files}", shown(project.root()))
+        });
+        (!attention.is_empty()).then(|| attention.join("\n")).into_iter()
+            .chain([file.join("\n")])
             .chain(project)
-            .chain(state.provider().map(|p| p.summary()))
-            .chain([self.language_server_details()])
+            .chain(state.results().filter(|r| r.results_kind() == crate::search::ResultsKind::ProjectSyntax).map(|r| format!("Project syntax check\n{}\nThe captured project inventory skips ignored folders; links outside the project, binary/lossy text, large files, environment files and SQL without a scan provider are not checked. Per-file findings and the total result list are bounded; known explorer badges retain at most 1024 paths. Cancel Project Syntax Check stops background work; Rerun Search checks again.{}", r.kind(), if r.limited() { " The result limit was reached; coverage is incomplete." } else { "" })))
+            .chain(state.terminal().active().map(|tab| format!("Terminal\nTab: {} — {}\nInitial directory: {}\nTabs: {}{}", tab.label(), tab.status(), shown(tab.cwd()), state.terminal().tabs().len(), tab.error().map_or(String::new(), |why| format!("\n{why}")))))
+            // Server Details' rows, one per line under one heading (the notices are already first).
+            .chain([format!("Language server\n{}", self.server_detail_rows().join("\n"))])
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+}
+
+/// How a details dialog draws one of its text lines (both adapters): a section heading, a `Label: value` line (its
+/// label dimmer than its value), or plain text. `previous` is the text line before it (`None`: the first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailLine { Heading, Labelled(usize), Plain }
+
+pub fn detail_line(previous: Option<&str>, line: &str) -> DetailLine {
+    let label = line.split_once(':').map(|(label, _)| label).filter(|label| label.len() <= 40 && !label.contains('/') && !label.contains('`') && !label.trim().is_empty());
+    match label {
+        Some(label) => DetailLine::Labelled(label.len() + 1),
+        // A short line without a colon that opens a paragraph and is no sentence.
+        None if previous.is_none_or(|p| p.trim().is_empty()) && !line.trim().is_empty() && line.chars().count() <= 24 && !line.ends_with(['.', '…', ')']) => DetailLine::Heading,
+        None => DetailLine::Plain,
     }
 }
 
@@ -301,7 +326,7 @@ pub fn ellipsize(text: &str, cols: usize) -> String {
 fn shown_name(state: &crate::session::State, document: &crate::text::TextSnapshot) -> String {
     match state.active().filter(|t| t.untitled()) {
         Some(tab) => tab.title(),
-        None => document.source().display().to_string(),
+        None => document.source_meta().archive().map_or_else(|| document.source().display().to_string(), crate::archive::Location::display_path),
     }
 }
 
@@ -331,6 +356,7 @@ mod tests {
             supports: vec![],
             error: None,
             environment: None,
+            quiet: false,
         };
         let before = provider_message(provider.clone());
         provider.memory = Some((150 << 20, 30 << 20));
@@ -341,5 +367,14 @@ mod tests {
         let missing = provider_message(provider);
         assert!(missing.contains("Install Language Server") && !missing.contains("RAW_STARTUP_DIAGNOSTICS"), "{missing}");
         assert!(before.contains("1.2"));
+    }
+
+    #[test]
+    fn a_settings_state_reads_back_from_its_row_text() {
+        for on in [Some(true), Some(false), None] {
+            assert_eq!(toggle_split(&toggle_text("Soft Wrap", on)), ("Soft Wrap", on));
+        }
+        // a label that only looks like one keeps its text
+        assert_eq!(toggle_split("Turn (on) Later"), ("Turn (on) Later", None));
     }
 }

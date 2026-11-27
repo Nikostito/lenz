@@ -36,9 +36,9 @@ One `lenz` command opens both, each a separate executable:
 (or `lenz-diff-tui`), and git difftool and mergetool configurations change as shown in
 [git difftool](#git-difftool) and [git mergetool](#git-mergetool).
 
-**Status:** beta (0.0.10). Diff is tested on Linux and macOS (Apple Silicon), with automated
+**Status:** beta ([0.0.23](docs/releases/0.0.23.md)). Diff is tested on Linux and macOS (Apple Silicon), with automated
 GUI interaction coverage on Linux. Lenz Code and the launcher are verified on Linux;
-native macOS validation is pending. Lenz Code edits existing files on verified Linux input (X11 desktop and terminal); Wayland desktop and macOS editing stay disabled. It has desktop and terminal adapters. See the [Diff macOS figures and known costs](docs/performance.md#macos).
+native macOS validation is pending. Lenz Code edits existing files in its window on Linux (X11 and Wayland) and macOS, and in the terminal on both. It has desktop and terminal adapters. See the [Diff macOS figures and known costs](docs/performance.md#macos).
 
 ## Screenshots
 
@@ -60,14 +60,24 @@ A bounded SQL completion check (512 tables × 16 columns, Linux release, ten alt
 measured **1.84→1.86 ms per completion** after the default-schema fix; paired differences varied in both
 directions. This is core computation, not popup latency; see the [SQL completion notes](docs/optimization-notebook.md#sql-metadata-completion--2026-10-29).
 
+A Linux release project-edit check completed **4,220 cycles in 120 seconds**, each replacing
+4,000 matches across 40 files and checking exact per-file Undo and disk bytes. Core preview/Apply
+medians were **2.33/10.45 ms**; see [validation results and frontend measurement limits](docs/research/project-replace-rename-validation.md).
+
 - **Explore code** with a project tree, file finder, tabs, independent split panes,
   breadcrumbs, outline, folding and sticky declarations.
+- **Edit archive members** by opening a ZIP or tarball, including nested archives. Open a member,
+  edit it normally and Save to update the archive while preserving its other members.
 - **Navigate** with bookmarks, recent files and locations, and back/forward history.
   Installed language servers add definitions, usages, documentation, call/type
   hierarchies, semantic colours and inlay hints; availability depends on the provider.
   Dependency definitions reveal a lazy **Libraries** section for browsing their source files.
   F2 offers [project-scoped LSP settings](docs/code/providers.md#project-language-server-settings),
   including a reversible Ruby tooling-gem exclusion toggle and a reset to inherited settings.
+- **Replace across a project** with a preview of each affected file, inclusion controls and undoable draft edits.
+  **Rename Symbol…** uses the language server and the same preview before applying changes. See the
+  [replacement and rename guide](docs/code/README.md#project-replacement-and-symbol-rename) and
+  [Linux validation results](docs/research/project-replace-rename-validation.md).
 - **Find and replace** within a file — the replace row takes the next match or every match, each replace one undo
   step on the draft — or search across the project, with case, whole-word and regular-expression
   options. Go straight to a file and line with `Ctrl+P`, or a line with `Ctrl+G`.
@@ -99,8 +109,8 @@ directions. This is core computation, not popup latency; see the [SQL completion
   preferences. Each app keeps its own documents and navigation state.
 
 Lenz Code edits stay in shared drafts until Save or Save As writes the file. Checkouts and branch operations
-change repository state explicitly. Archive browsing is currently a
-Diff feature. See the [Lenz Code guide](docs/code/README.md) for controls and limits,
+change repository state explicitly. Both apps browse archives; Code also saves member edits back into them.
+See the [Lenz Code guide](docs/code/README.md#editing-archives) for controls and limits,
 and [language-server compatibility](docs/code/providers.md) for setup and provider side effects.
 
 The internal snapshot migration measured core text availability at **0.888 → 0.912–0.976 ms**
@@ -133,8 +143,8 @@ for memory, workload scope and unverified platforms.
 - **Compare** files, directories, revisions, the index or the working tree, with word/character/line highlighting, whitespace and case modes, three scroll modes, syntax highlighting, sticky scroll (the enclosing declarations stay pinned at the top of each pane) and blame annotations.
 - **Apply changes**: move Change Blocks with ≫ / ≪ and revert hunks. Changes stay as a draft until you save. Every applied change stays visible as Applied or Undone, with selective Undo.
 - **Browse** the repository: commit log with branch graph, file history (`--follow`), Change Set search and read-only GitHub pull requests with descriptions and review threads.
-- **Merge**: a three-way Merge View, a Conflict List for whole merges/rebases/cherry-picks, and a Version Picker for binary files. The Merge View applies every non-conflicting change as soon as it opens and never drops a conflict.
-- **Images**: two-up, swipe, onion skin and difference modes, with zoom and opacity.
+- **Merge**: a three-way Merge View, a Conflict List for whole merges/rebases/cherry-picks, and a Version Picker for binary files. The Merge View applies every non-conflicting change as soon as it opens and never drops a conflict: an insertion or deletion that could equally sit right before the other side's change (repeated lines) is a conflict, as git makes it. When git finds conflicts in a file the Merge View settles completely, a notice says so.
+- **Images**: two-up, swipe, onion skin and difference modes, with zoom and opacity. An SVG opens as its rendering and adds **Source**, its line diff with find and copy, because scripts, links and text (Lenz loads no fonts) draw nothing; an SVG that cannot be drawn shows its text with the reason. A comparison is called identical only when its bytes are.
 - **Archives as folders**: a changed `.zip` or tarball (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`, `.tar.zst`) is listed as a folder of the files that changed inside it, each with its own comparison. Archives inside archives open too. RAR is shown as a binary file.
 - **Folders**: a folder heading in Files collapses and expands with its arrow; archives start collapsed with their file count. A click on a folder's name shows its **Folder Summary**: the folder's changed files with the lines each added and removed.
 - **Scrollbars**: each Side, the unified pane, each Merge View pane and the Markdown preview has an IntelliJ-style scrollbar: drag the thumb, click the track to page, and click a coloured mark to go there. Marks show unresolved conflicts, the current Change Block, find matches and the other Change Blocks, the most important winning where they meet; the preview's has no marks. The terminal app draws it as one column; see [terminal differences](docs/tui.md#differences-from-the-gui).
@@ -146,18 +156,24 @@ for memory, workload scope and unverified platforms.
 
 Builds for macOS (Apple Silicon) and Linux (x86_64, aarch64) are on the [GitHub Releases page](https://github.com/aantoniadis/lenz/releases); the current one is a beta.
 
-- **Homebrew** (macOS arm64, Linux): `brew install aantoniadis/lenz/lenz`, from the tap's formula (`packaging/homebrew/lenz.rb`).
+- **Homebrew** (macOS arm64, Linux): `brew install aantoniadis/lenz/lenz`, from the tap's formula (`packaging/homebrew/lenz.rb`). On macOS the formula keeps `Lenz.app` in its own prefix; for Launchpad and Spotlight, link it into `/Applications` (the link follows upgrades; remove it after `brew uninstall`):
+
+  ```sh
+  ln -s "$(brew --prefix lenz)/Lenz.app" /Applications/Lenz.app
+  ```
 - **Arch Linux**: `packaging/aur/PKGBUILD` builds `lenz-bin` from the release tarball: `curl -LO https://raw.githubusercontent.com/aantoniadis/lenz/main/packaging/aur/PKGBUILD && makepkg -si`. It will be submitted to the AUR as `lenz-bin` once account registration there reopens.
 - **Tarball**: `lenz-<version>-<target>.tar.gz` from the [releases](https://github.com/aantoniadis/lenz/releases) holds `lenz`, `lenz-code`, `lenz-code-tui`, `lenz-diff`, `lenz-diff-tui`, this README and the licences; put the five executables on your `PATH`, together. On macOS they are inside `Lenz.app` (so the Dock shows its icon), with a symlink into it for each: keep them with the bundle, or link to `Lenz.app/Contents/MacOS/<name>`.
 - **From source**: build the release package with `packaging/package.sh <version>` and put the five executables from `target/package/lenz-<version>-<target>/` on your `PATH`; see [Build](#build) for the system libraries.
 
 Every package installs all five executables; `lenz` finds the others beside it. Linux binaries need glibc 2.35 or later; the GUI also loads the system's libxkbcommon-x11, libxcb and Vulkan loader at runtime (Debian/Ubuntu: `libxkbcommon-x11-0 libxcb1 libvulkan1`), which desktop installations already have.
 
-Linux tarballs include the logo and two desktop entries, **Lenz Code** (`lenz.desktop`) and **Lenz Diff** (`lenz-diff.desktop`, which opens the repository chooser described below); the AUR and Linux Homebrew packages install them.
+Lenz runs the first `git` on its `PATH`, then one installed where an app started from the desktop cannot look: on macOS Homebrew's and MacPorts' prefixes and the Command Line Tools' own `git`, on Linux `/usr/local/bin` and Homebrew's `/home/linuxbrew/.linuxbrew/bin`. macOS's `/usr/bin/git` is Apple's stub and is only run when the Command Line Tools are installed, so an installed Homebrew git is used instead of asking for them; `LENZ_GIT` names an absolute path to run instead.
+
+Linux tarballs include the logo and two desktop entries, **Lenz Code** (`lenz.desktop`) and **Lenz Diff** (`lenz-diff.desktop`, which opens the comparison/repository chooser described below); the AUR and Linux Homebrew packages install them.
 
 ## Build
 
-Needs a stable Rust toolchain and git 2.30 or later at runtime.
+Needs a stable Rust toolchain and git 2.30 or later at runtime. Before git 2.35, `merge.conflictStyle=zdiff3` is refused by git itself, in its merges as in the Merge View and Re-open, which then show git's error.
 
 ### Command family
 
@@ -192,14 +208,14 @@ On Linux, gpui needs: `libxkbcommon-x11-dev libwayland-dev libfontconfig-dev lib
 `cargo build` makes bare executables. They work, but the Dock shows a generic icon while they start and quit, and the Lenz logo only once the window is up. For the logo throughout, build the release package, which puts all five executables in `Lenz.app`:
 
 ```sh
-packaging/package.sh 0.0.10
+packaging/package.sh 0.0.23
 ```
 
-The bundle is at `target/package/lenz-0.0.10-aarch64-apple-darwin/Lenz.app`, next to a symlink into it for each executable; the same folder is packed as `target/package/lenz-0.0.10-aarch64-apple-darwin.tar.gz`. `cargo build` does not update it: run the script again after changes. The argument is the bundle's version (Finder's Get Info) and goes into the file names; About shows the workspace version. It builds in `/tmp/lenz-dist` (set `CARGO_TARGET_DIR` to choose another folder outside your home): the shaders record their build folder, and no home folder may ship.
+The bundle is at `target/package/lenz-0.0.23-aarch64-apple-darwin/Lenz.app`, next to a symlink into it for each executable; the same folder is packed as `target/package/lenz-0.0.23-aarch64-apple-darwin.tar.gz`. `cargo build` does not update it: run the script again after changes. The argument is the bundle's version (Finder's Get Info) and goes into the file names; About shows the workspace version. It builds in `/tmp/lenz-dist` (set `CARGO_TARGET_DIR` to choose another folder outside your home): the shaders record their build folder, and no home folder may ship. The script creates that folder private (0700) and stops before building if it is a link, another account's, or writable by group or others.
 
 ```sh
-open target/package/lenz-0.0.10-aarch64-apple-darwin/Lenz.app                          # Lenz Code, as from Finder
-target/package/lenz-0.0.10-aarch64-apple-darwin/lenz diff path/to/left path/to/right  # a comparison
+open target/package/lenz-0.0.23-aarch64-apple-darwin/Lenz.app                          # Lenz Code, as from Finder
+target/package/lenz-0.0.23-aarch64-apple-darwin/lenz diff path/to/left path/to/right  # a comparison
 ```
 
 To install it, copy `Lenz.app` to `/Applications` and put symlinks to the five executables in `/Applications/Lenz.app/Contents/MacOS/` on your `PATH` (as the Homebrew formula does); launched through them, from a terminal or as a git difftool, it still shows the logo.
@@ -215,10 +231,12 @@ This is Diff's reference; Lenz Code usage is in the [Lenz Code guide](docs/code/
 | `lenz diff` | working tree vs index (unstaged changes), plus untracked files |
 | `lenz diff --staged` (or `--cached`) | index vs HEAD |
 | `lenz diff <rev>` | working tree vs `<rev>`, plus untracked files |
+| `lenz diff show <commit>` | that commit vs its first parent; root commits compare with the empty tree, merge commits use their first parent |
+| `lenz diff --new-comparison` | choose two files, two folders, or a repository |
 | `lenz diff A B`, `lenz diff A..B` | revision `A` vs revision `B` |
 | `lenz diff A...B` | merge base of `A` and `B` vs `B` |
 | `lenz diff ... -- <path>...` | only these paths (relative to the current directory) |
-| `lenz diff <left> <right>` | two files, or two directories paired by relative path (inside a repository, the files git lists, submodules and nested repositories included, ignored ones skipped; `.git` never compared) |
+| `lenz diff <left> <right>` | two files, or two directories paired by relative path (inside a repository, the files git lists, submodules and nested repositories included; files their `.gitignore` files or your own global excludes ignore are skipped, but never by a compared folder's `.git/info/exclude` or repository-local `core.excludesFile`, and a `.gitignore` that ignores itself is still compared; `.git` never compared) |
 | `lenz diff --no-index <left> <right>` | the same, even if an argument names a revision |
 
 Browsing the repository:
@@ -230,7 +248,7 @@ Browsing the repository:
 | `lenz diff pr [<number>\|<url>]` | a GitHub pull request, read-only (needs `gh`, run inside a clone) |
 | `lenz diff` in a repository without changes | the Repository Window on HEAD |
 
-In the Repository Window, a branch's right-click menu checks it out (a remote branch as a local branch tracking it), makes **New Branch from Here…** or compares it with the current branch; a tag's checks it out on a detached HEAD; another worktree's **Compare with Working Tree** compares the two folders. The command palette adds **New Branch…**, **Checkout Tag or Revision…** and **Show Changes Since Branch Start** (the working tree against where the current branch split from `main`, `master` or the remote's default branch). Local changes go along when git allows; otherwise **Smart Checkout** stashes and restores them and **Force Checkout** discards them after a second confirmation; untracked files in the way must be moved first. Unsaved edits in Lenz Diff must be saved or discarded before a checkout. Checkouts run git as your terminal would, hooks and filters included; nothing else does.
+In the Repository Window, a branch's right-click menu checks it out (a remote branch as a local branch tracking it), makes **New Branch from Here…** or compares it with the current branch; a tag's checks it out on a detached HEAD; another worktree's **Compare with Working Tree** compares the two folders. The command palette adds **New Branch…**, **Checkout Tag or Revision…** and **Show Changes Since Branch Start** (the working tree against where the current branch split from `main`, `master` or the remote's default branch). Local changes go along when git allows; otherwise **Smart Checkout** stashes and restores them and **Force Checkout** discards them after a second confirmation; untracked files in the way must be moved first. Unsaved edits in Lenz Diff must be saved or discarded before a checkout. Checkouts run git as your terminal would, hooks and filters included; nothing else does. Every other git command Lenz runs reads its log and ref output as UTF-8 whatever the repository's `i18n.logOutputEncoding` or `i18n.commitEncoding` says, and every one, Mark resolved, Re-open and the pull-request fetch included, runs no hooks and none of the programs the repository's own config names (filter, textconv and merge drivers, an fsmonitor hook, a signature verifier), also not in repositories nested inside it; Re-open writes git's own conflict markers. It never fetches the missing objects of a partial clone: a comparison, rename check or blame that needs an object not fetched yet fails with git's message until you fetch it yourself (this needs git 2.45 or later; older git refuses such a repository). A pull-request fetch is refused while the repository's own config sets proxy, TLS, cookie, credential, URL-rewrite, protocol or ssh settings, and a repository whose config names a driver or hook with `=` in its name, which Lenz cannot switch off, is refused outright.
 
 Resolving conflicts:
 
@@ -251,9 +269,11 @@ Options:
 - `--blame`: start with Blame Annotations on; `--line <n>`: open the first file at line `n` of the right Side.
 - `--about`: show version, platform and licence information without opening a comparison.
 
-**Outside a repository**, `lenz diff`, `lenz diff log`, `lenz diff merge` and `lenz diff pr` (and the same in `lenz diff --tui`) open a repository chooser instead of failing: recent repositories (those Lenz has saved a place for), a path field with Tab completion, and in the GUI **Browse…** (Ctrl+O) for the system folder dialog. Choosing one reruns the same command inside it; Esc quits with exit code `0`. Two files or folders still compare anywhere.
+**Outside a repository**, plain `lenz diff` offers **Compare Files**, **Compare Folders** and **Open Repository** (F1/F2/F3 or a click). The same chooser opens anywhere with `lenz diff --new-comparison`, or **☰ → New Comparison…** / Commands in an existing comparison. A new comparison opens in a separate window, or an independent terminal view; the current documents and drafts stay open. Enter compares the two paths; Tab switches fields and Ctrl+Space completes a path. The repository path uses Tab completion and can also select a recent repository. All path fields support Ctrl/Cmd+A, caret/word movement and deletion; the GUI supports clipboard paste and the terminal supports bracketed paste. GUI **Browse…** (Ctrl+O) selects the active path.
 
-Lenz stays in the foreground until its window closes. Exit codes: `0` on a normal close, or when there is nothing to show (it prints `no differences` and opens no window); `2` on bad arguments or startup errors (git missing or older than 2.30, `lenz diff --tui` outside a repository without an interactive terminal). `lenz diff merge <base> <local> <remote> <merged>` exits `0` only after **Done**, `1` when cancelled or closed, so `git mergetool` restores its backup.
+Repository workflows (`lenz diff log`, `lenz diff show <commit>`, `lenz diff merge`, `lenz diff pr`) started outside Git ask for a repository and retain the requested command. Choosing one reruns it there; Esc cancels with exit code `0`. Two files or folders still compare anywhere. `show` accepts a commit ID or revision, optional comparison options and `-- <path>…`; it shows committed bytes without including local edits or restoring a previous comparison.
+
+Lenz stays in the foreground until its window closes. Exit codes: `0` on a normal close, or when an ordinary Git comparison has nothing to show (it prints `no differences` and opens no window); identical file/folder comparisons and `show` of an empty commit retain a window with an empty result; `2` on bad arguments or startup errors (git missing or older than 2.30, `lenz diff --tui` outside a repository without an interactive terminal). `lenz diff merge <base> <local> <remote> <merged>` exits `0` only after **Done**, `1` when cancelled or closed, so `git mergetool` restores its backup.
 
 ### Settings and last position
 
@@ -291,7 +311,7 @@ Plain `lenz diff` and `lenz diff log` in a repository reopen where you left off:
 - Tab/Shift-Tab move focus between panes. Typing in the Files or Commits list searches it; Ctrl/Cmd+F searches the focused text side, Ctrl/Cmd+Shift+F the whole Change Set.
 - **Back / Forward** (◀ ▶, Alt+Left/Right, mouse back/forward buttons) return to the previous commit, branch, filter or file history and reopen its file and line; `[` / `]` move between files.
 - In **Focus**, commit details sit below the file tree and diff in a full-width panel. **Commit** in the bottom bar, or **Show / hide commit message** in Commands, hides and restores it. Files can be hidden independently.
-- Drag pane dividers to resize; **Reset pane sizes** restores the layout.
+- Drag pane dividers to resize; **Reset pane sizes** restores the layout. Narrow GUI Overviews shrink navigation panes to reserve reading space, keeping the preferred sizes for a wider window. Merge finish controls remain available in narrow windows, and recovery warnings wrap.
 - `o` opens the file in your editor at the line (`$VISUAL`/`$EDITOR`, or `LENZ_EDITOR` when those are wrappers), `shift-o` in the default app.
 - Long histories load in steps of about 50,000 commits beyond what you can see; scrolling, End, searches and filters load more.
 - In a pull request, **PR details** (`d`) shows the description, discussion, review summaries and inline review threads.
@@ -345,7 +365,7 @@ In editable text comparisons **Undo** (Ctrl/Cmd+Z), **Redo** (Ctrl/Cmd+Shift+Z) 
 
 A click on a folder heading's ▾/▸ arrow collapses or expands it, and a click on its name shows the Folder Summary in place of the comparison. In Files, the arrow keys walk files and headings like a tree: on a heading Left collapses and Right expands it, and Left on a file moves to its folder's heading. In the summary, Enter opens the selected file, Left/Right collapse or expand the folder, and Esc returns to the file behind it. `]`/`[` and n/p skip files in collapsed folders. The command palette has **Show folder summary**, **Collapse folder**, **Expand folder**, **Expand all folders** and **Collapse all archives**. An archive starts collapsed; once you expand one it stays expanded while you browse other commits. Line counts are computed in the background, a few files at a time, as `git diff --numstat` counts them; binary files show their sizes and files over 20 MiB say "large file".
 
-Files inside an archive are read-only: Apply, Revert hunk and Discard are refused with the reason, and **Show file history** follows the archive itself. Lenz reads archives in memory and never extracts them to disk. Members are compared by size and CRC-32 (zip's own record). An archive over 512 MiB, or one that cannot be read, stays one binary file with a note saying why. So does one whose files are all unchanged and only its packing differs.
+Files inside an archive are read-only: Apply, Revert hunk and Discard are refused with the reason, and **Show file history** follows the archive itself. Lenz reads archives in memory and never extracts them to disk. Members are compared by size and a SHA-256 of their content, so every tar member and every Zstd frame is read. Between two zips of at most 64 MiB each, a file whose compression method, flags, sizes, CRC-32 and stored (compressed) bytes are all the same on both sides is unchanged without being decompressed; every other zip member is decompressed (which also checks its CRC-32) and hashed, so an unchanged member with a damaged CRC-32 goes unnoticed. An archive over 512 MiB, or one that cannot be read, stays one binary file with a note saying why. So does one whose files are all unchanged and only its packing differs, and one whose files Lenz cannot list as GNU tar, bsdtar or UnZip would extract them: headers that name a file two ways, a path listed twice, a file named outside the archive, a tar entry type Lenz does not read, a PAX sparse file, data stored on a directory, link, device or FIFO entry (extractors read it as further members), a PAX size that is not a plain number, a name holding a NUL, an encrypted zip member or one compressed in a way Lenz does not read, or a changed zip member that cannot be read.
 
 ### Merging
 
@@ -383,6 +403,32 @@ git config --global mergetool.keepBackup false   # optional: Lenz writes atomica
 
 ## Performance
 
+The [Code branch-picker audit](docs/research/code-branch-picker-audit.md) measures
+usable cached choices at **20.635 → 1.407 ms** on 1,000 generated branches and
+three worktrees. Its first PTY frame takes **0.727 → 1.354 ms**, now containing
+choices instead of a loading placeholder. Six editor pairs retain a small TUI
+key-feedback tendency of about **0.04 ms**; the user accepted this measured
+tradeoff on 2026-11-10.
+The report includes the passing full gate/native replays, normal release builds,
+repeated samples, a reverted cache-layout experiment and native-platform limits.
+
+The [0.0.14 validation](docs/research/release-0.0.14-validation.md) passes the fresh
+combined-tree gate and full suite: **133 cases, 394 metrics, no skipped workloads**.
+Three alternating normal-release pairs measured large-comparison view construction
+at **3.96 → 2.16 ms** after reducing allocations. Five startup and six frontend
+interaction pairs found overlapping Find-scroll and resize ranges; those endpoints
+remain inconclusive. The baseline already includes PRs 49–52, rather than pristine
+0.0.13. The report records actual stress duration, memory, retained failures and
+native-platform limits.
+
+Archive editing checks on Linux listed a 5,000-file ZIP in **3.32 ms** and gzip/Zstd TARs in
+**17.10 / 16.55 ms**; replacing two small members alongside 8 MiB of untouched payload took
+**22.35 / 125.21 / 140.50 ms**. These are completed codec operations, excluding disk writes and
+frontend painting. A 21-second rewrite/cache stress checked 170 cycles. Ordinary startup and input
+repeats found no consistent latency regression; terminal search used about 0.6 MiB more RSS, mostly
+file-backed pages. See the [archive and recovery checks](docs/optimization-notebook.md#archive-editing-and-recovery-checks-2026-11-09)
+for fixtures, memory, repeat results and limits.
+
 The [integrated-editor Linux validation](docs/research/code-integrated-editor-linux-validation.md)
 records a fresh complete CI pass, 62 available-provider checks, native SQL/X11/PTY safety and the
 completed Linux measurement campaign. Final 180-second Lenz Code PTY settled RSS was **45.70→40.00 MiB**;
@@ -390,7 +436,7 @@ ordinary GUI editing repeats measured **162.69→207.71 MiB** settled RSS. Cache
 other memory/throughput costs are detailed in the report. **The single cost decision remains pending**;
 this is not complete native release acceptance. Editing on macOS (window and terminal) is enabled from 0.0.8.
 
-The [final Linux validation on 2026-10-21](docs/release-validation.md) passed the
+The [earlier Linux validation on 2026-10-21](docs/release-validation.md) passed the
 full suite: **133 cases, 394 metrics**, plus ten live language-server lifecycle
 checks. Fresh paired runs measured Lenz Code wheel feedback at **26.00→26.01 ms**
 and Rails recovery after lost watcher events at **6.79→0.95 seconds**. The report
@@ -466,6 +512,11 @@ Lazy library browsing revealed a 1,000-file library in 0.811 ms in the shared co
 not a native macOS guarantee. See [library browsing validation](docs/code/performance.md#dependency-libraries-in-the-explorer--2026-10-21)
 for startup, interaction, cancellation, memory and test limits.
 
+Journey-input checks retained 20-second long-search runs: GUI feedback was 22.82→23.36 ms and terminal
+feedback 0.268→0.319 ms. Code TUI retained about 0.6–0.8 MiB more file-backed RSS, with anonymous RSS
+unchanged; GUI memory ranges overlapped on repeat. These are feedback and residency measurements,
+not completed-frame times or leak proof. See the [journey validation notes](docs/optimization-notebook.md#journey-input-and-comparison-entry-2026-11-08).
+
 ### Diff and merge
 
 Linux desktop, release builds, medians of three warm launches; the GUI on a software-rendered private X display, the TUI in a 120×36 pseudo-terminal:
@@ -480,7 +531,11 @@ Linux desktop, release builds, medians of three warm launches; the GUI on a soft
 | Page Down in a 100k-line diff | 15.6 ms | 0.6 ms |
 | Move through the repository log | 8.6 ms | 0.3 ms |
 
-Opening times run to the GUI's first paint and the TUI's first comparison text; memory is RSS three seconds later (on macOS, the physical footprint). Interaction times are first feedback after the key, not a completed frame on a physical display. Syntax highlighting finishes after first content (0.5–0.9 s on 100k-line inputs in the TUI). On an Apple M2 Mac, GUI first paint is 231–401 ms; see the [macOS results](docs/performance.md#macos).
+Opening times run to the GUI's first paint and the TUI's first comparison text; memory is RSS three seconds later (on macOS, the physical footprint). Interaction times are first feedback after the key, not a completed frame on a physical display. Syntax highlighting finishes after first content (0.5–0.9 s on 100k-line inputs in the TUI); a file whose parse and highlighting would take longer than 10 s is shown as plain text instead, with a note in the status line (in Lenz Code, under Problems). On an Apple M2 Mac, GUI first paint is 231–401 ms; see the [macOS results](docs/performance.md#macos).
+
+Folder comparison now streams file contents for equality and rename detection, retaining at most 1 MiB of tiny-file bodies. In a paired Linux release probe with 128 MiB of renamed files, core listing time fell from 232 to 75 ms and peak process RSS from 138.5 to 7.0 MiB. A 31-pair small-folder repeat found overlapping timings. These numbers exclude frontend painting and archive expansion; see the [folder comparison measurements](docs/optimization-notebook.md#review-fixes-after-0013--2026-11-09).
+
+Opening a changed archive as a folder compares its files by content. 0.0.18 made that content a SHA-256 of each member's extracted bytes, rather than the archive's stored CRC-32: a 5,000 × 2 KiB zip pair went from **3.4 to 46.9 ms** and a 32 × 2 MiB pair from **2.9 to 113.2 ms**, with tars 1.4–2.8× slower. Two zips, each at most 64 MiB, now skip members whose stored bytes match: **45.2 → 4.5 ms** and **111.8 → 7.2 ms** in six alternating pairs. A larger pair is listed one archive at a time as before, so it holds half the memory: two 200 MiB zips took 236 ms and 199 MiB of peak growth, against 71 ms and 399 MiB if paired. Small-member tars went 37.8 → 34.2 ms (gzip) and 29.7 → 25.6 ms (Zstd). A zip pair repacked at another level, where every member is still decompressed, stays at 43 and 135 ms. Other 0.0.18 hardening costs: Lenz Code's PostgreSQL syntax check about **1 → 30 µs** (a 256 MiB-stack parser thread), folder listing inside Git **+2.3 ms** per repository level, and loading an SVG comparison **+2.4 ms** to keep its source. These are core timings without frontends; see the [archive and hardening measurements](docs/optimization-notebook.md#0018-hardening-costs-and-zip-member-comparison--2026-11-20).
 
 In a shared-core release fixture with 5,001 branches and 25 worktrees, incremental loading reduced first-comparison readiness from 114 to 10 ms and first-branch readiness from 105 to 35 ms (six samples). The sidebar initially retains 20 branches and offers **Load more**; worktree details finish in the background. These timings exclude frontend painting and GitHub access; see the [repository loading measurements](docs/optimization-notebook.md#2026-10-17-incremental-repository-loading-and-pr-reading).
 
@@ -574,6 +629,13 @@ with ordinary directory updates **0.58→0.50 seconds**. The existing saved-inde
 and explicit rebuild remains available in both frontends. Cold server indexing remains around **11–12 seconds**;
 the report includes repeat measurements, the small retained-digest memory cost and unverified native macOS behavior.
 
+The [editor Find update](docs/research/editor-feedback-setup-search-validation.md) measures completed hot
+scans over 100,000 ASCII lines at **7.17→1.97 ms** for an absent literal and **16.19→1.48 ms** for a sparse
+case-sensitive literal. Dense, Unicode and regex cases remain comparable in three normal-release process
+pairs. These are matcher/collection timings, excluding document loading and frontend presentation.
+Three standalone TUI release pairs measure completed Find and reveal at **9.88→3.45 ms** on the
+100,000-line fixture, with exact selection, resize, terminal-restoration and sustained-work checks.
+
 See the [performance overview](docs/performance.md) for method and accepted costs, and the [benchmark guide](docs/benchmarking.md) to run the suite yourself.
 
 ## Documentation
@@ -598,6 +660,13 @@ See the [performance overview](docs/performance.md) for method and accepted cost
 ## Contributing
 
 Checks run locally: `scripts/ci-local.sh` runs clippy with warnings as errors, the panic-site ratchet, every test suite and the release size check (`--old-git` adds the git 2.30 tests in podman or docker). Enable it before every push with `git config core.hooksPath .githooks`. `python3 scripts/capture-screenshots.py --xvfb /path/to/Xvfb` regenerates the Diff screenshots (Catppuccin Mocha) on a private display. Add `--reader target/release/lenz-code --only reader-code reader-markdown` to capture Lenz Code using disposable demo files.
+
+On Linux, local CI runs under a child-reaping supervisor so detached tools cannot
+accumulate exited processes when the container's PID 1 does not reap them. Fixture
+Git commands keep maintenance synchronous. For an individual validation command,
+use `python3 scripts/reap-children.py -- <command>`. It reports collected orphaned
+children and fails if lingering processes require forced cleanup; see the
+[process cleanup guide](docs/benchmarking.md#validation-process-cleanup).
 
 ## Licence
 

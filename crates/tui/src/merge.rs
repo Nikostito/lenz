@@ -37,7 +37,7 @@ pub struct Merger {
     files_search:lenz::pane_search::PaneSearch,files_search_origin:Option<usize>,
     diff: Option<crate::app::App>,
     diff_path: Option<(String, bool, bool)>,
-    menu: Option<usize>,menu_query:String,
+    menu: Option<usize>,menu_query:String,menu_cursor:lenz::field_edit::Cursor,
     pub(crate) command_palette: Option<lenz::palette::Palette>,
     files_menu_target:Option<(usize,String)>,
     /// The change block a pointer menu is for: (file index, block, the current change before the menu).
@@ -73,7 +73,7 @@ impl Merger {
             new_view: None,
             files_search:Default::default(),files_search_origin:None,diff: None,
             diff_path: None,
-            menu: None,menu_query:String::new(),command_palette:None,files_menu_target:None,block_menu_target:None,pending_files_action:None,
+            menu: None,menu_query:String::new(),menu_cursor:Default::default(),command_palette:None,files_menu_target:None,block_menu_target:None,pending_files_action:None,
             menu_first:0,menu_area:Rect::default(),files_area:Rect::default(),text_area:Rect::default(),files_focused:false,file_scroll:0,last_file:None,
             toolbar:Default::default(),help:None,message:None,about:None,report_request:Default::default(),
             horizontal:[0;3],columns:[None;3],horizontal_version:None,
@@ -243,7 +243,7 @@ impl Merger {
             m.current=previous.filter(|&i|i<m.m.blocks().len());
         }
     }
-    fn open_menu(&mut self){self.menu_query.clear();self.menu=Some(0);}
+    fn open_menu(&mut self){self.menu_cursor=Default::default();self.menu_query.clear();self.menu=Some(0);}
     /// The file list's pointer menu: open, copy path, then the list actions.
     fn menu_labels(&self)->Vec<(String,Option<String>)>{
         if let Some((_,block,_))=self.block_menu_target {
@@ -417,8 +417,22 @@ impl Merger {
             return true;
         }
         if self.resize_input(&event){return true;}
+        // Text controls own copy and editing before Ctrl+C's global quit binding.
+        if self.help.is_none()&&self.about.is_none()&&self.message.is_none()&&self.command_palette.is_none()&&!self.toolbar.menu_open()&&!self.workspace.confirming() {
+            let command=match &event {Event::Key(k) if k.kind!=KeyEventKind::Release=>lenz_terminal_ui::command(*k),Event::Paste(s)=>Some(lenz::field_edit::Command::Insert(s.clone())),_=>None};
+            if let Some(command)=command {
+                let out=if self.menu.is_some(){
+                    let out=self.menu_cursor.execute_limited(&mut self.menu_query,command,4096);
+                    if out.changed {self.menu=Some(self.menu_matches().first().copied().unwrap_or(0));}Some(out)
+                }else if let Some(FileView::Merge(m))=&mut self.workspace.file {
+                    if m.ask.is_none()&&m.find_editing(){Some(m.edit_find(command))}else{None}
+                }else{None};
+                if let Some(out)=out {if let Some(text)=out.copy{let _=crate::clipboard::copy(&text);}return true;}
+            }
+        }
         let list_copy=matches!(event,Event::Key(k)if k.kind!=KeyEventKind::Release&&k.modifiers==KeyModifiers::CONTROL&&k.code==KeyCode::Char('c'))&&self.files_focused&&self.about.is_none()&&self.help.is_none()&&self.message.is_none()&&self.menu.is_none()&&!self.workspace.confirming()&&!matches!(&self.workspace.file,Some(FileView::Merge(m))if m.ask.is_some()||m.find_editing())&&!matches!(&self.workspace.file,Some(FileView::Picker(p))if p.ask.is_some())&&self.diff.as_ref().is_none_or(|a|!a.modal_input());
-        let quit=!list_copy&&matches!(event,Event::Key(k)if k.kind!=KeyEventKind::Release&&k.modifiers.contains(KeyModifiers::CONTROL)&&matches!(k.code,KeyCode::Char('q'|'c')));
+        let palette_copy=self.command_palette.is_some()&&self.help.is_none()&&self.about.is_none()&&self.message.is_none()&&matches!(event,Event::Key(k)if k.kind!=KeyEventKind::Release&&k.modifiers==KeyModifiers::CONTROL&&k.code==KeyCode::Char('c'));
+        let quit=!list_copy&&!palette_copy&&matches!(event,Event::Key(k)if k.kind!=KeyEventKind::Release&&k.modifiers.contains(KeyModifiers::CONTROL)&&matches!(k.code,KeyCode::Char('q'|'c')));
         if quit && self.guard_preview_edits() { return true; }
         if !quit && let Some(about)=&mut self.about {
             if let Event::Resize(w,h)=event {self.width=w;self.height=h;}
@@ -451,6 +465,7 @@ impl Merger {
             match crate::palette::handle(p,&event,crate::palette::rect(Rect::new(0,0,self.width,self.height),p)) {
                 Input::Ignored=>{},
                 Input::Handled=>return true,
+                Input::Copy(text)=>{let _=crate::clipboard::copy(&text);return true;}
                 Input::Close=>{self.command_palette=None;return true;}
                 Input::Done(Outcome::Run(action))=>{self.run_action(action);self.quit=self.workspace.quit;return true;}
                 Input::Done(Outcome::Disabled(why))=>{self.workspace.notice=Some(why.into_owned());return true;}
@@ -1176,6 +1191,10 @@ impl Merger {
             ),
             bands[2],
         );
+        if let Some(FileView::Merge(m))=&self.workspace.file && m.ask.is_none()&&m.error.is_none()&&m.find_editing() {
+            let row=Rect::new(bands[2].x,bands[2].y+u16::from(bands[2].height>0),bands[2].width,bands[2].height.saturating_sub(1).min(1));
+            lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:m.find_query().unwrap_or_default(),cursor:m.find_cursor(),area:row,active:true},crate::chrome::style_with(palette),crate::chrome::style_with(palette).bg(crate::chrome::color(palette.selected_bg)));
+        }
         self.resizer.draw(frame.buffer_mut(),palette);
         if let Some(app)=&mut self.diff{app.popup_area=full;crate::render::draw_popup(app,frame);crate::palette::draw(app,frame);app.draw_context(frame);}
         self.toolbar.draw_menu_with_theme(frame,palette);
@@ -1192,10 +1211,19 @@ impl Merger {
         let width=area.width.min(78);let height=area.height.min(matches.len().max(1)as u16+2);let visible=usize::from(height.saturating_sub(2));
         self.menu_first=selected.saturating_sub(visible.saturating_sub(1));
         let rect=Rect::new(area.x+(area.width-width)/2,area.y+(area.height-height)/2,width,height);self.menu_area=rect;
-        let mut lines:Vec<_>=matches.iter().skip(self.menu_first).take(visible).map(|&index|{let(label,reason)=&labels[index];Line::from(format!("{} {}{}",if index==at{">"}else{" "},label,reason.as_ref().map(|r|format!(" — {r}")).unwrap_or_default()))}).collect();
-        if lines.is_empty(){lines.push(Line::from("No matching commands"));}
-        let title=if self.block_menu_target.is_some(){format!("Change · {}",self.menu_query)}else if let Some((_,path))=&self.files_menu_target{format!("Files: {} · {}",clean(path),self.menu_query)}else{format!("Merge commands: {}",if self.menu_query.is_empty(){"type to filter"}else{&self.menu_query})};
-        frame.render_widget(Clear,rect);frame.render_widget(Paragraph::new(lines).style(crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg))).block(Block::default().borders(Borders::ALL).title(format!("F2 details · {title}"))),rect);
+        // the chosen row is highlighted like every other menu's; a row that cannot run is dim with its reason
+        let base=crate::chrome::style_with(palette).bg(crate::chrome::color(palette.status_bg));
+        let row_style=|index:usize|{let s=if index==at{base.bg(crate::chrome::color(palette.menu_selected(palette.status_bg)))}else{base};if labels[index].1.is_some(){s.fg(crate::chrome::color(palette.dim))}else{s}};
+        let mut lines:Vec<_>=matches.iter().skip(self.menu_first).take(visible).map(|&index|{let(label,reason)=&labels[index];Line::styled(format!("{}{}{}",if index==at{"› "}else{"  "},label,reason.as_ref().map(|r|format!(" — {r}")).unwrap_or_default()),row_style(index))}).collect();
+        if lines.is_empty(){lines.push(Line::styled("No matching commands",base.fg(crate::chrome::color(palette.dim))));}
+        let title=if rect.width<12{"› "}else if rect.width<32{"Filter: "}else if self.block_menu_target.is_some(){"Change filter: "}else if self.files_menu_target.is_some(){"File actions: "}else{"Merge commands: "};
+        frame.render_widget(Clear,rect);frame.render_widget(Paragraph::new(lines).style(base).block(crate::chrome::pane(title,palette,true)),rect);
+        lenz_terminal_ui::scroll_thumb(frame.buffer_mut(),rect.right()-1,rect.y+1,visible as u16,(matches.len(),self.menu_first,visible),base);
+        let offset=(title.len() as u16+1).min(rect.width);
+        let field=Rect::new(rect.x+offset,rect.y,rect.width.saturating_sub(offset+1),1);
+        lenz_terminal_ui::paint(frame,lenz_terminal_ui::Field{text:&self.menu_query,cursor:self.menu_cursor,area:field,active:true},crate::chrome::style_with(palette),crate::chrome::style_with(palette).bg(crate::chrome::color(palette.selected_bg)));
+        if self.menu_query.is_empty()&&field.width>0{frame.buffer_mut().set_stringn(field.x,field.y,"type to filter",usize::from(field.width),crate::chrome::style_with(palette).fg(crate::chrome::color(palette.dim)));}
+
     }
 
 }
@@ -1243,7 +1271,7 @@ impl Merger {
             },
             Action::Help(HelpAction::Shortcuts) => self.help = Some(0),
             Action::Help(HelpAction::Settings) => self.workspace.notice = Some(crate::palette::open_settings()),
-            Action::Comparison(_) | Action::Interaction(_) | Action::Edit(_) | Action::File(_) | Action::Image(_) | Action::Layout(_)
+            Action::NewComparison | Action::Comparison(_) | Action::Interaction(_) | Action::Edit(_) | Action::File(_) | Action::Image(_) | Action::Layout(_)
             | Action::Help(HelpAction::DiffOptions) | Action::Repository(_) | Action::Pr(_) | Action::Folder(_) => match &mut self.diff {
                 Some(app) => app.run_action(action),
                 None => self.workspace.notice = Some("No comparison here".into()),
@@ -1262,7 +1290,7 @@ impl lenz::catalog::Availability for Merger {
             Action::Pick(act) => match &self.workspace.file { Some(FileView::Picker(p)) => p.disabled(act).map(Cow::Borrowed), _ => Some(Cow::Borrowed("Only in the Version Picker")) },
             Action::Interaction(I::ChangeTheme | I::About | I::ResetPaneSizes | I::ReportLastError) | Action::Help(HelpAction::Shortcuts | HelpAction::Settings) => None,
             Action::Interaction(I::FindCase | I::FindWord | I::FindRegex) if let Some(FileView::Merge(m)) = &self.workspace.file => (!m.find_editing()).then_some(Cow::Borrowed("No find is open")),
-            Action::Comparison(_) | Action::Interaction(_) | Action::Edit(_) | Action::File(_) | Action::Image(_) | Action::Layout(_)
+            Action::NewComparison | Action::Comparison(_) | Action::Interaction(_) | Action::Edit(_) | Action::File(_) | Action::Image(_) | Action::Layout(_)
             | Action::Help(HelpAction::DiffOptions) | Action::Repository(_) | Action::Pr(_) | Action::Folder(_) =>
                 self.diff.as_ref().map_or(Some(Cow::Borrowed("No comparison here")), |app| lenz::catalog::Availability::disabled(app, action)),
         }
@@ -1298,14 +1326,13 @@ fn styled_source(
     use unicode_width::UnicodeWidthStr;
     let mut x = 0;
     let mut out = Vec::new();
-    for (byte, g) in s
-        .trim_end_matches(['\r', '\n'])
-        .grapheme_indices(true)
-        .take(lenz::document::LONG_LINE)
-    {
+    let line = s.trim_end_matches(['\r', '\n']);
+    let cut = lenz::document::displayed_bytes(line);
+    for (byte, g) in line.get(..cut).unwrap_or(line).grapheme_indices(true) {
         let display = if g=="\t"{"    ".into()}else{clean(g)};
         let w = display.width().max(1);
         if x + w > offset + width {
+            x = offset + width; // the pane is full
             break;
         }
         if x >= offset {
@@ -1333,6 +1360,11 @@ fn styled_source(
         }
         x += w;
     }
+    // a cut line ends with how much it leaves out, as in the GUI
+    if x < offset + width && let Some(note) = lenz::document::cut_note(line, cut) {
+        let shown: String = note.chars().skip(offset.saturating_sub(x)).take(offset + width - x.max(offset)).collect();
+        out.push(Span::styled(shown, base.fg(crate::chrome::color(palette.dim))));
+    }
     out
 }
 fn clipped(s: &str, offset: usize, width: usize) -> String {
@@ -1340,20 +1372,22 @@ fn clipped(s: &str, offset: usize, width: usize) -> String {
     use unicode_width::UnicodeWidthStr;
     let mut x = 0;
     let mut out = String::new();
-    for g in s
-        .trim_end_matches(['\r', '\n'])
-        .graphemes(true)
-        .take(lenz::document::LONG_LINE)
-    {
+    let line = s.trim_end_matches(['\r', '\n']);
+    let cut = lenz::document::displayed_bytes(line);
+    for g in line.get(..cut).unwrap_or(line).graphemes(true) {
         let g = clean(g);
         let w = g.width();
         if x + w > offset + width {
+            x = offset + width; // the pane is full
             break;
         }
         if x >= offset {
             out.push_str(&g);
         }
         x += w;
+    }
+    if x < offset + width && let Some(note) = lenz::document::cut_note(line, cut) {
+        out.extend(note.chars().skip(offset.saturating_sub(x)).take(offset + width - x.max(offset)));
     }
     out
 }
@@ -1384,12 +1418,38 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+
+    #[test]
+    fn a_cut_line_ends_with_its_note_in_every_merge_pane() {
+        let long = format!("{}changed\n", "x".repeat(lenz::document::LONG_LINE));
+        let note = "  … 7 more characters";
+        let offset = lenz::document::LONG_LINE - 10;
+        let palette = crate::chrome::palette();
+        let spans: String = styled_source(palette, &long, offset, 40, Style::default(), &[], &[], None, &[]).iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(spans, format!("{}{note}", "x".repeat(10)));
+        assert_eq!(clipped(&long, offset, 40), format!("{}{note}", "x".repeat(10)));
+        assert_eq!(clipped(&long, offset, 15), format!("{}  … 7", "x".repeat(10)), "cut to the pane");
+        assert_eq!(clipped(&long, 0, 5), "xxxxx", "a full pane shows no note");
+        assert_eq!(clipped("short\n", 0, 40), "short");
+    }
     fn key(app: &mut Merger, code: KeyCode, mods: KeyModifiers) {
         app.handle(Event::Key(KeyEvent::new(code, mods)));
     }
     /// The window's merge fixture (crates/app/src/ui/scrollbar_tests.rs `merge`): 200 lines, Conflicts at lines 5 and
     /// 150; each pane's strip is its last text column, left of the border it keeps, and drags, pages and marks as the
     /// window's `gui_merge_scrollbars_mark_conflicts` and `gui_merge_scrollbar_drag_and_page_move_each_pane` assert.
+    #[test]
+    fn merge_palette_text_owns_paste_copy_and_cut_above_existing_find(){
+        let (_dir,mut app)=open_fixture([b"a\n",b"ours\n",b"theirs\n"]);
+        if let Some(FileView::Merge(m))=&mut app.workspace.file{m.begin_find(Default::default());m.type_find("protected");}
+        app.open_palette();app.handle(Event::Paste("commands".into()));
+        assert_eq!(app.command_palette.as_ref().unwrap().query(),"commands");
+        key(&mut app,KeyCode::Home,KeyModifiers::NONE);key(&mut app,KeyCode::Right,KeyModifiers::SHIFT);
+        key(&mut app,KeyCode::Char('c'),KeyModifiers::CONTROL);assert!(!app.quit);
+        key(&mut app,KeyCode::Char('x'),KeyModifiers::CONTROL);
+        assert_eq!(app.command_palette.as_ref().unwrap().query(),"ommands");
+        if let Some(FileView::Merge(m))=&app.workspace.file{assert_eq!(m.find_query(),Some("protected"));assert!(!m.dirty);}else{panic!("merge missing");}
+    }
     #[test]
     fn merge_border_columns_carry_scrollbars() {
         let text=|who:&str|(0..200).map(|i|if i==5||i==150{format!("{who} {i}\n")}else{format!("line {i}\n")}).collect::<String>();
@@ -1809,6 +1869,27 @@ mod tests {
             .map(|c| c.symbol())
             .collect()
     }
+    #[test]
+    fn merge_footer_says_when_a_panes_highlighting_stopped_at_its_time_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for (name, text) in [("base.rs", "fn a() {}\n"), ("ours.rs", "fn b() {}\n"), ("theirs.rs", "fn c() {}\n")] { std::fs::write(d.join(name), text).unwrap(); }
+        let req = lenz::cli::parse(&["merge", "base.rs", "ours.rs", "theirs.rs", "result.rs"].map(str::to_owned), d).unwrap();
+        let mut app = Merger::open(req, d.into());
+        for _ in 0..5000 { app.poll(); if !app.busy() { break; } std::thread::sleep(std::time::Duration::from_millis(1)); }
+        let wide = |app: &mut Merger| {
+            let mut terminal = Terminal::new(TestBackend::new(240, 18)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>()
+        };
+        assert!(!wide(&mut app).contains("Syntax limit"));
+        let Some(FileView::Merge(m)) = &mut app.workspace.file else { panic!("a Merge View") };
+        m.parsed[2] = Some(std::sync::Arc::new(lenz::highlight::Parsed::limited_plain("fn c() {}\n")));
+        let shown = wide(&mut app);
+        assert!(shown.contains(lenz::highlight::LIMIT_NOTE), "{shown}");
+        assert!(!d.join("result.rs").exists());
+    }
+
     #[test]
     fn merge_render_handles_tiny_terminal_sizes() {
         let (_dir,mut app)=open_fixture([b"base\n",b"ours\n",b"theirs\n"]);

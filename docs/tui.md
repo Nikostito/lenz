@@ -39,10 +39,28 @@ Undo step, and the project's format-on-save formats before Save writes; see the
 configured ruff or black instead (Pyright does not format), in both adapters alike; Server Details names the Python
 environment Pyright uses ([Pyright](code/providers.md#pyright-python)).
 
+**Restricted mode** works alike in both adapters: until you trust an opened folder, Lenz Code runs no code from it.
+Language servers that run a project's code (rust-analyzer, typescript-language-server, Ruby LSP, JDT LS, Kotlin LSP,
+gopls) and the project's own programs (typescript-go's `node_modules/.bin/tsc`, a configured Python environment's
+interpreter and formatters, erb_lint, haml-lint) stay off with the status "Off until you trust this folder". The first
+time one of them would start in a folder never asked about, the shared folder-trust dialog asks once, naming the folder
+and what would run: **Stay Restricted**, **Trust** or **Trust Parent Folder** (not offered for the file system root, the
+home folder or a folder holding it, a folder every account can write to, or another account's folder). Escape stays
+restricted; Tab and Shift+Tab move the focus, and Enter right after takes the focused choice (any other key, text or
+paste puts the focus back on Stay Restricted, so typing into the dialog never trusts); a click on a button works too.
+The GUI also takes Alt+T and Alt+P; the terminal does not, since a terminal without the kitty keyboard protocol sends
+Alt+T as Escape then T (a parity difference in shortcuts only). It asks only about the opened folder: a tool held back
+outside it, or in a folder inside it answered on its own, stays restricted silently. The dialog takes every key before
+the editor, wraps and scrolls in a narrow terminal (Up/Down, Page keys, Home/End), and the answer is remembered, and
+followed by every open window. A **Restricted** item in the status bar (both adapters) and **Folder Trust…** in the
+Language Servers menu, F10 and Find Action open it again; **Trust Project Tools in This Folder** and **Stop Trusting
+Project Tools in This Folder** stay in the same menus ([folder
+trust](code/providers.md#project-tools-and-folder-trust)).
+
 The editor's gutter marks the draft's changes against a named baseline in both adapters: **M** (blue) for a modified
 line, **A** (green) for an added one and **D** where lines were deleted above, each a letter and not only a colour.
 Tracked files compare with HEAD (unsaved edits included, so Save keeps the marks), new files say they are new, and
-files outside Git compare with the last save; the status bar and Status details name the baseline. See the
+files outside Git compare with the last save; Status details names the baseline. See the
 [terminal editor guide](code/tui.md) for the cells, the timing and the limits.
 
 Find in the current draft also replaces: both adapters open find with Ctrl+F, Tab moves to the replacement row,
@@ -74,10 +92,11 @@ other files are not changed. There is no default shortcut; the menus are the rou
 
 **Delete** while the file tree is focused opens the same confirmation as **Delete in Explorer…**.
 It moves the highlighted file or folder to the freedesktop trash of its file system (the home
-trash, or the mount's own `.Trash` folder), after a confirmation that says what goes and how many open tabs close;
-**Restore Last Deleted Entry** puts this session's latest deletion back without replacing anything (the desktop's trash
-can restore it too). **Delete Permanently in Explorer…** is a separate command and confirmation. Where no trash can be
-used (another platform, a file system without one) Delete says so and removes nothing. A document with unsaved changes,
+trash, or the mount's own `.Trash` folder), after a confirmation that says what goes and how many open tabs close.
+A trash folder another user owns or may change is never used. **Restore Last Deleted Entry** puts this session's
+latest deletion back without replacing anything, and only the entry it moved, never something put in its place in the
+trash (the desktop's trash can restore it too). **Delete Permanently in Explorer…** is a separate command and
+confirmation. Where no trash can be used (another platform, a file system without one) Delete says so and removes nothing. A document with unsaved changes,
 a running or unconfirmed save, or an undecided recovered draft refuses both, so unsaved work is never deleted with its
 file, and deleted work is not offered back by draft recovery.
 
@@ -98,19 +117,29 @@ cargo build --locked --release -p lenz-tui
 ./target/release/lenz-tui merge
 ```
 
-`lenz diff --tui` needs an interactive terminal and takes the same arguments as `lenz diff`, including `--about`. Started outside a repository, `lenz diff --tui` and its `log`, `merge` and `pr` first show the shared repository chooser: type a path (Tab completes folders, `~` is home) or pick a recent repository with the arrows or a click, Enter opens it and Esc quits. The GUI has the same chooser plus **Browse…**, which a terminal cannot offer. The chooser has no command menu; **Report last error** is in the menus once a repository opens, and `lenz diff --tui report --last` works anywhere.
+`lenz diff --tui` needs an interactive terminal and takes the same arguments as `lenz diff`, including `--about`. Started outside a repository, plain `lenz diff --tui` offers Compare Files (F1), Compare Folders (F2) and Open Repository (F3). **New Comparison…** in ☰ or F10 opens the same chooser inside an existing comparison and creates an independent view, keeping the original drafts. Tab switches the two paths; Ctrl+Space completes one. Path fields support Ctrl+A, caret/word movement and deletion, and bracketed paste. The `log`, `show`, `merge` and `pr` subcommands first show the shared repository chooser: type a path (Tab completes folders, `~` is home) or pick a recent repository with the arrows or a click, Enter opens it and Esc quits. The GUI has the same chooser plus **Browse…**, which a terminal cannot offer. The chooser has no command menu; **Report last error** is in the menus once a repository opens, and `lenz diff --tui report --last` works anywhere.
 
 ## Keyboard and mouse basics
 
-- **Command palette:** `:` or F10 opens it (the toolbar's `⋯` too). It lists every command from the shared catalog, filtered as you type, with its group, shortcut and, when the command cannot run, the reason. Enter or a click runs a row, Esc closes, F2 explains the selected row. In the Files, Sources and History lists `:` is search text, so use F10 there.
+- **Command palette:** `:` or F10 opens it (the toolbar's `⋯` too). It lists every command from the shared catalog, filtered as you type, with its group and shortcut in right-aligned columns and, when the command cannot run, the reason (a reason too long for the row takes the columns' place). Enter or a click runs a row, Esc closes, F2 explains the selected row. In the Files, Sources and History lists `:` is search text, so use F10 there.
 - **Toolbar:** click a control, or press Alt-F10 and use the arrows, Home/End and Enter. `?` sits at the right end, as in the GUI. On a terminal too narrow for every button, the ones that do not fit fold into `⋯`, whose last row opens the palette; otherwise there is no `⋯`, and clicking **F10 commands** in the bottom bar opens the palette (the GUI's **Commands**). Ordinary comparisons hide the Undo/Redo/Save controls even with a dirty draft; they stay in the palette and keep their shortcuts.
 - **Help and details:** `?` or F1 opens a wrapped, scrollable shortcut table for the current view. F2 opens the full status message, or the explanation of the selected command, in a scrollable Details dialog; Esc, Enter or F2 closes it and returns to the menu it came from. Merge and Version Picker recovery questions are explained there too.
 - **Panes:** Tab/Shift-Tab (or F6) cycle through the visible sources, log, files, comparison sides and search results; hidden panes are skipped. Clicking a pane focuses it. Arrows and Page/Home/End act on the focused pane, and the mouse wheel on the pane under the pointer. Pane dividers drag with the left button; **Reset pane sizes** in the palette restores the default layout.
 - **Horizontal scrolling:** in Shared, Aligned and Padded, both Sides of a comparison move sideways together (to the end of the wider one); in Independent each keeps its own position, as do the three Merge View panes. Use the horizontal wheel, Shift-wheel or Ctrl-Alt-Left/Right. Emulators differ in how they deliver horizontal wheel events, so the keys are the reliable route.
-- **Context actions:** right click, or Shift-F10 for the focused pane, opens actions for the text, file or commit under the pointer. Text menus list only what applies there (Copy, Fold/Unfold, Move change, Open in editor, blame, and in the Markdown Preview Show in source); **All commands…** opens the palette.
+- **Context actions:** right click, or Shift-F10 for the focused pane, opens actions for the text, file or commit under the pointer: a right click opens the menu at the pointer, Shift-F10 in the middle of the terminal. Text menus list only what applies there (Copy, Fold/Unfold, Move change, Open in editor, blame, and in the Markdown Preview Show in source); **All commands…** opens the palette.
 - **Modals:** menus, dialogs and prompts consume all input before the panes below them. Quit (Ctrl-Q) and F8/Shift-F8 are the global exceptions.
 - **Lists:** in Files and Commits, typing or Ctrl-F starts a literal, case-insensitive search of that list (file paths; commit subject, author, email and hash in the loaded history). Every row stays visible, matches are highlighted, and Up/Down or F3/Shift-F3 step the candidate without changing the comparison. Enter opens the candidate and keeps the query; Esc clears the search and restores the earlier position; Ctrl-A clears the query; Ctrl-C copies the candidate's path or hash. Plain letters, including `q`, `j`, `k` and `g`, are search text in these lists.
 - **Quitting:** Ctrl-Q quits; `q` closes the current view in a comparison or merge.
+
+## Text in searches and dialogs
+
+Reader and Diff search fields, command filters, path/name prompts and comparison/repository choosers share single-line editing. Left/Right move by grapheme, Ctrl/Alt-Left/Right move by word, and Home/End move to the input's ends. Add Shift to select a range; Ctrl-A selects all. Ctrl-C copies the selection and Ctrl-X cuts it. Backspace/Delete remove a selection or character; Ctrl/Alt-Backspace/Delete remove a word. Reader prompts and Git revision/name prompts take the first pasted line. Other Diff query fields turn line breaks and tabs into spaces.
+
+In a GUI, Ctrl-V (Cmd-V on macOS) pastes from the system clipboard. In a terminal, use the emulator's Paste command, usually Ctrl-Shift-V, which delivers a bracketed paste event. Copy/cut use OSC 52 and require the emulator to allow clipboard writes. Modified motions require a terminal that reports those keys. Popup fields do not implement document undo, Vim operators or multiple cursors.
+
+GUI search and popup fields also accept native text input and input-method composition. Preedit text stays separate from the query until committed. Escape cancels composition; a subsequent Escape dismisses the field or popup. Clicking text places the caret, and Shift-click extends the selection. Printable Option-key characters are accepted where the key is not already a documented field shortcut; for example, Find keeps Alt+C/W/R for its options and Alt+A for Replace All. A terminal receives the text committed by its emulator's input method.
+
+Up/Down and PageUp/PageDown still navigate picker results; Tab switches fields or search scope. Alt-Home/End select the first/last result where the picker supports those jumps. In Reader's branch picker, Alt-Enter opens the selected row's actions, including Open in New Window. F6 forgets a highlighted recent item/bookmark or resets a highlighted keybinding, while Delete edits a nonempty filter. Escape cancels and Enter confirms the active dialog.
 
 ## Comparison controls
 
@@ -147,7 +176,7 @@ Writes use the same snapshots, encoding and line-ending preservation, read-only 
 
 ### Images
 
-Images draw as colored half-block cells. `m` cycles the modes; `0` fits and `1` shows 1:1; `+`/`-` zoom; arrows pan; `,` / `.` change the opacity or Swipe split; `n`/`p` step through changed regions. Every image command, including copying paths and opening the original externally, is also in the palette.
+Images draw as colored half-block cells. An SVG adds **Source** to the header's modes: its line diff, with find, copy and the diff options, since a rendering shows no script, link or text; a click on another mode returns to the rendering. `m` cycles the modes; `0` fits and `1` shows 1:1; `+`/`-` zoom; arrows pan; `,` / `.` change the opacity or Swipe split; `n`/`p` step through changed regions. Every image command, including copying paths and opening the original externally, is also in the palette.
 
 ### Archives
 
@@ -164,6 +193,7 @@ Folder headings in Files collapse and expand: click the ▾/▸ arrow (the headi
 - Callouts, `==highlights==`, tags, links, footnotes, properties and done tasks use theme colors and styles (see the guide).
 - Local images are decoded in the background and drawn at most 20 rows tall: as real pixels through kitty graphics Unicode placeholders in kitty and Ghostty (not inside tmux), as half-block cells elsewhere. `LENZ_IMAGES=cells|kitty` overrides detection (`sixel` also selects cells here). A missing or unreadable image keeps its placeholder text.
 - Lenz Code's terminal editor edits Markdown source with a preview beside it; see [its Markdown section](code/README.md#markdown).
+- A line over 10,000 characters is cut there in every text pane, Merge View panes included, and ends with `… N more characters`, as in the GUI; sideways scrolling reaches that note, so a change past the cut still shows where it is.
 - Three-way merge panes keep their plain rendering. PR conversations share the Markdown file parser and terminal text styles; the GUI also reuses its reading fonts and inline styling in a 30% wider column, formatted in the background. PR tables keep compact text separators and images remain linked placeholders; the timeline does not offer the Preview's image or callout controls. The PR wheel moves one row per notch; the GUI accumulates small trackpad movements instead of treating every event as three rows.
 
 ### Themes and icons
@@ -194,7 +224,7 @@ Selecting or refreshing a PR in the repository view shows a persistent **Loading
 
 Both frontends share the **Overview** (Branches, History, Files and the diff) and **Focus** (Files and the diff) through the shared layout. Focus hides Branches and History; Alt-2 and Alt-3 are refused there with their reason. A window without a repository has no Overview, and Alt-0 there says why. Enter or a double click on a file in Files enters Focus.
 
-- **Toolbar:** it starts with ☰, then **Focus** in the Overview or **Overview** in Focus, then ◀ ▶. Both views share **⚙** (Layout Split | Unified, whitespace, highlighting, scrolling, context, case, blame); Focus adds **≡ Unchanged** and **?**. A PR's **Conversation | Commits | Files changed** tabs sit in the middle and give way to the Markdown modes when the header is too narrow. The pane header carries **Source | Inline | Side by side** for Markdown and **2-up | Swipe | Onion skin | Difference** for images.
+- **Toolbar:** it starts with ☰, then **Focus** in the Overview or **Overview** in Focus, then ◀ ▶. Both views share **⚙** (Layout Split | Unified, whitespace, highlighting, scrolling, context, case, blame); Focus adds **≡ Unchanged** and **?**. A PR's **Conversation | Commits | Files changed** tabs sit in the middle and give way to the Markdown modes when the header is too narrow. The pane header carries **Source | Inline | Side by side** for Markdown and **2-up | Swipe | Onion skin | Difference** for images, plus **Source** for an SVG.
 - **Selection Title:** the name of what is compared (`main ~ feature/x`, `v0.1.0 (a1b2c3d)`) leads the diff title line and the History header. The terminal has no window title to carry it.
 - **Unified:** one full-width column (deleted rows, then inserted, unchanged once). Selection and copy work on the Side of the row under the pointer, one horizontal scroll covers both Sides, and editing is refused with "Switch to Split to edit". Images and the Preview keep their own layouts.
 - **Commit message:** in Focus, the file tree and diff sit above a full-width bottom panel showing the commit's subject, author, date, hash and body. A range lists its newest 200 commits, each opening on a click. The panel takes at most a third of the available height. **Commit** in the bottom bar or **Show / hide commit message** in the palette hides or restores the whole panel; clicking its first line also hides it. It stays available when Files is hidden. Down on the last file gives the panel the keyboard: Up/Down walk a range or scroll one message, Enter or Space opens the commit, Esc or moving past an end returns to Files (or the diff if Files is hidden), Ctrl-C copies the message. The GUI also selects text by dragging; the terminal leaves text selection to the emulator. Working tree, index and pull requests show none. Very small terminals omit the panel until there is room.
@@ -203,7 +233,7 @@ Both frontends share the **Overview** (Branches, History, Files and the diff) an
 
 ![The terminal Diff's Merge View with Ours, Result and Theirs panes](images/tui-merge.png)
 
-The Merge View's toolbar matches the GUI's: ☰, ↑ ↓ changes, ⇡ ⇣ unresolved conflicts, ↶ Undo, ↷ Redo, ⤓ Save, Done/Cancel and `⋯`. The Version Picker uses the same icons plus Mark resolved and its **Take ‹version›** buttons. The Conflict List adds **File actions ▾** and **Copy command ▾** (continuation and submodule commands). The GUI shows those buttons in the page rather than the toolbar.
+The Merge View's toolbar matches the GUI's: ☰, ↑ ↓ changes, ⇡ ⇣ unresolved conflicts, ↶ Undo, ↷ Redo, ⤓ Save, Done/Cancel and `⋯`. The Version Picker uses the same icons plus Mark resolved and its **Take ‹version›** buttons. The Conflict List adds **File actions ▾** and **Copy command ▾** (continuation and submodule commands; a submodule path is quoted for POSIX shells and fish, and one with control characters gets no command to copy). The GUI shows those buttons in the page rather than the toolbar.
 
 | Operation | Terminal control |
 | --- | --- |
@@ -229,6 +259,10 @@ Both adapters build their menus, labels, availability and disabled reasons from 
 - The command palette opens with `:` or F10 instead of Ctrl/Cmd+Shift+P; `f` opens the file finder and Alt-0 is Focus.
 - **Diff options…** opens the ⚙ menu, or the palette's Diff group when the button has folded into `⋯`.
 - Alt-Left/Right outside a repository only says that Back and Forward work in repository views.
+- Lenz Code on macOS with macOS Word Motion on: Option+Left/Right move by word in the text when the emulator sends Option as Alt (Esc-prefixed
+  arrows); Terminal.app's default Esc b / Esc f arrive as Alt+B / Alt+F instead. Option+Shift+Left/Right keep moving the
+  tab, so select by word with Ctrl+Shift+Left/Right, and Back/Forward stay in the menus there. Cmd+arrows do not reach a
+  terminal, so Search Everywhere's query has no to-the-ends key (Ctrl+A clears it).
 - The Version Picker's **Take ‹version›** buttons and the Conflict List's **File actions ▾** are toolbar items.
 - Terminal text selection and Linux primary selection belong to the emulator. Clipboard copy uses OSC 52 and needs terminal support; it transports exact text, and source control characters are drawn visibly.
 - Images are limited to cell geometry and colors, except where kitty graphics or Sixel apply as described above.

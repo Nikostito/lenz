@@ -42,6 +42,8 @@ pub struct Picker {
     pub sidebar: bool,
     pub log_shown: bool,
     pub root: PathBuf,
+    /// Directory whose Git semantics apply to the CLI path scope, independent of the resolved repository root.
+    path_cwd: PathBuf,
     pub log: Log,
     pub refs: Option<history::Refs>,
     pub(crate) stream: Option<history::Stream>,
@@ -550,6 +552,7 @@ impl Picker {
             shown,
             sidebar: true,
             log_shown: true,
+            path_cwd: root.clone(),
             root,
             log: Log::default(),
             refs: None,
@@ -775,7 +778,8 @@ impl Picker {
     pub fn start_stream(&mut self) {
         self.started = Some(std::time::Instant::now());
         self.paused = false;
-        match history::stream_limited_paths(&self.root, &self.branches, self.demand(0.0), &self.paths) {
+        let cwd = if self.paths.is_empty() { &self.root } else { &self.path_cwd };
+        match history::stream_limited_paths(cwd, &self.branches, self.demand(0.0), &self.paths) {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.loading = true;
@@ -1282,6 +1286,8 @@ pub struct RepositoryInventory {
     head: Option<String>,
     root: PathBuf,
 }
+/// A loaded comparison with the exact directory used to interpret its Git pathspecs.
+type LoadedComparison = (ChangeSet, Spec, PathBuf);
 type Inventory = RepositoryInventory;
 type RefreshSelection = (Option<String>, Option<String>, bool, usize, f32);
 type RefreshedInventory = (PickerRefresh, Inventory, RefreshFilters);
@@ -1380,6 +1386,8 @@ pub struct RepositorySession {
     effects: Vec<RepositoryEffect>,
     ready: Option<(std::sync::Arc<ChangeSet>, Spec)>,
     current_spec: Option<Spec>,
+    /// The shown spec may still carry launch-relative pathspecs; Git must interpret them in that directory.
+    spec_cwd: PathBuf,
     /// Back and Forward over the places this view has been.
     nav: crate::navigation::History,
     /// The file and line on screen, as the adapter last reported them.
@@ -1390,6 +1398,8 @@ pub struct RepositorySession {
     moving: bool,
     /// Back or Forward is restoring: its own commands are not steps.
     navigating: bool,
+    /// A Back/Forward request remains exact while its history/filter workers settle.
+    navigation_comparison: Option<(Spec, PathBuf)>,
     refreshing: Option<Inbox<RefreshedInventory>>,
     pending_refresh: bool,
     /// Only explicit PR commit navigation and refresh retain the current review.
@@ -1408,14 +1418,14 @@ pub struct RepositorySession {
     remote_token:std::sync::Arc<()>,
     remote_limit:usize,
     prs: Option<Inbox<Result<Vec<crate::pr::ListedPr>, crate::pr::PrError>>>,
-    pending: Option<Inbox<Result<(ChangeSet, Spec), String>>>,
+    pending: Option<Inbox<Result<LoadedComparison, String>>>,
     opened: Option<Inbox<Result<crate::pr_session::Opened, crate::pr::PrError>>>,
     opening_label: String,
     filter: Option<Inbox<(HistoryRequest,Result<DeepFilter, String>)>>,
     followed: Option<Inbox<FollowedResult>>,
     graph: Option<Inbox<Result<(), String>>>,
     moved: Option<Inbox<Result<bool, crate::pr::PrError>>>,
-    initial_follow: Option<String>,
+    initial_follow: Option<(String, Option<PathBuf>)>,
     initial_pick: bool,
     head: Option<String>,
     cleanup_pr: bool,
@@ -1454,7 +1464,8 @@ impl RepositorySession {
         };
         let branches = matches!(request.launch, Launch::Log { .. }).then(|| initial_log_branches(&request.spec));
         let paths = if matches!(request.launch, Launch::Log { follow: None }) { log_paths(&request.spec) } else { Vec::new() };
-        let mut state = Self::start(cwd, !matches!(request.launch, Launch::Diff), branches, follow, paths);
+        let mut state = Self::start(cwd, !matches!(request.launch, Launch::Diff | Launch::Show), branches, follow, paths);
+        if request.launch == Launch::Show { state.place_initial(&request.spec); state.set_spec_at(request.spec.clone(), state.spec_cwd.clone()); }
         if let Launch::Pr(target) = &request.launch {
             state.execute(RepositoryCommand::OpenPr(target.clone()));
         } else if state.picker.shown {
@@ -1463,7 +1474,7 @@ impl RepositorySession {
             let root = state.picker.root.clone();
             let requested=request.spec.clone();
             state.pending = Some(submit(&state.pick_token, move || {
-                initial_log_comparison(&root,&requested).map(|(set,spec,_)|(set,spec))
+                initial_log_comparison(&root,&requested).map(|(set,spec,_)|(set,spec,root))
             }));
         }
         state
@@ -1481,7 +1492,7 @@ impl RepositorySession {
             state.picker.sources.branches_loading=true;
             state.picker.sources.details_loading=true;
             state.sources = Some(submit_inventory(&state.token, move || read_startup_inventory(cwd)));
-            state.initial_follow = follow;
+            state.initial_follow = follow.map(|path| (path, Some(state.picker.path_cwd.clone())));
         }
         state
     }
@@ -1613,7 +1624,7 @@ impl RepositorySession {
             state.picker.root = root.to_path_buf();
         }
         state.set = Some(set);
-        state.set_spec(spec);
+        state.set_spec_at(spec, state.spec_cwd.clone());
         state
     }
 
@@ -1685,8 +1696,9 @@ impl RepositorySession {
             }
             Some(SourceAction::Tag(commit)) => {
                 // ponytail: tags on one commit share a row action, so the first one's name is used
-                let tag = self.picker.sources.tags.iter().find(|t| t.commit == commit).map_or(commit.clone(), |t| t.name.clone());
-                vec![command(C::Checkout(Target::Detached(tag.clone()))), new_branch(&format!("refs/tags/{tag}"))]
+                // Fully named: a branch, remote, `$GIT_DIR` file or object id sharing the short name must not win.
+                let tag = self.picker.sources.tags.iter().find(|t| t.commit == commit).map_or(commit.clone(), |t| format!("refs/tags/{}", t.name));
+                vec![command(C::Checkout(Target::Detached(tag.clone()))), new_branch(&tag)]
             }
             Some(SourceAction::Worktree(path)) => match self.picker.sources.worktrees.iter().find(|w| w.path == path) {
                 // A bare repository has no files, and a removed folder nothing to show.
@@ -1812,13 +1824,15 @@ impl RepositorySession {
 
     /// The comparison on screen, when the frontend loaded it itself: refresh reloads this one.
     pub fn showing(&mut self, set: std::sync::Arc<ChangeSet>, spec: Spec) {
+        let cwd = if self.current_spec.as_ref() == Some(&spec) { self.spec_cwd.clone() } else { set.git_root().unwrap_or(&self.picker.root).to_path_buf() };
         self.set = Some(set);
-        self.set_spec(spec);
+        self.set_spec_at(spec, cwd);
     }
 
     /// A session over `picker` with no background work started.
     pub fn with_picker(picker: Picker) -> Self {
         Self {
+            spec_cwd: picker.path_cwd.clone(),
             picker,
             pr: None,
             notice: None,
@@ -1832,6 +1846,7 @@ impl RepositorySession {
             nav_restore: None,
             moving: false,
             navigating: false,
+            navigation_comparison: None,
             refreshing: None,
             pending_refresh: false,
             pending_pr: false,
@@ -1896,7 +1911,9 @@ impl RepositorySession {
         self.set.as_ref().map_or(&[], |set| &set.comparisons)
     }
     pub fn take_change_set(&mut self) -> Option<(std::sync::Arc<ChangeSet>, Spec)> {
-        self.ready.take()
+        let ready = self.ready.take();
+        self.finish_navigation();
+        ready
     }
     pub fn take_refresh_placement(&mut self)->bool{std::mem::take(&mut self.refresh_placement)}
     pub fn take_effects(&mut self) -> Vec<RepositoryEffect> {
@@ -1940,19 +1957,33 @@ impl RepositorySession {
             _ => None,
         }
     }
-    fn accept(&mut self, set: ChangeSet, spec: Spec, keep_pr: bool) {
+    fn accept(&mut self, set: ChangeSet, spec: Spec, cwd: PathBuf, keep_pr: bool) {
         if !keep_pr {
             self.pr = None;
             self.moved = None;
         }
         let set = std::sync::Arc::new(set);
-        if let Some(root)=set.git_root(){self.picker.root=root.to_path_buf();}
+        if let Some(root) = set.git_root() {
+            if let Some(old) = self.set.as_ref().and_then(|set| set.git_root()).filter(|old| *old != root) {
+                let prefix = self.picker.path_cwd.strip_prefix(old).unwrap_or_else(|_| Path::new(""));
+                self.picker.path_cwd = root.join(prefix);
+            }
+            self.picker.root = root.to_path_buf();
+        }
         self.set = Some(set.clone());
-        self.set_spec(spec.clone());
+        self.set_spec_at(spec.clone(), cwd);
         self.ready = Some((set, spec));
     }
-    /// Show `spec` and read its commit messages; a read for an earlier comparison is dropped.
-    fn set_spec(&mut self, spec: Spec) {
+    /// Repository selections retain the CLI log scope; file-history paths are already root-relative.
+    fn selection_cwd(&self, spec: &Spec) -> PathBuf {
+        if let Spec::Git { paths, .. } = spec
+            && !paths.is_empty() && self.picker.file_paths.is_none() && *paths == self.picker.paths
+        { return self.picker.path_cwd.clone(); }
+        self.picker.root.clone()
+    }
+    /// The cwd is carried by the accepted request rather than inferred from similar-looking path strings.
+    fn set_spec_at(&mut self, spec: Spec, cwd: PathBuf) {
+        self.spec_cwd = cwd;
         let query = crate::commit_message::query(&spec);
         self.current_spec = Some(spec);
         self.message_token = std::sync::Arc::new(());
@@ -2003,30 +2034,37 @@ impl RepositorySession {
         })
     }
     fn load(&mut self, spec: Spec) {
+        let cwd = self.selection_cwd(&spec);
+        self.load_at(spec, cwd);
+    }
+    fn load_at(&mut self, spec: Spec, root: PathBuf) {
         self.initial_pick = false;
         self.pending_refresh = false;
         self.new_pick();
-        let root = self.picker.root.clone();
         self.opened = None;
         self.pending = Some(submit(&self.pick_token, move || {
-            ChangeSet::load(&spec, &root).map(|set| (set, spec))
+            ChangeSet::load(&spec, &root).map(|set| (set, spec, root))
         }));
     }
     fn load_local(&mut self) {
         self.initial_pick = false;
         self.pending_refresh = false;
         self.new_pick();
-        let root = self.picker.root.clone();
         let mut spec = local_spec();
         if let Spec::Git { paths, .. } = &mut spec { *paths = self.picker.paths.clone(); }
+        let root = self.selection_cwd(&spec);
         self.pending = Some(submit(&self.pick_token, move || {
-            read_refresh_comparison(&root, spec, None, false)
+            read_refresh_comparison(&root, spec, None, false).map(|(set,spec)|(set,spec,root))
         }));
     }
     fn pick(&mut self) {
+        if let Some((spec,cwd)) = self.navigation_comparison.clone() {
+            self.load_at(spec,cwd);
+            return;
+        }
         match self.picker.comparison_spec() {
             // already on screen: drop any other load in flight and keep what is shown, without reloading it
-            Ok(spec) if self.current_spec.as_ref() == Some(&spec) && self.ready.is_none() => {
+            Ok(spec) if self.current_spec.as_ref() == Some(&spec) && self.spec_cwd == self.selection_cwd(&spec) && self.ready.is_none() => {
                 self.new_pick();
                 self.pr = None;
                 self.moved = None;
@@ -2116,8 +2154,14 @@ impl RepositorySession {
                 self.load_more_prs();
             }
             if !self.picker.sources.filter.is_empty(){self.load_branches(usize::MAX);}
-            if let Some(path) = self.initial_follow.take() {
-                self.execute(RepositoryCommand::FileHistory(path));
+            if let Some((path, path_cwd)) = self.initial_follow.take() {
+                // --follow names one literal file, so rebasing its path needs no pathspec parsing.
+                // None denotes an already root-relative UI path; the root only became known with this inventory.
+                let path_cwd = path_cwd.unwrap_or_else(|| self.picker.root.clone());
+                let cwd = path_cwd.canonicalize().unwrap_or(path_cwd);
+                let absolute = cwd.join(path);
+                let path = absolute.strip_prefix(&self.picker.root).unwrap_or(&absolute).to_string_lossy().into_owned();
+                self.run(RepositoryCommand::FileHistory(path));
             }
         }
         if let Some(mut inventory)=receive(&mut self.source_details){
@@ -2160,12 +2204,12 @@ impl RepositorySession {
         if let Some(result) = receive(&mut self.pending) {
             changed = true;
             match result {
-                Ok((set, spec)) => {
+                Ok((set, spec, cwd)) => {
                     if std::mem::take(&mut self.initial_pick) {
                         self.place_initial(&spec);
                     }
                     self.refresh_placement=std::mem::take(&mut self.pending_refresh);
-                    self.accept(set, spec, self.pending_pr);
+                    self.accept(set, spec, cwd, self.pending_pr);
                 }
                 Err(error) => {
                     crate::diagnostics::repository_failure(&error);
@@ -2178,7 +2222,8 @@ impl RepositorySession {
             changed = true;
             match result {
                 Ok(opened) => {
-                    self.accept(opened.set, opened.fetched.spec(), false);
+                    let cwd = opened.set.git_root().unwrap_or(&self.picker.root).to_path_buf();
+                    self.accept(opened.set, opened.fetched.spec(), cwd, false);
                     self.adopt_pr(opened.pr, opened.fetched);
                 }
                 Err(crate::pr::PrError::NoPullRequest) => {
@@ -2188,7 +2233,7 @@ impl RepositorySession {
                     let root = self.picker.root.clone();
                     self.initial_pick=true;
                     self.pending = Some(submit(&self.pick_token, move || {
-                        pinned_commit_comparison(&root,"HEAD").map(|(set,spec,_)|(set,spec))
+                        pinned_commit_comparison(&root,"HEAD").map(|(set,spec,_)|(set,spec,root))
                     }));
                     self.picker.anchor = 1;
                 }
@@ -2248,7 +2293,14 @@ impl RepositorySession {
                 self.notice = Some("PR updated — refresh to fetch the new head".into());
             }
         }
+        self.finish_navigation();
         changed
+    }
+    fn finish_navigation(&mut self) {
+        if !self.picker.loading && self.picker.want.is_none() && self.followed.is_none() && self.filter.is_none()
+            && self.pending.is_none() && self.ready.is_none()
+            && self.navigation_comparison.as_ref().is_some_and(|(spec,cwd)| self.current_spec.as_ref() == Some(spec) && self.spec_cwd == *cwd)
+        { self.navigation_comparison = None; }
     }
     fn show_picker(&mut self, shown: bool) {
         self.picker.shown = shown;
@@ -2294,7 +2346,7 @@ impl RepositorySession {
         let picked = if p.anchor == 0 { Some(Picked::Local) }
             else { id(p.anchor).map(|anchor| Picked::Commits { anchor, second: p.second.and_then(id), range: p.range }) };
         crate::navigation::Spot { branches: p.branches.clone(), filter: p.filter.clone(), file_history: p.file_paths.as_ref().map(|(f, _)| f.clone()),
-            picked, file: self.position.0.clone(), line: self.position.1 }
+            picked, comparison: self.current_spec.clone().map(|spec|(spec,self.spec_cwd.clone())), file: self.position.0.clone(), line: self.position.1 }
     }
 
     /// Show `spot` again: the log's branches, filter and file history, its selection, then (through the adapter) its file
@@ -2302,6 +2354,7 @@ impl RepositorySession {
     fn go_to(&mut self, spot: crate::navigation::Spot) {
         use crate::navigation::Picked;
         self.navigating = true;
+        self.navigation_comparison = spot.comparison.clone();
         let now = self.here();
         // a log that restarts below is not yet the one the spot's commit is picked from
         let reloading = (&spot.filter, &spot.file_history, &spot.branches) != (&now.filter, &now.file_history, &now.branches);
@@ -2323,6 +2376,11 @@ impl RepositorySession {
             }
             None => None,
         };
+        if let Some((spec,cwd)) = self.navigation_comparison.clone() {
+            // Selecting the row restores UI state; the saved request owns the comparison even before it arrives.
+            self.picker.pick_on_want = false;
+            self.load_at(spec,cwd);
+        }
         self.nav_restore = Some(crate::place::Restore { commit, file: spot.file, line: spot.line });
         self.navigating = false;
     }
@@ -2337,6 +2395,7 @@ impl RepositorySession {
         let is_move = matches!(command, C::Move { .. });
         // a step whose effect arrives later (file history, a deep filter, a pull request) counts at once
         let later = matches!(command, C::FileHistory(_) | C::ApplyFilter | C::OpenPr(_) | C::Compare { .. } | C::BranchChanges | C::CompareWorktree(_));
+        if step && !self.navigating { self.navigation_comparison = None; }
         let before = (step && !self.navigating && !(is_move && self.moving)).then(|| self.here());
         self.moving = is_move;
         self.run(command);
@@ -2385,14 +2444,14 @@ impl RepositorySession {
                 SourcePlan::Worktree(path) => {
                     self.new_pick();
                     self.pending = Some(submit(&self.pick_token, move || {
-                        repo::local_changes(&path, true).map(|set| (set, local_spec()))
+                        repo::local_changes(&path, true).map(|set| (set, local_spec(), path))
                     }));
                 }
                 SourcePlan::Stash(sha) => {
                     self.new_pick();
                     let root = self.picker.root.clone();
                     self.pending = Some(submit(&self.pick_token, move || {
-                        repo::stash_changes(&root, &sha).map(|set| (set, stash_spec(&sha)))
+                        repo::stash_changes(&root, &sha).map(|set| (set, stash_spec(&sha), root))
                     }));
                 }
                 SourcePlan::Pr(number) => self.execute(C::OpenPr(Some(number.to_string()))),
@@ -2488,7 +2547,7 @@ impl RepositorySession {
                 if self.sources.is_some() {
                     // the inventory resolves the root (a link or a subdirectory becomes git's top level);
                     // a request against the unresolved one would be dropped as stale when it arrives
-                    self.initial_follow=Some(path);
+                    self.initial_follow=Some((path,None));
                 } else {
                     let request=self.picker.begin_file_history(path);
                     self.followed=Some(submit(&self.filter_token,move || {
@@ -2578,10 +2637,10 @@ impl RepositorySession {
                 if let Some(spec)=self.current_spec.clone(){
                     self.initial_pick=false;self.new_pick();self.opened=None;
                     self.pending_pr=self.pr.is_some();
-                    let root=self.set.as_ref().and_then(|set|set.git_root()).unwrap_or(&self.picker.root).to_path_buf();
+                    let root=self.spec_cwd.clone();
                     let selected=self.picker.log_row(self.picker.anchor).map(|row|self.picker.log.id(row));
                     let stash=self.set.as_ref().is_some_and(|set|set.groups.iter().any(|(group,_)|group=="Changes"));
-                    self.pending=Some(submit(&self.pick_token,move||read_refresh_comparison(&root,spec,selected.as_deref(),stash)));
+                    self.pending=Some(submit(&self.pick_token,move||read_refresh_comparison(&root,spec,selected.as_deref(),stash).map(|(set,spec)|(set,spec,root))));
                     self.pending_refresh=true;
                 }
             }
@@ -2657,6 +2716,11 @@ impl RepositorySession {
             C::ToggleMessage(Some(i)) => if let Some(open) = self.message.as_mut().and_then(|m| m.open.get_mut(i)) { *open = !*open; self.message_cursor = i; },
             C::MessageCursor(i) => self.message_cursor = i,
             C::PrCommit(sha) => if let Some(pr) = self.pr.as_mut() {
+                // the forge names the commit: only an object id may reach git
+                if sha.as_deref().is_some_and(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    self.notice = Some("Not a commit id".into());
+                    return;
+                }
                 // Files changed, for that commit alone or the whole PR again
                 let spec = match &sha { Some(sha) => branch_comparison(&format!("{sha}^1"), sha, false), None => pr.fetched.spec() };
                 pr.shown_commit = sha;
@@ -3319,6 +3383,19 @@ mod session_tests {
         assert!(state.pr.is_none(),"ordinary navigation to a PR commit must leave review context");
     }
     #[test]
+    fn a_forge_commit_id_that_is_not_hex_never_reaches_git() {
+        let root=repo();write(root.path(),"ref.md","old\n");commit_all(root.path(),"Before");
+        write(root.path(),"ref.md","new\n");commit_all(root.path(),"After");
+        let _provider=crate::pr::test_support::markdown_provider(root.path());
+        let mut state=open(root.path());
+        state.execute(RepositoryCommand::OpenPr(Some("9".into())));settle(&mut state);
+        let elsewhere=tempfile::tempdir().unwrap();let target=elsewhere.path().join("written");
+        state.execute(RepositoryCommand::PrCommit(Some(format!("--output={}",target.display()))));settle(&mut state);
+        assert_eq!(state.notice.as_deref(),Some("Not a commit id"));
+        assert!(state.pr.as_ref().is_some_and(|pr|pr.shown_commit.is_none()),"the PR's Files changed stay");
+        assert!(!target.exists()&&!elsewhere.path().join("written^1").exists());
+    }
+    #[test]
     fn shared_quiet_refresh_keeps_range_ids_and_ignores_obsolete_filter_results(){
         let root=repo();write(root.path(),"file","first\n");commit_all(root.path(),"First");
         write(root.path(),"file","second\n");commit_all(root.path(),"Second");
@@ -3802,10 +3879,31 @@ mod checkout_tests {
         let (_r, _wt, mut state) = fixture();
         state.execute(RepositoryCommand::Source(SourceAction::Toggle("Tags")));
         let tag = row(&state, |a| matches!(a, SourceAction::Tag(_)));
-        assert!(matches!(&state.source_menu(tag)[0].1, SourceEntry::Command(RepositoryCommand::Checkout(Target::Detached(t))) if t == "v1"));
+        assert!(matches!(&state.source_menu(tag)[0].1, SourceEntry::Command(RepositoryCommand::Checkout(Target::Detached(t))) if t == "refs/tags/v1"));
         assert!(matches!(&state.source_menu(tag)[1].1, SourceEntry::NewBranchFrom(t) if t == "refs/tags/v1"));
         assert_eq!(state.disabled(&RepositoryCommand::Checkout(Target::Branch("side".into()))), Some("Checked out in another worktree"));
         assert_eq!(state.disabled(&RepositoryCommand::Checkout(Target::Branch("other".into()))), None);
+    }
+
+    #[test]
+    fn a_tag_row_checks_out_its_own_commit_though_a_branch_shares_the_tag_name() {
+        let (r, _wt, mut state) = fixture();
+        let tagged = git(r.path(), &["rev-parse", "v1^{commit}"]).trim().to_string();
+        // The only tag on v1's commit besides v1, newer, and named so `heads/main` resolves to the branch.
+        git(r.path(), &["tag", "-d", "v1"]);
+        git(r.path(), &["tag", "heads/main", &tagged]);
+        write(r.path(), "a.txt", "main moved on\n");
+        commit_all(r.path(), "main moves on");
+        assert_ne!(git(r.path(), &["rev-parse", "main"]).trim(), tagged);
+        state.execute(RepositoryCommand::RefreshRepository);
+        settle(&mut state);
+        state.execute(RepositoryCommand::Source(SourceAction::Toggle("Tags")));
+        let tag = row(&state, |a| matches!(a, SourceAction::Tag(c) if *c == tagged));
+        let SourceEntry::Command(checkout_tag) = state.source_menu(tag)[0].1.clone() else { panic!("Checkout") };
+        state.execute(checkout_tag);
+        settle(&mut state);
+        assert_eq!(git(r.path(), &["rev-parse", "HEAD"]).trim(), tagged, "the row's commit, not main's");
+        assert_eq!(state.notice.as_deref(), Some("Checked out heads/main"));
     }
 
     #[test]
@@ -3839,3 +3937,7 @@ mod checkout_tests {
         assert_eq!(state.action_command(A::BranchChanges, ""), Ok(Some(RepositoryCommand::BranchChanges)));
     }
 }
+
+#[cfg(test)]
+#[path = "repository_session_entry_tests.rs"]
+mod entry_tests;

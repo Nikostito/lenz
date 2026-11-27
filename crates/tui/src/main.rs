@@ -28,6 +28,7 @@ mod repository;
 mod pr_details;
 mod visual;
 mod app;
+mod fields;
 mod context;
 mod palette;
 mod md_images;
@@ -48,12 +49,16 @@ use lenz::cli::{self, Launch, Request};
 const HELP: &str = "Lenz terminal
 usage: lenz diff --tui [options] [--staged] [<rev> [<rev>]] [-- <path>...]
        lenz diff --tui [options] [--no-index] <left> <right>
+       lenz diff --tui show <commit> [options] [-- <path>...]
+       lenz diff --tui --new-comparison
        lenz diff --tui log [<rev>...] [-- <path>...] | log --follow <file>
        lenz diff --tui pr [<number>|<url>]
        lenz diff --tui merge [[--] <path>...] | merge <base> <local> <remote> <merged>
 lenz-diff-tui takes the same arguments without the diff --tui prefix.
 
 Same comparison options as lenz diff, including --blame and --line N.
+show compares a commit with its first parent (the empty tree for a root commit).
+--new-comparison chooses files, folders or a repository in an independent view.
 Icons: Nerd Font Mono glyphs by default; LENZ_ICONS=plain (or [tools] icons = plain) turns them off, and the ☰ menu toggles them.
 n/p changes; [/] files; / find; f files; : commands; Ctrl-R repository;
 A applied history; Ctrl-Z/Ctrl-Y undo/redo drafts; Ctrl-S saves;
@@ -210,10 +215,10 @@ fn restore_input_modes() {
 }
 
 /// Outside a repository: the repository picker, before any comparison opens. `None` when the user quits.
-fn choose_repository(terminal:&mut ratatui::DefaultTerminal,cwd:std::path::PathBuf)->io::Result<Option<std::path::PathBuf>>{
+fn choose_repository(terminal:&mut ratatui::DefaultTerminal,cwd:std::path::PathBuf,comparisons:bool,new:bool)->io::Result<Option<lenz::repo_picker::Choice>>{
     let themes=lenz::theme::ThemeService::new_deferred(lenz::theme::paths_from_env(),lenz::theme::overrides_from_env(),true);
     let palette=themes.snapshot().palette;
-    let mut view=repo_picker::View::new(lenz::repo_picker::RepoPicker::new(cwd));
+    let mut view=repo_picker::View::new(lenz::repo_picker::RepoPicker::new(cwd).with_optional_comparisons(comparisons,new));
     loop {
         terminal.draw(|frame|view.draw(frame,&palette))?;
         match view.handle(&event::read()?) {
@@ -244,9 +249,10 @@ fn run(args: &[String], mut request: Request, mut cwd: std::path::PathBuf) -> io
     let mut terminal = init_terminal()?;
     restore_on_signal();
     if lenz::repo_picker::needed(&request,&cwd) {
-        let Some(root)=choose_repository(&mut terminal,cwd)? else { return Ok(0) };
+        let Some(choice)=choose_repository(&mut terminal,cwd.clone(),args.is_empty()||request.launch==Launch::Choose,request.launch==Launch::Choose)? else { return Ok(0) };
+        let (args,root)=choice.invocation(args,&cwd);
         std::env::set_current_dir(&root)?;
-        request=self::request(args,&root).map_err(io::Error::other)?;
+        request=self::request(&args,&root).map_err(io::Error::other)?;
         cwd=root;
     }
     let mut app = Screens::open(request,cwd);
@@ -461,7 +467,12 @@ fn main() -> ExitCode {
         let first=match &mut screens.views[0]{Screen::Diff(app)=>{app.new_view=Some((request(),dir.path().into()));app.session.markdown_projection().unwrap().clone()},_=>panic!()};screens.poll();settle(&mut screens);
         assert_eq!(screens.active,1);assert!(matches!(&screens.views[1],Screen::Diff(app)if app.session.markdown_mode()==PresentationMode::Source));
         rendered(&mut screens);settle(&mut screens);let second=match &screens.views[1]{Screen::Diff(app)=>app.session.markdown_projection().unwrap().clone(),_=>panic!()};assert!(!std::sync::Arc::ptr_eq(&first.pair,&second.pair));let weak=std::sync::Arc::downgrade(&second.pair);drop(second);
-        screens.handle(key(event::KeyCode::Char('h')));assert!(screens.busy());screens.handle(key(event::KeyCode::Char('q')));screens.poll();assert_eq!(screens.views.len(),1);settle(&mut screens);assert!(weak.upgrade().is_none());
+        screens.handle(key(event::KeyCode::Char('h')));assert!(screens.busy());screens.handle(key(event::KeyCode::Char('q')));screens.poll();assert_eq!(screens.views.len(),1);settle(&mut screens);
+        // The remaining view can be idle before the closed view's cancelled worker
+        // unwinds. Require release after that asynchronous cleanup, not in this turn.
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        while weak.upgrade().is_some() && std::time::Instant::now()<until {std::thread::sleep(std::time::Duration::from_millis(1));}
+        assert!(weak.upgrade().is_none());
         assert!(matches!(&screens.views[0],Screen::Diff(app)if app.session.markdown_mode()==PresentationMode::Rendered));assert_eq!(std::fs::read(dir.path().join("right.md")).unwrap(),b"# New\n");
     }
 

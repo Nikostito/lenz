@@ -79,7 +79,7 @@ fn app(dir: &std::path::Path, dark: bool) -> App {
             .collect();
     std::fs::write(
         &providers,
-        serde_json::json!({"providers":settings}).to_string(),
+        serde_json::json!({"providers":settings,"trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()]}).to_string(),
     )
     .unwrap();
     App::new(
@@ -149,11 +149,13 @@ fn indexing_percentage_is_visible_in_the_footer_and_status_dialog() {
     assert!(build.status().unwrap().success());
     let fake = profile.join(format!("examples/fake_lsp{}", std::env::consts::EXE_SUFFIX));
     for dark in [true, false] {
+        let now = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let clock = now.clone();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         std::fs::write(
             base.join("providers.json"),
-            serde_json::json!({"providers":{"rust-analyzer":{"executable":fake}}}).to_string(),
+            serde_json::json!({"providers":{"rust-analyzer":{"executable":fake}},"trusted":[std::fs::canonicalize(std::env::temp_dir()).unwrap()]}).to_string(),
         )
         .unwrap();
         let mut app = App::new(
@@ -168,7 +170,7 @@ fn indexing_percentage_is_visible_in_the_footer_and_status_dialog() {
                 providers: base.join("providers.json"),
                 cache: base.join("cache"),
                 idle: code_core::semantics::IDLE,
-                clock: std::sync::Arc::new(std::time::Instant::now),
+                clock: std::sync::Arc::new(move || *clock.lock().unwrap()),
                 overrides: Default::default(),
                 dark,
             },
@@ -190,6 +192,8 @@ fn indexing_percentage_is_visible_in_the_footer_and_status_dialog() {
                 session: 1,
                 message: serde_json::json!({"jsonrpc":"2.0", "method":"$/progress", "params":{"token":"ruby-index", "value":{"kind":"begin", "title":"Indexing Ruby files", "percentage":42}}}),
             }));
+        // Past the moment a ready server's indexing stays quiet in the footer.
+        *now.lock().unwrap() += code_core::semantics::REINDEX_QUIET;
         for (width, height) in [(100, 30), (60, 15)] {
             assert!(text(&draw(&mut app, width, height)).contains("42%"));
             app.handle(crossterm::event::Event::Key(
@@ -209,13 +213,14 @@ fn indexing_percentage_is_visible_in_the_footer_and_status_dialog() {
                 ),
             ));
         }
-        // An error it logs: marked first in the footer (kept when narrow), its words in the details.
+        // An error it logs: the footer keeps the state (it would flicker between files), its words in the details.
         app.apply(code_core::session::Completion::Semantic(code_core::semantics::Event::Message {
                 session: 1,
                 message: serde_json::json!({"jsonrpc":"2.0", "method":"window/logMessage", "params":{"type":1, "message":"Error processing initialized: (Gem::ConflictError)"}}),
             }));
         for (width, height) in [(100, 30), (60, 15)] {
-            assert!(text(&draw(&mut app, width, height)).contains("LSP error"));
+            let drawn = text(&draw(&mut app, width, height));
+            assert!(drawn.contains(" LSP ") && !drawn.contains("LSP error"), "{drawn}");
             app.handle(crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::F(2), crossterm::event::KeyModifiers::NONE,
             )));
@@ -885,7 +890,8 @@ fn chrome_reserves_menu_position_commands_and_ellipsizes_unicode_status() {
                 assert!(footer.starts_with(&format!(" {}", a.session.status_position())), "{footer}");
                 assert!(footer.contains('…'));
                 assert!(a.layout.panes[0].tabs.iter().all(|(_, rect)| rect.y == 1));
-                let (_, message) = a.layout.controls.iter().find(|(id, _)| *id == CommandId::StatusDetails).unwrap();
+                // The message's target, after the labelled Details item's.
+                let (_, message) = a.layout.controls.iter().rev().find(|(id, _)| *id == CommandId::StatusDetails).unwrap();
                 let shown: String = (message.x..message.right()).map(|x| buffer[(x, message.y)].symbol()).collect();
                 assert!(shown.contains('界'));
                 assert!(shown.contains("e\u{301}"));
@@ -1109,7 +1115,13 @@ fn editor_gutter_marks_change_letters_in_their_own_colours_against_head() {
     assert_eq!(markers.drawn_version(), Some(app.session.state().current_source().unwrap().key().version), "the drawn blocks describe the draft version shown");
     assert_eq!(markers.baseline().map(code_core::markers::Baseline::kind), Some(BaselineKind::Head));
     assert_eq!(markers.summary().as_deref().map(|s| s.starts_with("vs HEAD (main · ")), Some(true), "{:?}", markers.summary());
-    assert!(lines_of(&draw(&mut app, 80, 12)).iter().any(|l: &String| l.contains("vs HEAD")), "the status bar names the baseline");
+    // The status bar has no baseline cell; Status Details, from a click on the message, names it.
+    assert!(!lines_of(&draw(&mut app, 80, 12)).iter().any(|l: &String| l.contains("vs HEAD")), "no baseline in the status bar");
+    let (_, message) = *app.layout.controls.iter().find(|(id, _)| *id == CommandId::StatusDetails).unwrap();
+    app.handle(Event::Mouse(crossterm::event::MouseEvent { kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: message.x + 1, row: message.y, modifiers: KeyModifiers::NONE }));
+    assert!(lines_of(&draw(&mut app, 80, 24)).iter().any(|l: &String| l.contains("vs HEAD (main · ")), "Status Details names the baseline");
+    app.handle(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert_eq!(std::fs::read_to_string(r.path().join("a.txt")).unwrap(), "one\ntwo\nthree\n");
 }
 
@@ -1162,8 +1174,8 @@ fn short_dialogs_keep_errors_and_consequences_above_the_actions() {
     for dark in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut a = app(dir.path(), dark);
-        a.run(CommandId::NewScratch);
-        a.modal.as_mut().unwrap().error = Some("That name is already in use".into());
+        a.prompt(Prompt::GoTo);
+        a.modal.as_mut().unwrap().error = Some("That line is past the file's end".into());
         draw(&mut a, 18, 8);
         assert!(a.layout.modal_rows.height > 0);
         assert!(a.layout.form_buttons.unwrap().iter().all(|b| b.y >= a.layout.modal_rows.bottom()));
@@ -1273,6 +1285,22 @@ fn the_number_column_keeps_its_background_past_the_last_line() {
     }
 }
 
+/// Only status bar cells that say something are controls: no Status Details target over blank space; the position
+/// is Go to Line.
+#[test]
+fn status_bar_controls_cover_only_drawn_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), false);
+    open(&mut app, dir.path(), "notes.txt", b"one\ntwo\n");
+    let buffer = draw(&mut app, 130, 20);
+    assert_eq!(app.session.status_message(), "");
+    // Status Details' only target is its labelled item, never the empty message.
+    let details: Vec<Rect> = app.layout.controls.iter().filter(|(id, _)| *id == CommandId::StatusDetails).map(|(_, r)| *r).collect();
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert_eq!((details[0].x..details[0].right()).map(|x| buffer[(x, 19)].symbol()).collect::<String>(), "Details ");
+    assert!(app.layout.controls.iter().any(|(id, r)| *id == CommandId::GoToLine && r.y == 19));
+}
+
 #[test]
 fn markdown_lists_show_each_marker_once_and_keep_tight_items_together() {
     let dir = tempfile::tempdir().unwrap();
@@ -1283,7 +1311,9 @@ fn markdown_lists_show_each_marker_once_and_keep_tight_items_together() {
     let buffer = draw(&mut app, 50, 20);
     // Left of the scrollbar column.
     let right = app.layout.panes[0].strip.x;
-    let rows: Vec<String> = (0..20).map(|y| (0..right).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_owned()).collect();
+    // The Source toggle floating over the first line is not the list's text.
+    let toggle = app.layout.controls.iter().find(|(id, _)| *id == CommandId::MarkdownSource).map(|(_, r)| *r).expect("the Source toggle");
+    let rows: Vec<String> = (0..20).map(|y| (0..right).map(|x| if toggle.contains(ratatui::layout::Position { x, y }) { " " } else { buffer[(x, y)].symbol() }).collect::<String>().trim_end().to_owned()).collect();
     let shown = |s: &str| rows.iter().position(|r| r.ends_with(s)).unwrap_or_else(|| panic!("{s:?} not in {rows:#?}"));
     for (row, marker) in [("a", "•"), ("one", "1."), ("task", "☐"), ("done", "☑")] {
         let r = &rows[shown(row)];

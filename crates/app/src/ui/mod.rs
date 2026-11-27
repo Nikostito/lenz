@@ -8,6 +8,7 @@ mod pane_search;
 mod editing;
 mod menus;
 mod message_panel;
+mod fields;
 mod palette_view;
 mod toolbar;
 use panes::PaneSizes;
@@ -110,6 +111,16 @@ impl Doc {
     pub fn load(set: &ChangeSet, index: usize, lp: &Path, rp: &Path, force: bool) -> Result<Self, String> {
         let prepared=crate::document::PreparedDocument::load(set,index,lp,rp,force)?;
         Ok(Self{text:prepared.text,image:prepared.image.and_then(Result::ok).map(|core|Arc::new(ImageDoc::from_core(core)))})
+    }
+
+    /// Both Sides hold the same content: pixels alone never make an image comparison identical, nor empty text
+    /// in place of binary or unread Sides.
+    pub(super) fn content_identical(&self) -> bool {
+        match &self.placeholder {
+            Some(Placeholder::Binary { differ, .. }) => !differ,
+            Some(Placeholder::Large { .. } | Placeholder::Unreadable(_)) => false,
+            None => self.text_left == self.text_right && self.image.as_ref().is_none_or(|i| i.same_bytes),
+        }
     }
 }
 
@@ -277,6 +288,17 @@ struct Labels {
 }
 
 pub struct Viewer {
+    field_inputs:crate::field_edit::Fields,
+    field_input_modal:Option<Modal>,
+    field_native:crate::field_edit::Native,
+    field_native_owner:Option<u64>,
+    field_native_stale:bool,
+    field_native_registered:std::rc::Rc<std::cell::Cell<bool>>,
+    field_native_observed:bool,
+    field_native_changes:u8,
+    field_native_suppress:Option<(u64,String)>,
+    #[cfg(all(test, feature="gui-test"))]
+    spawned_comparisons: Vec<(Vec<String>, PathBuf)>,
     panes: PaneSizes,
     palette: Arc<theme::Palette>,
     theme_chooser: Option<themes::ThemeChooser>,
@@ -359,6 +381,8 @@ pub struct Viewer {
     /// Drag selection: pointer x, rows and pixels to auto-scroll per tick (0 inside the pane).
     drag: (f32, f32, f32),
     drag_ticking: bool,
+    /// The Files list's scrollbar thumb while it is held: how far below its top it was pressed.
+    nav_bar_grab: Option<f32>,
     /// Horizontal scroll of both Sides' text, in pixels.
     hscroll: [f32; 2],
     /// Width of one character of the monospace font.
@@ -475,6 +499,20 @@ impl Viewer {
     }
 }
 
+/// Both identities matter: while a recompare runs, a menu can still target the preceding diff.
+#[derive(Clone, Copy)]
+struct HunkTarget {
+    block: usize,
+    generation: u64,
+    diffed: u64,
+}
+
+impl HunkTarget {
+    fn is_current(self, comparison: &crate::comparison_session::ComparisonSession) -> bool {
+        self.generation == comparison.generation && self.diffed == comparison.diffed
+    }
+}
+
 enum MenuAction {
     /// A catalog action, as the ☰ menu lists them.
     Run(crate::catalog::Action),
@@ -485,9 +523,9 @@ enum MenuAction {
     InteractionCommand(commands::Interaction),
     TextCopy(commands::Interaction,Side,Option<Selection>,u64),
     ToggleBlame,
-    Fold(usize),
+    Fold(HunkTarget),
     /// Copy a Change Block onto this Side.
-    Move(usize, Side),
+    Move(HunkTarget, Side),
     /// A Merge View action on one merge block.
     Merge(merge_view::Control),
     /// Comparison, Side, 1-based line, and whether to use the system default app.
@@ -610,12 +648,9 @@ struct Tip(SharedString, Arc<theme::Palette>);
 
 impl Render for Tip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        lenz_gpui::popup::dialog(div(), &self.1)
             .px_2()
             .py_1()
-            .bg(rgb(self.1.status_bg))
-            .border_1()
-            .border_color(rgb(self.1.border))
             .text_color(rgb(self.1.fg))
             .text_size(px(12.0))
             .child(self.0.clone())
@@ -740,6 +775,10 @@ impl Viewer {
         comparison.view.set_unified(crate::settings::get().view.unified);
         comparison.banner = gave_up.then(|| "Unable to calculate diff — file too big / too many changes".into());
         let mut viewer = Viewer {
+            field_inputs:Default::default(),field_input_modal:None,
+            field_native:Default::default(),field_native_owner:None,field_native_stale:false,field_native_registered:Default::default(),field_native_observed:false,field_native_changes:0,field_native_suppress:None,
+            #[cfg(all(test, feature="gui-test"))]
+            spawned_comparisons: Vec::new(),
             palette: cx.global::<themes::GuiThemes>().0.snapshot().palette,
             theme_chooser: None,
             theme_preview: None,
@@ -791,6 +830,7 @@ impl Viewer {
             search: None,
             drag: (0.0, 0.0, 0.0),
             drag_ticking: false,
+            nav_bar_grab: None,
             hscroll: [0.0; 2],
             char_w: 0.0,
             text_w: [600.0; 2],
@@ -825,7 +865,7 @@ impl Viewer {
         let start = viewer.comparison.folders.start(&viewer.set);
         viewer.sync_nav();
         viewer.layout.set_files(viewer.set.comparisons.len() > 1);
-        if !viewer.set.comparisons.is_empty(){viewer.loaded.insert(0, Loaded::new(doc, 0));}else{viewer.nothing=Some(commands::NOTHING_OPEN.into());viewer.comparison.empty=true;}
+        if !viewer.set.comparisons.is_empty(){viewer.loaded.insert(0, Loaded::new(doc, 0));}else{viewer.nothing=Some(commands::empty_label(&viewer.spec).into());viewer.comparison.empty=true;}
         viewer.ensure_blame(cx);
         if start != 0 { viewer.open(start, Place::FirstChange, cx); }
         viewer.poll_folders(cx);
@@ -915,6 +955,10 @@ impl Viewer {
         self.refresh_conflicts(cx);
     }
 
+    pub fn start_in_focus(&mut self) {
+        self.layout = crate::layout::Layout::focused_selection(self.layout.files());
+    }
+
     /// Show another Change Set (picked in the picker): its first file, everything per-file reset.
     pub(super) fn show_change_set(&mut self, set: impl Into<Arc<ChangeSet>>, cx: &mut Context<Self>) {
         self.show_change_set_with(set.into(), None, cx);
@@ -937,7 +981,7 @@ impl Viewer {
         self.diff_options = None;
         self.applied_scroll = 0.0;
         let empty = set.comparisons.is_empty();
-        self.nothing = empty.then(|| "No changes in this selection".into());
+        self.nothing = empty.then(|| commands::empty_label(&self.spec).into());
         self.comparison.empty = empty;
         self.set = set;
         // the session indexes Viewed Marks and review threads into the comparison on screen
@@ -982,7 +1026,7 @@ impl Viewer {
             if let Some(t) = r.selection_title() { return format!("{} — {repo} — Lenz", t.text); }
             if r.picker.shown { return format!("{repo} — {} — Lenz", r.picker.title_branch); }
         }
-        if self.set.comparisons.is_empty() { return "Lenz".into(); }
+        if self.set.comparisons.is_empty() { return crate::selection_title::title(&self.spec, None, &[], None).map_or_else(|| "Lenz".into(), |t| format!("{} — Lenz", t.text)); }
         let l = self.labels(self.comparison.current);
         let mut title = if l.left == l.right { l.right } else { format!("{} ⟷ {}", l.left, l.right) };
         if self.set.comparisons.len() > 1 {
@@ -1577,7 +1621,8 @@ impl Viewer {
     /// Diff in the background: the lines, then the shown blocks' Inline Changes. Past `DIFF_PATIENCE` it gives
     /// up for this file and options, showing the text alone under a banner; a late result is dropped.
     fn diff(&mut self, doc: Arc<Doc>, place: Place, cx: &mut Context<Self>) {
-        if doc.placeholder.is_some() || doc.image.is_some() {
+        // an SVG's source is diffed for its Source mode; a raster image has no text
+        if doc.placeholder.is_some() || doc.image.as_ref().is_some_and(|i| !i.source) {
             self.comparison.diffed = self.comparison.generation;
             return;
         }
@@ -1654,6 +1699,18 @@ impl Viewer {
             .ok();
         })
         .detach();
+    }
+
+    /// The notes in front of the status line, left to right: a Merge View's own (the 2-way Comparison underneath isn't
+    /// shown), else the Comparison's (its file's notes, last first, then its status notice).
+    pub(super) fn status_notes(&self) -> Vec<String> {
+        if let Some(notices) = self.merge_notices() { return notices; }
+        let loaded = self.loaded.get(&self.comparison.current);
+        let identical = loaded.is_some_and(|l| l.doc.content_identical());
+        let notice = self.set.comparisons.get(self.comparison.current).and_then(|c| navigator::notice(&c.status, identical));
+        let notes = loaded.map_or(Vec::new(), |l| l.doc.notes.iter().cloned()
+            .chain(Parsed::limit_note(l.parsed.iter().map(Option::as_deref)).map(str::to_owned)).collect());
+        notice.into_iter().chain(notes).rev().collect()
     }
 
     fn parse_in_background(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1758,10 +1815,13 @@ impl Viewer {
         .detach();
     }
 
+    /// Reserve reading space even before the first font metrics arrive.
+    fn comparison_min_width(&self) -> f32 { (60.0 * self.char_w).max(400.0) }
+
     /// The File Navigator's width (0 when hidden).
     fn sidebar_w(&self) -> f32 {
         // a PR's Conversation and Commits read without the file list; Files changed has it
-        if self.layout.files() && !self.pr_details_shown() { crate::pane_layout::clamp_size((self.panes.viewport[0]-self.picker_w()).max(0.0),self.panes.navigator,100.0,120.0) } else { 0.0 }
+        if self.layout.files() && !self.pr_details_shown() { crate::pane_layout::clamp_size((self.panes.viewport[0]-self.picker_w()).max(0.0),self.panes.navigator,100.0,self.comparison_min_width()) } else { 0.0 }
     }
 
     /// Window x where the File Navigator starts (right of the picker's sidebar).
@@ -1776,6 +1836,20 @@ impl Viewer {
 
     fn in_nav(&self, x: f32) -> bool {
         x >= self.nav_x() && x < self.diff_x()
+    }
+
+    /// The Files list's scrollbar: its track's top and height in the window, and the rows it stands for (one past
+    /// the last, as the list scrolls). `None` while the list is hidden.
+    fn nav_bar(&self) -> Option<(f32, f32, lenz_gpui::popup::Scrolled)> {
+        let visible = self.comparison.view.viewport_rows().floor().max(0.0) as usize;
+        (self.sidebar_w() > 0.0 && visible > 0).then(|| (self.nav_top(), visible as f32 * line_h(), lenz_gpui::popup::Scrolled { total: self.nav.len() + 1, first: self.nav_scroll.round() as usize, visible }))
+    }
+
+    /// Hold the Files list's thumb `grab` px below its top at window `y`.
+    fn nav_bar_to(&mut self, grab: f32, y: f32, cx: &mut Context<Self>) {
+        let Some((top, h, list)) = self.nav_bar() else { self.nav_bar_grab = None; return };
+        self.nav_scroll = lenz_gpui::popup::first_at(y - top - grab, h, list) as f32;
+        cx.notify();
     }
 
     /// Window y where the panes' rows start: below the toolbar, the log (when shown) and the header.
@@ -2021,7 +2095,7 @@ impl Viewer {
         let o = self.comparison.find_options;
         Some(lenz_gpui::find::FindBox {
             bounds: Bounds::default(), toggles: [(FindOption::Case, Bounds::default()); 3],
-            on: [o.case, o.word, o.regex], query: f.query.clone(), counter: f.counter(),
+            on: [o.case, o.word, o.regex], query: self.projected_field(Modal::Find as u64,&f.query,self.field_inputs.cursor(Modal::Find as u64,0).unwrap_or_default(),(widths[side as usize]/self.text_char_w()).max(0.0) as usize).text, query_cursor:self.projected_field(Modal::Find as u64,&f.query,self.field_inputs.cursor(Modal::Find as u64,0).unwrap_or_default(),(widths[side as usize]/self.text_char_w()).max(0.0) as usize).cursor, replace_cursor:Default::default(), counter: f.counter(),
             error: f.error().is_some(), focused: self.modal() == Some(Modal::Find),
             // Diff's find bar searches the comparison; it has no replace.
             show_replace: false, replace_label: String::new(), replace: String::new(), replace_focused: false, replace_row: Bounds::default(),
@@ -2040,7 +2114,7 @@ impl Viewer {
         self.search.as_ref().filter(|s| s.editing).map(|s| {
             let only = if s.changed_only { "on" } else { "off" };
             let error = s.query_error().map_or(String::new(), |e| format!("   {e}"));
-            format!("Find in Change Set: {}▏   {TOGGLES}   alt-o changed lines only: {only}{error}", s.query)
+            format!("Find in Change Set: {TOGGLES}   alt-o changed lines only: {only}{error}")
         })
     }
 
@@ -2049,21 +2123,21 @@ impl Viewer {
         if let Some(text) = self.git_prompt_text() {
             return Some(text);
         }
-        let q = self.goto.as_ref()?;
+        self.goto.as_ref()?;
         let side = if self.sel.is_some_and(|s| s.side == Side::Left) { "left" } else { "right" };
-        Some(format!("Go to line[:column] on the {side} Side: {q}▏"))
+        Some(format!("Go to line[:column] on the {side} Side · Enter opens · Esc closes"))
     }
 
     /// Whether a point lies on the open Go to file or Go to line box (as painted).
     /// The Change Set search prompt's option toggles as painted: which option, and its box (x, y, width, height).
     pub(super) fn search_toggles(&self) -> Vec<(FindOption, (f32, f32, f32, f32))> {
         let (Some(prompt), None) = (self.search_prompt(), self.goto_prompt()) else { return Vec::new() };
-        let Some(s) = self.search.as_ref() else { return Vec::new() };
+        let Some(_s) = self.search.as_ref() else { return Vec::new() };
         let [vw, _] = self.panes.viewport;
         let (x0, w) = (self.diff_x(), vw - self.diff_x());
-        let bw = prompt.chars().count() as f32 * self.text_char_w() + 24.0;
+        let bw = (prompt.chars().count() as f32 * self.text_char_w() + 24.0).min((w-24.0).max(0.0));
         let (bx, by) = (x0 + (w - bw) / 2.0, toolbar_h() + self.log_h() + 60.0);
-        let lead = "Find in Change Set: ".chars().count() + s.query.chars().count() + "▏   ".chars().count();
+        let lead = "Find in Change Set: ".chars().count();
         toggle_spans().into_iter().map(|(o, at, len)| (o, (bx + 12.0 + (lead + at) as f32 * self.text_char_w() - 2.0, by + 2.0, len as f32 * self.text_char_w() + 4.0, line_h() + 8.0))).collect()
     }
 
@@ -2076,8 +2150,8 @@ impl Viewer {
             (x0 + (w - bw) / 2.0, top + 60.0, bw, (s.hits.len() as f32 + 1.0) * line_h() + 16.0)
         } else if let Some(prompt) = self.goto_prompt().or_else(|| self.search_prompt()) {
             let (x0, w) = (self.diff_x(), vw - self.diff_x());
-            let bw = prompt.chars().count() as f32 * self.text_char_w() + 24.0;
-            (x0 + (w - bw) / 2.0, top + 60.0, bw, line_h() + 12.0)
+            let bw = (prompt.chars().count() as f32 * self.text_char_w() + 24.0).min((w-24.0).max(0.0));
+            (x0 + (w - bw) / 2.0, top + 60.0, bw, 2.0*line_h() + 12.0)
         } else {
             return false;
         };
@@ -2122,8 +2196,9 @@ impl Viewer {
                     (_, MenuAction::ToggleBlame) => self.toggle_blame(cx),
                     (_, MenuAction::Command(command)) => self.comparison_command(*command, cx),
                     (_, MenuAction::InteractionCommand(command))=>self.interaction(*command,cx),
-                    (_, MenuAction::Fold(i)) => self.fold(Some(*i), cx),
-                    (_, MenuAction::Move(i, onto)) => self.move_change(*i, *onto, cx),
+                    (_, MenuAction::Fold(target)) if target.is_current(&self.comparison) => self.fold(Some(target.block), cx),
+                    (_, MenuAction::Move(target, onto)) if target.is_current(&self.comparison) => self.move_change(target.block, *onto, cx),
+                    (_, MenuAction::Fold(_) | MenuAction::Move(..)) => self.toast("Comparison changed — reopen the menu".into(), cx),
                     (_, MenuAction::Merge(c)) => self.merge_control(*c, cx),
                     (_, MenuAction::Open(index, side, line, default_app)) => self.open_file(*index, *side, *line, None, *default_app, cx),
                     (_, MenuAction::MarkResolved(path)) => self.mark_resolved(path.clone(), cx),
@@ -2142,6 +2217,7 @@ impl Viewer {
     /// The Ctrl+F bar stays while it is clicked; any other click does what it would and then closes the bar.
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.double_shift.interrupt();
+        if self.native_field_click(ev,window,cx){return;}
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
         let outside_find = self.find_bar_box().is_some_and(|(bx, by, bw, bh)| !(x >= bx && x < bx + bw && y >= by && y < by + bh));
         // A find option toggle in the find bar or the Change Set search prompt flips that option; either stays.
@@ -2255,6 +2331,16 @@ impl Viewer {
             self.panel_click(y, panel_top, cx);
             cx.notify();
             return;
+        }
+        // The Files list's scrollbar: the thumb is held where it was pressed; a press on the track brings its middle there.
+        if ev.button == MouseButton::Left && self.in_nav(x) && x >= self.diff_x() - 12.0
+            && let Some((top, h, list)) = self.nav_bar()
+            && let Some((_, thumb_y, thumb_h)) = lenz_gpui::popup::thumb(0.0, top, 0.0, h, list)
+        {
+            let grab = if (thumb_y..thumb_y + thumb_h).contains(&y) { y - thumb_y } else { thumb_h / 2.0 };
+            self.nav_bar_grab = Some(grab);
+            self.dragging = false;
+            return self.nav_bar_to(grab, y, cx);
         }
         if self.in_nav(x) {
             self.nav_focused = true;
@@ -2398,7 +2484,7 @@ impl Viewer {
     fn drag_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(30)).await;
+                cx.background_executor().timer(lenz_gpui::scroll::DRAG_TICK).await;
                 let go = this
                     .update_in(cx, |v: &mut Viewer, window, cx| {
                         let (x, rows, px) = v.drag;
@@ -2434,6 +2520,7 @@ impl Viewer {
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_bar_grab.take().is_some() { return; }
         self.message_release(cx);
         self.pr_dialog_release();
         self.panes.drag=None;
@@ -2524,16 +2611,17 @@ impl Viewer {
             _ => None,
         };
         if let Some(i) = block {
+            let target = HunkTarget { block: i, generation: self.comparison.generation, diffed: self.comparison.diffed };
             if self.comparison.view.can_fold(i) {
                 let label = crate::catalog::pointer::fold(self.comparison.view.folded(i));
-                items.push((label.into(), MenuAction::Fold(i)));
+                items.push((label.into(), MenuAction::Fold(target)));
             }
             let writable = self.doc().map_or([false, false], |d| d.writable.each_ref().map(|w| w.is_ok()));
             if writable[1] {
-                items.push((crate::catalog::pointer::move_change(Side::Right).into(), MenuAction::Move(i, Side::Right)));
+                items.push((crate::catalog::pointer::move_change(Side::Right).into(), MenuAction::Move(target, Side::Right)));
             }
             if writable[0] {
-                items.push((crate::catalog::pointer::move_change(Side::Left).into(), MenuAction::Move(i, Side::Left)));
+                items.push((crate::catalog::pointer::move_change(Side::Left).into(), MenuAction::Move(target, Side::Left)));
             }
         }
         let at = match self.content_at(side, y) {
@@ -2558,6 +2646,10 @@ impl Viewer {
         if self.resize_blocked(){self.panes.drag=None;}
         if self.modal().is_some_and(|m|matches!(m,Modal::Question|Modal::Discard|Modal::Checkout|Modal::About|Modal::Theme|Modal::Help)){return;}
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+        if let Some(grab) = self.nav_bar_grab {
+            if ev.pressed_button == Some(MouseButton::Left) { self.nav_bar_to(grab, y, cx); } else { self.nav_bar_grab = None; }
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             let hover = menu.item_at(x, y, self.char_w,self.panes.viewport);
             if hover != menu.hover {
@@ -2590,9 +2682,9 @@ impl Viewer {
             let bottom = self.content_bottom() - self.panel_h() - self.picker_v_height();
             let (start, end) = self.pane_span(window, sel.side);
             let top = self.top();
-            let rows = (if y < top { y - top } else if y > bottom { y - bottom } else { 0.0 }) / line_h();
+            let past = if y < top { y - top } else if y > bottom { y - bottom } else { 0.0 };
             let px = if x < start { x - start } else if x > end { x - end } else { 0.0 };
-            self.drag = (x, (rows * 0.5).clamp(-6.0, 6.0), (px * 0.5).clamp(-60.0, 60.0));
+            self.drag = (x, lenz_gpui::scroll::drag_rows(past, line_h()), (px * 0.5).clamp(-60.0, 60.0));
             if (self.drag.1 != 0.0 || self.drag.2 != 0.0) && !self.drag_ticking {
                 self.drag_ticking = true;
                 self.drag_tick(window, cx);
@@ -2893,11 +2985,13 @@ impl Viewer {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.native_field_key(ev,window,cx){return;}
         if !matches!(ev.keystroke.key.as_str(), "shift" | "control" | "alt" | "super" | "meta" | "fn") { self.double_shift.interrupt(); }
         self.panes.drag=None;
         // a key other than a quit cancels a quit refused for unsaved changes
         if !matches!(ev.keystroke.key.as_str(),"q"|"w"){self.edits.keep_open();}
         if self.discard_modal(){match ev.keystroke.key.as_str(){"escape"=>self.file_actions.cancel(),"enter" if !self.file_actions.busy()=>self.confirm_discard(cx),_=>{}}cx.notify();return;}
+        if self.field_input_key(ev,cx){return;}
         if self.checkout_key(ev,cx)||self.git_prompt_key(ev,cx){return;}
         if self.theme_key(ev,cx) { return; }
         if let Some(about)=&mut self.about {
@@ -3296,6 +3390,8 @@ fn paint_sidebar(palette: &theme::Palette,
     (rows, header): &(Vec<SideRow>, String),
     scroll: f32,
     tooltip: Option<&(usize, String)>,
+    char_w: f32,
+    bar: Option<(f32, f32, lenz_gpui::popup::Scrolled)>,
 ) {
     let (x0, top) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
     let h = f32::from(bounds.size.height);
@@ -3325,11 +3421,12 @@ fn paint_sidebar(palette: &theme::Palette,
             colored_text(palette, window, cx, font, x0 + 8.0 + row.indent, y, &s, &spans, &found);
         }
     });
+    if let Some((bar_top, bar_h, list)) = bar { lenz_gpui::popup::scrollbar(window, x0, bar_top, sidebar_w - 1.0, bar_h, list, palette); }
     fill(window, x0 + sidebar_w - 1.0, top, 1.0, h, palette.border);
     if let Some((row, tip)) = tooltip {
         let y = list_top + (*row as f32 + 1.0 - scroll) * line_h();
-        let tw = tip.chars().count() as f32 * 7.8 + 16.0;
-        fill(window, x0 + 24.0, y, tw, line_h(), palette.status_bg);
+        let tw = tip.chars().count() as f32 * char_w + 16.0;
+        paint_raised(window, x0 + 24.0, y, tw, line_h(), palette);
         text(window, cx, font, x0 + 32.0, y, tip, palette.fg);
     }
 }
@@ -3343,21 +3440,21 @@ fn paint_switcher(palette: &theme::Palette,
     top: f32,
     w: f32,
     query: &str,
+    cursor: crate::field_edit::Cursor,
+    char_w:f32,
     selected: usize,
     hits: &[(String, String, u32)],
 ) {
     let bw = 720.0f32.min(w - 40.0);
     let (bx, by) = (x0 + (w - bw) / 2.0, top + 60.0);
     let bh = (hits.len() as f32 + 1.0) * line_h() + 16.0;
-    fill(window, bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0, palette.border);
-    fill(window, bx, by, bw, bh, palette.status_bg);
-    let prompt = format!("Go to changed file: {query}▏");
-    let spans = [(0.."Go to changed file: ".len(), palette.dim)];
-    colored_text(palette, window, cx, font, bx + 10.0, by + 6.0, &prompt, &spans, &[]);
+    paint_raised(window, bx, by, bw, bh, palette);
+    text(window,cx,font,bx+10.0,by+6.0,"File:",palette.dim);
+    lenz_gpui::field::paint(lenz_gpui::field::View{text:query,cursor,bounds:Bounds{origin:point(px(bx+70.0),px(by+6.0)),size:size(px((bw-80.0).max(0.0)),px(line_h()))},char_w,active:true},window,cx,metrics(font),palette);
     for (i, (name, dir, color)) in hits.iter().enumerate() {
         let y = by + 8.0 + (i as f32 + 1.0) * line_h();
         if i == selected {
-            fill(window, bx, y, bw, line_h(), palette.selected_bg);
+            lenz_gpui::popup::row(window, bx, y, bw, line_h(), lenz_gpui::popup::selected(palette));
         }
         let line = format!("{name}  {dir}");
         let spans = [(0..name.len(), *color), (name.len()..line.len(), palette.dim)];
@@ -3481,6 +3578,10 @@ impl Viewer {
 
 impl Render for Viewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !std::mem::replace(&mut self.field_native_observed,true) {
+            cx.on_blur(&self.focus,window,|v,_,cx|{v.field_native.cancel();v.field_native_stale=true;cx.notify();}).detach();
+            cx.observe_window_activation(window,|v,window,cx|{if !window.is_window_active(){v.field_native.cancel();v.field_native_stale=true;cx.notify();}}).detach();
+        }
         // A tap before the window lost focus does not pair with one after.
         if !window.is_window_active() { self.double_shift.reset(); }
         self.restore_and_record_place(cx);
@@ -3629,17 +3730,9 @@ impl Render for Viewer {
         let (left, right) = if self.nothing.is_some() { (Vec::new(), Vec::new()) } else { (left, right) };
         let nothing = self.nothing.clone();
         let (picker_w, log_h) = (self.picker_w(), self.log_h());
-        let comparison = self.set.comparisons.get(self.comparison.current);
-        let identical = loaded.is_some_and(|l| l.doc.text_left == l.doc.text_right);
-        let notice = comparison.and_then(|comparison|navigator::notice(&comparison.status, identical));
-        // a Merge View has notices of its own; the 2-way Comparison underneath isn't shown
-        let merging = self.merge_notices();
-        let mut status = status_text(&self.comparison.options, self.comparison.view.mode(), line_endings.filter(|_| merging.is_none()));
+        let mut status = status_text(&self.comparison.options, self.comparison.view.mode(), line_endings.filter(|_| self.merge.is_none()));
         if self.comparison.markdown_loading()||self.markdown_building(){status=format!("Preparing Markdown… · {status}");}
-        let notes = loaded.map_or(Vec::new(), |l| l.doc.notes.clone());
-        // each note goes in front: the merge's in reverse, to read in order
-        let notes: Vec<String> = merging.map_or_else(|| notice.into_iter().chain(notes).collect(), |m| m.into_iter().rev().collect());
-        for n in notes {
+        for n in self.status_notes().into_iter().rev() {
             status = if status.is_empty() { n } else { format!("{n} · {status}") };
         }
         let encodings = loaded.map_or([None, None], |l| l.doc.encodings.clone());
@@ -3667,6 +3760,8 @@ impl Render for Viewer {
             let tip: Vec<String> = renamed.into_iter().chain(edited).collect();
             (!tip.is_empty()).then(|| (row, tip.join(" · ")))
         });
+        let switcher_input=self.field_snapshot((self.panes.viewport[0]/char_w.max(1.0)).max(0.0) as usize);
+        let self_cursor=switcher_input.as_ref().map_or_else(||self.field_inputs.cursor(Modal::Switcher as u64,0).unwrap_or_default(),|s|s.cursor);
         let switcher = self.switcher.as_ref().map(|sw| {
             let hits: Vec<(String, String, u32)> = sw
                 .hits
@@ -3678,9 +3773,9 @@ impl Render for Viewer {
                     Some((format!("{} {name}", navigator::badge(&c.status)), dir.to_string(), status_color(&palette, &c.status)))
                 })
                 .collect();
-            (sw.query.clone(), sw.selected, hits)
+            (switcher_input.as_ref().map_or_else(||sw.query.clone(),|s|s.text.clone()), sw.selected, hits)
         });
-        let (sw_w, nav_scroll) = (self.sidebar_w(), self.nav_scroll);
+        let (sw_w, nav_scroll, nav_bar) = (self.sidebar_w(), self.nav_scroll, self.nav_bar());
         let labels = self.labels(self.comparison.current);
         let mut position = if self.set.comparisons.len() > 1 {
             format!("   file {}/{}", self.comparison.current + 1, self.set.comparisons.len())
@@ -3694,12 +3789,15 @@ impl Render for Viewer {
         }
         let menu=self.menu.as_ref().map(|m| {
             let (x,y,width,rows)=m.layout(self.panes.viewport,char_w);let start=m.start(rows);
-            (x,y,width,m.items.iter().skip(start).take(rows).map(|i|i.0.clone()).collect::<Vec<_>>(),m.hover.map(|i|i-start),start, m.items.len())
+            // a catalog action that cannot run now is dim; its label already carries the reason
+            let disabled=|action:&MenuAction|matches!(action,MenuAction::Run(a) if crate::catalog::Availability::disabled(self,*a).is_some());
+            (x,y,width,m.items.iter().skip(start).take(rows).map(|i|(i.0.clone(),disabled(&i.1))).collect::<Vec<_>>(),m.hover.map(|i|i-start),start, m.items.len())
         });
         let goto = self.goto_prompt();
+        let field_snapshot = self.field_snapshot((self.panes.viewport[0]/char_w.max(1.0)).max(0.0) as usize);
         let find_control = self.find_control();
         let search_prompt = self.search_prompt();
-        let search_x = self.search_prompt().map_or(0.0, |p| { let [vw, _] = self.panes.viewport; self.diff_x() + (vw - self.diff_x() - (p.chars().count() as f32 * self.text_char_w() + 24.0)) / 2.0 });
+        let search_x = self.search_prompt().map_or(0.0, |p| { let [vw, _] = self.panes.viewport; let w=vw-self.diff_x();self.diff_x() + (w-(p.chars().count() as f32*self.text_char_w()+24.0).min((w-24.0).max(0.0)))/2.0 });
         let search_marks: Vec<(f32, f32, bool)> = self.search_toggles().into_iter().map(|(o, (x, _, w, _))| (x - search_x, w, self.search.as_ref().is_some_and(|s| s.options().get(o)))).collect();
         let panel = self.search.as_ref().filter(|s| !s.editing).map(|s| {
             let files = s.rows().iter().filter(|r| matches!(r, PanelRow::File(..))).count();
@@ -3761,22 +3859,28 @@ impl Render for Viewer {
                 .child(canvas(|_,_,_|{},move|bounds,_,window,cx|{
                     let ((x,y,w,h),visible)=help_layout(bounds.size);
                     let clip=Bounds{origin:point(px(x),px(y)),size:size(px(w),px(h))};
-                    fill(window,x,y,w,h,palette.border);
-                    fill(window,x+1.0,y+1.0,(w-2.0).max(0.0),(h-2.0).max(0.0),palette.status_bg);
+                    paint_raised(window,x+1.0,y+1.0,(w-2.0).max(0.0),(h-2.0).max(0.0),&palette);
                     window.with_content_mask(Some(ContentMask{bounds:clip}),|window|{
                         text(window,cx,&font,x+12.0,y+8.0,"Key bindings",palette.accent);
                         let content=Bounds{origin:point(px(x+12.0),px(y+36.0)),size:size(px((w-24.0).max(0.0)),px(visible as f32*line_h()))};
                         window.with_content_mask(Some(ContentMask{bounds:content}),|window|{
                             for (i,(line,keys)) in rows.iter().skip(scroll).take(visible).enumerate(){text(window,cx,&font,x+12.0,y+36.0+i as f32*line_h(),line,if *keys{palette.accent}else{palette.fg});}
                         });
+                        lenz_gpui::popup::scrollbar(window, x, y + 36.0, w, visible as f32 * line_h(), lenz_gpui::popup::Scrolled { total: rows.len(), first: scroll, visible }, &palette);
                         let close=help_close_bounds(bounds.size);let cy=f32::from(close.origin.y);
-                        fill(window,x+8.0,cy,f32::from(close.size.width),f32::from(close.size.height),palette.selected_bg);
+                        fill(window,x+8.0,cy,f32::from(close.size.width),f32::from(close.size.height),lenz_gpui::popup::selected(&palette));
                         text(window,cx,&font,x+12.0,cy,"Close · Esc / Enter",palette.accent);
                         text(window,cx,&font,x+12.0,cy-line_h(),"↑/↓ PgUp/PgDn Home/End · wheel",palette.dim);
                     });
                 }).size_full())
         });
         let toolbar = self.toolbar(cx);
+        self.sync_native_field();
+        let native_changes=std::mem::take(&mut self.field_native_changes);
+        if native_changes&1!=0 {window.notify_text_input_changed(&self.focus);}
+        if native_changes&2!=0 {window.notify_text_selection_changed(&self.focus);}
+        self.field_native_registered.set(false);
+        let native_input=self.native_field().is_some().then(||(self.focus.clone(),cx.entity().clone(),self.field_native_registered.clone()));
         let footer = self.footer();
         if let Some(about)=&mut self.about{about.scroll=about.scroll.min(about::About::max_scroll(window.viewport_size(),self.char_w));}
         let about_palette=palette.clone();
@@ -3797,6 +3901,7 @@ impl Render for Viewer {
             .flex_col()
             .bg(rgb(palette.bg))
             .track_focus(&self.focus)
+            .child(canvas(|_,_,_|{},move|bounds,_,window,cx|{if let Some((focus,entity,registered))=&native_input{window.handle_input(focus,gpui::ElementInputHandler::new(bounds,entity.clone()),cx);registered.set(true);}}).absolute().size_full())
             // capture phase: before any handler can stop propagation
             .capture_key_down(|_, window, _| present::soon(window))
             .capture_any_mouse_down(|_, window, _| present::soon(window))
@@ -3847,7 +3952,7 @@ impl Render for Viewer {
                         let h = f32::from(bounds.size.height);
                         let (left_edge, top) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
                         if let Some(rows) = &sidebar {
-                            paint_sidebar(&palette, window, cx, &font, bounds, sw_w, rows, nav_scroll, tooltip.as_ref());
+                            paint_sidebar(&palette, window, cx, &font, bounds, sw_w, rows, nav_scroll, tooltip.as_ref(), char_w, nav_bar);
                         }
                         // the diff area sits right of the File Navigator
                         let x0 = left_edge + sw_w;
@@ -3925,10 +4030,9 @@ impl Render for Viewer {
                         }
                         if let Some(summary) = &summary_frame { summary.paint(&palette, &font, char_w, window, cx); }
                         if let Some(message) = &toast {
-                            let tw = message.chars().count() as f32 * 7.8 + 24.0;
+                            let tw = message.chars().count() as f32 * char_w + 24.0;
                             let (tx, ty) = (x0 + (w - tw) / 2.0, y0 + h - line_h() * 3.0);
-                            fill(window, tx - 1.0, ty - 1.0, tw + 2.0, line_h() + 10.0, palette.border);
-                            fill(window, tx, ty, tw, line_h() + 8.0, palette.status_bg);
+                            paint_raised(window, tx, ty, tw, line_h() + 8.0, &palette);
                             text(window, cx, &font, tx + 12.0, ty + 4.0, message, palette.fg);
                         }
                         if let Some(message) = &placeholder {
@@ -3958,36 +4062,41 @@ impl Render for Viewer {
                             });
                         }
                         if let Some(prompt) = &search_prompt {
-                            let bw = prompt.chars().count() as f32 * char_w + 24.0;
+                            let bw = (prompt.chars().count() as f32 * char_w + 24.0).min((w-24.0).max(0.0));
                             let (bx, by) = (x0 + (w - bw) / 2.0, top + 60.0);
-                            fill(window, bx - 1.0, by - 1.0, bw + 2.0, line_h() + 14.0, palette.border);
-                            fill(window, bx, by, bw, line_h() + 12.0, palette.status_bg);
+                            paint_raised(window, bx, by, bw, 2.0*line_h() + 12.0, &palette);
                             for (dx, mw, on) in &search_marks {
                                 fill(window, bx + dx, by + 2.0, *mw, line_h() + 8.0, palette.border);
-                                fill(window, bx + dx + 1.0, by + 3.0, mw - 2.0, line_h() + 6.0, if *on { palette.selected_bg } else { palette.status_bg });
+                                fill(window, bx + dx + 1.0, by + 3.0, mw - 2.0, line_h() + 6.0, if *on { lenz_gpui::popup::selected(&palette) } else { lenz_gpui::popup::colors(&palette).0 });
                             }
-                            text(window, cx, &font, bx + 12.0, by + 6.0, prompt, palette.fg);
+                            let bounds=Bounds{origin:point(px(bx),px(by)),size:size(px(bw),px(line_h()+12.0))};
+                            window.with_content_mask(Some(ContentMask{bounds}),|window|text(window, cx, &font, bx + 12.0, by + 6.0, prompt, palette.fg));
+                            if let Some(field)=&field_snapshot {
+                                lenz_gpui::field::paint(lenz_gpui::field::View{text:&field.text,cursor:field.cursor,bounds:Bounds{origin:point(px(bx+12.0),px(by+6.0+line_h())),size:size(px((bw-24.0).max(0.0)),px(line_h()))},char_w,active:true},window,cx,metrics(&font),&palette);
+                            }
                         }
                         if let Some(prompt) = &goto {
-                            let bw = prompt.chars().count() as f32 * char_w + 24.0;
+                            let bw = (prompt.chars().count() as f32 * char_w + 24.0).min((w-24.0).max(0.0));
                             let (bx, by) = (x0 + (w - bw) / 2.0, top + 60.0);
-                            fill(window, bx - 1.0, by - 1.0, bw + 2.0, line_h() + 14.0, palette.border);
-                            fill(window, bx, by, bw, line_h() + 12.0, palette.status_bg);
-                            text(window, cx, &font, bx + 12.0, by + 6.0, prompt, palette.fg);
+                            paint_raised(window, bx, by, bw, 2.0*line_h() + 12.0, &palette);
+                            let bounds=Bounds{origin:point(px(bx),px(by)),size:size(px(bw),px(line_h()+12.0))};
+                            window.with_content_mask(Some(ContentMask{bounds}),|window|text(window, cx, &font, bx + 12.0, by + 6.0, prompt, palette.fg));
+                            if let Some(field)=&field_snapshot {
+                                lenz_gpui::field::paint(lenz_gpui::field::View{text:&field.text,cursor:field.cursor,bounds:Bounds{origin:point(px(bx+12.0),px(by+6.0+line_h())),size:size(px((bw-24.0).max(0.0)),px(line_h()))},char_w,active:true},window,cx,metrics(&font),&palette);
+                            }
                         }
                         if let Some((mx, my, mw, items, hover, start, total)) = &menu {
                             let mh = items.len() as f32 * line_h() + 8.0;
                             paint_raised(window, *mx, *my, *mw, mh, &palette);
-                            for (i, label) in items.iter().enumerate() {
+                            for (i, (label, disabled)) in items.iter().enumerate() {
                                 let iy = my + 4.0 + i as f32 * line_h();
                                 if *hover == Some(i) {
-                                    fill(window, *mx, iy, *mw, line_h(), palette.selected_bg);
+                                    lenz_gpui::popup::row(window, *mx, iy, *mw, line_h(), lenz_gpui::popup::selected(&palette));
                                 }
                                 let bounds=Bounds{origin:point(px(*mx),px(iy)),size:size(px(*mw),px(line_h()))};
-                                window.with_content_mask(Some(ContentMask{bounds}),|window|text(window,cx,&font,mx+12.,iy,label,palette.fg));
+                                window.with_content_mask(Some(ContentMask{bounds}),|window|text(window,cx,&font,mx+12.,iy,label,if *disabled {palette.dim} else {palette.fg}));
                             }
-                            if *start>0 {text(window,cx,&font,mx+2.,my+4.,"↑",palette.dim);}
-                            if start+items.len()<*total {text(window,cx,&font,mx+2.,my+4.+items.len().saturating_sub(1) as f32*line_h(),"↓",palette.dim);}
+                            lenz_gpui::popup::scrollbar(window, *mx, my + 4.0, *mw, items.len() as f32 * line_h(), lenz_gpui::popup::Scrolled { total: *total, first: *start, visible: items.len() }, &palette);
                         }
                         if let Some(d) = &diff_options {
                             paint_raised(window, d.x, d.y, d.width, d.height, &palette);
@@ -3996,7 +4105,7 @@ impl Render for Viewer {
                                 text(window, cx, &font, d.x + 12.0, ry, label, palette.dim);
                                 for (choice, cx_, current, focused) in choices {
                                     let cw = (choice.chars().count() + 2) as f32 * char_w;
-                                    if *current { fill(window, *cx_, ry, cw, line_h(), palette.selected_bg); }
+                                    if *current { fill(window, *cx_, ry, cw, line_h(), lenz_gpui::popup::selected(&palette)); }
                                     if *focused { fill(window, *cx_, ry + line_h() - 2.0, cw, 2.0, palette.accent); }
                                     text(window, cx, &font, cx_ + char_w, ry, choice, palette.fg);
                                 }
@@ -4007,32 +4116,47 @@ impl Render for Viewer {
                             paint_raised(window, cp.x, cp.y, cp.width, mh, &palette);
                             let bounds=Bounds{origin:point(px(cp.x),px(cp.y)),size:size(px(cp.width),px(mh))};
                             window.with_content_mask(Some(ContentMask{bounds}),|window| {
-                                text(window, cx, &font, cp.x + 12.0, cp.y + 4.0, &cp.query, palette.accent);
-                                if cp.empty {text(window, cx, &font, cp.x + 12.0, cp.y + 4.0 + line_h(), "  No matching commands", palette.dim);}
-                                for (i, (label, right, disabled, selected)) in cp.lines.iter().enumerate() {
+                                lenz_gpui::field::paint(lenz_gpui::field::View{text:&cp.query,cursor:cp.cursor,
+                                    bounds:Bounds{origin:point(px(cp.x+12.),px(cp.y+4.)),size:size(px((cp.width-24.).max(0.)),px(line_h()))},char_w,active:true},window,cx,
+                                    lenz_gpui::Metrics{font:&font,font_size:font_size(),line_h:line_h(),num_w:0.},&palette);
+                                if cp.query.is_empty() {text(window, cx, &font, cp.x + 12.0, cp.y + 4.0, "Type a command", palette.dim);}
+                                // the query and the list read as two parts of the box
+                                fill(window, cp.x, cp.y + 4.0 + line_h() - 1.0, cp.width, 1.0, lenz_gpui::popup::colors(&palette).1);
+                                if cp.empty {text(window, cx, &font, cp.x + 12.0, cp.y + 4.0 + line_h(), "No matching commands", palette.dim);}
+                                // shortcuts share one right-aligned column; the group sits left of it
+                                let key_w = cp.lines.iter().map(|l| l.key.chars().count()).max().unwrap_or(0) as f32 * char_w;
+                                for (i, palette_view::PaletteLine { label, group, key, disabled, selected, in_label, in_group }) in cp.lines.iter().enumerate() {
                                     let iy = cp.y + 4.0 + (i + 1) as f32 * line_h();
-                                    if *selected { fill(window, cp.x, iy, cp.width, line_h(), palette.selected_bg); }
-                                    let rw = right.chars().count() as f32 * char_w;
-                                    text(window, cx, &font, cp.x + cp.width - rw - 12.0, iy, right, palette.dim);
-                                    let lb=Bounds{origin:point(px(cp.x),px(iy)),size:size(px((cp.width-rw-24.0).max(0.0)),px(line_h()))};
-                                    window.with_content_mask(Some(ContentMask{bounds:lb}),|window|text(window, cx, &font, cp.x + 12.0, iy, label, if *disabled {palette.dim} else {palette.fg}));
+                                    let fill = if *selected { lenz_gpui::popup::selected(&palette) } else { lenz_gpui::popup::colors(&palette).0 };
+                                    if *selected { lenz_gpui::popup::row(window, cp.x, iy, cp.width, line_h(), fill); }
+                                    let matched = palette.readable_on(palette.accent, fill);
+                                    let marks = |ranges: &[Range<usize>]| ranges.iter().cloned().map(|r| (r, matched)).collect::<Vec<_>>();
+                                    let kw = key.chars().count() as f32 * char_w;
+                                    text(window, cx, &font, cp.x + cp.width - kw - 12.0, iy, key, palette.dim);
+                                    let gap = if key_w > 0.0 { key_w + 2.0 * char_w } else { 0.0 };
+                                    let gw = group.chars().count() as f32 * char_w;
+                                    let gx = cp.x + cp.width - 12.0 - gap - gw;
+                                    lenz_gpui::colored_text(window, cx, metrics(&font), palette.dim, gx, iy, group, &marks(in_group), &[]);
+                                    let lb=Bounds{origin:point(px(cp.x),px(iy)),size:size(px((gx-cp.x-char_w).max(0.0)),px(line_h()))};
+                                    window.with_content_mask(Some(ContentMask{bounds:lb}),|window|lenz_gpui::colored_text(window, cx, metrics(&font), if *disabled {palette.dim} else {palette.fg}, cp.x + 12.0, iy, label, &marks(in_label), &[]));
                                 }
+                                lenz_gpui::popup::scrollbar(window, cp.x, cp.y + 4.0 + line_h(), cp.width, cp.lines.len() as f32 * line_h(), lenz_gpui::popup::Scrolled { total: cp.total, first: cp.first, visible: cp.lines.len() }, &palette);
                             });
                         }
                         if let Some((rows,scroll))=&popup {
                             let ((bx,by,bw,bh),buttons,visible)=popup_layout(rows.len(),popup_viewport,char_w);
                             let bounds=Bounds{origin:point(px(bx),px(by)),size:size(px(bw),px(bh))};
-                            fill(window,bx-1.,by-1.,bw+2.,bh+2.,palette.border);
-                            fill(window,bx,by,bw,bh,palette.status_bg);
+                            paint_raised(window,bx,by,bw,bh,&palette);
                             window.with_content_mask(Some(ContentMask{bounds}),|window| {
                                 for (i,(line,color)) in rows.iter().skip(*scroll).take(visible).enumerate(){text(window,cx,&font,bx+12.,by+8.+i as f32*line_h(),line,*color);}
+                                lenz_gpui::popup::scrollbar(window, bx, by + 8.0, bw, visible as f32 * line_h(), lenz_gpui::popup::Scrolled { total: rows.len(), first: *scroll, visible }, &palette);
                                 for ((key,label),(x,y,w,h)) in POPUP_BUTTONS.iter().zip(buttons){
-                                    fill(window,x,y,w,h,palette.selected_bg);text(window,cx,&font,x+8.,y,&format!("[{key}] {label}"),palette.fg);
+                                    fill(window,x,y,w,h,lenz_gpui::popup::selected(&palette));text(window,cx,&font,x+8.,y,&format!("[{key}] {label}"),palette.fg);
                                 }
                             });
                         }
                         if let Some((query, selected, hits)) = &switcher {
-                            paint_switcher(&palette, window, cx, &font, left_edge, top, full_w, query, *selected, hits);
+                            paint_switcher(&palette, window, cx, &font, left_edge, top, full_w, query, self_cursor, char_w, *selected, hits);
                         }
                         if !reported.replace(true) && timings {
                             eprintln!("lenz: first paint {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
@@ -4046,12 +4170,7 @@ impl Render for Viewer {
 
 /// A popup, menu or palette box: soft shadow, border, and a background lifted off what is under it.
 fn paint_raised(window: &mut Window, x: f32, y: f32, w: f32, h: f32, palette: &theme::Palette) {
-    let (bg, border) = palette.raised();
-    for (spread, alpha) in [(6.0, 0.10), (3.0, 0.16)] {
-        fill_hsla(window, x - spread + 2.0, y - spread + 4.0, w + 2.0 * spread, h + 2.0 * spread, gpui::hsla(0.0, 0.0, 0.0, alpha));
-    }
-    fill(window, x - 1.0, y - 1.0, w + 2.0, h + 2.0, border);
-    fill(window, x, y, w, h, bg);
+    lenz_gpui::popup::surface(window, x, y, w, h, palette);
 }
 
 fn fill_hsla(window: &mut Window, x: f32, y: f32, w: f32, h: f32, color: Hsla) {

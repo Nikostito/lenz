@@ -6,9 +6,11 @@ mod server_install;
 mod external;
 mod find_replace;
 mod multi_selection;
+mod word_unicode;
 mod structural_edits;
 mod snippet;
 mod save_as;
+mod archive;
 mod preferences;
 mod keymap;
 mod json;
@@ -34,6 +36,10 @@ mod csv;
 mod scrollbar;
 mod problems;
 mod project_syntax;
+mod branch_inventory;
+mod scratch_numbering;
+mod own_save_refresh;
+mod shutdown;
 use crate::tabs::TabId;
 use crate::text::TextSnapshot;
 use std::time::Duration;
@@ -71,6 +77,16 @@ fn word_deletion_removes_one_run_and_then_the_line_break() {
     assert_eq!(after(None, true), "\r\nqux", "nothing before the document's start");
     assert_eq!(after(None, false), "qux", "the CRLF line break as one");
     assert_eq!(after(Some(1), false), "q");
+    assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
+}
+
+#[test]
+fn mac_word_motion_deletes_a_word_with_the_spaces_before_it() {
+    let d = tempfile::tempdir().unwrap(); let path = write(d.path(), "words.txt", b"foo_bar  baz\r\nqux"); let mut s = session(d.path()); open(&mut s, Command::OpenRetained(path.clone()), "words.txt"); s.enable_text_input_for_test();
+    s.dispatch(Command::SetMacWordMotion(true));
+    let mut after = |caret: Option<usize>, backward| { if let Some(at) = caret { s.dispatch(Command::Select(Selection { anchor: at, head: at })); } s.dispatch(Command::Delete { backward, word: true }); source_text(s.state().current_source().unwrap()) };
+    assert_eq!(after(Some(12), true), "foo_bar  \r\nqux");
+    assert_eq!(after(None, true), "\r\nqux", "the spaces go with the word before them");
     assert_eq!(std::fs::read(path).unwrap(), b"foo_bar  baz\r\nqux");
 }
 
@@ -1652,6 +1668,16 @@ fn session_clock(dir: &Path, clock: semantics::Clock) -> Session {
 }
 
 /// Apply background results until `done` holds.
+/// Whether a session opened on `dir` sees `seen` within 10 s: settings are saved in the background.
+fn saved(dir: &Path, seen: impl Fn(&Session) -> bool) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if seen(&session(dir)) { return true; }
+        if std::time::Instant::now() > until { return false; }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn settle(s: &mut Session, done: impl Fn(&Session) -> bool) {
     let rx = s.completions();
     let until = std::time::Instant::now() + Duration::from_secs(10);
@@ -2572,7 +2598,7 @@ fn an_empty_session_offers_open_and_explains_the_rest() {
     assert_eq!(disabled(CommandId::CloseTerminal), Some("No terminal is open"));
     assert_eq!(disabled(CommandId::RecoverDrafts), Some("No recovered drafts are offered"));
     assert_eq!(disabled(CommandId::SaveAs), Some("No file is open"));
-    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "New Project Tab", "Open Folder in New Project Tab…", "Close Project Tab", "Next Project Tab", "Previous Project Tab", "Projects Side by Side", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Format Selection", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
+    assert_eq!(actions.iter().map(|a| a.label).collect::<Vec<_>>(), ["Show / Hide Terminal", "New Terminal", "Focus Terminal", "Focus Editor", "Send Selection to Terminal", "Paste File Path to Terminal…", "Close Terminal Tab…", "Stop Terminal…", "Rename Terminal Tab…", "Restart Terminal", "Next Terminal Tab", "Previous Terminal Tab", "Copy Terminal Selection", "Find in Terminal…", "Open File…", "Open Folder…", "Open Recent Folder…", "Find File…", "Search in Project…", "Replace in Project…", "Rename Symbol…", "Apply Previewed Edits", "Cancel Edit Preview", "Find in File…", "Next Match", "Previous Match", "Close Find", "Find: Match Case", "Find: Whole Word", "Find: Regular Expression", "Replace", "Replace All", "List All Matches", "Go to Line…", "Soft Wrap", "Relative Line Numbers", "Vim Editing", "macOS Word Motion", "Save When Leaving a File", "Search Everywhere: Letters in File Names", "Search Everywhere: Rank by Open and Recent Files", "Sticky Scroll", "Breadcrumbs", "Focus Breadcrumbs", "File Outline", "Find Declaration…", "Rerun Search", "Close Results", "Show / Hide Results", "Stop Search", "Collapse / Expand All Results", "Next Result", "Previous Result", "Previous Results", "Next Results", "Back", "Forward", "Toggle Bookmark", "Set Bookmark Mnemonic…", "Show Bookmarks…", "Next Bookmark", "Previous Bookmark", "Recent Files…", "Recent Locations…", "Keep Tab Open", "Next Tab", "Previous Tab", "Reload", "Close Tab", "Close All Tabs", "Close Other Tabs", "Close Tabs to Left", "Close Tabs to Right", "Close Window", "New Project Tab", "Open Folder in New Project Tab…", "Close Project Tab", "Next Project Tab", "Previous Project Tab", "Projects Side by Side", "Quit All Windows", "Select All", "Copy", "Cut", "Paste", "Delete", "Read-only Mode", "Undo", "Redo", "Save", "Save As…", "New File", "New Scratch File…", "Scratch Files…", "New File in Explorer…", "New Folder in Explorer…", "Copy File Name", "Copy Full Path", "Copy Project-Relative Path", "Copy File / Folder", "Paste File / Folder…", "Cancel File Copy", "Show File / Folder Git History", "Rename in Explorer…", "Move in Explorer…", "Delete in Explorer…", "Delete Permanently in Explorer…", "Restore Last Deleted Entry", "Recover Unsaved Draft…", "Recheck Saved File", "Confirm Rechecked Save", "Resolve External Change…", "Copy Path", "Copy Path:Line", "Copy Reference", "Go to Test or Subject", "Open in Editor", "Open with Default App", "Compare Saved Disk Inputs…", "Compare with Last Saved Version", "Close Saved Comparison", "Compare Selected Saved Disk Inputs", "Collapse", "Expand", "Collapse All", "Expand All", "Collapse Comments and Imports", "Extend Selection", "Shrink Selection", "Add Cursor Below", "Add Cursor Above", "Select Next Occurrence", "Collapse to Single Cursor", "Indent Selection", "Outdent Selection", "Toggle Comment", "Move Lines Up", "Move Lines Down", "Duplicate Lines Up", "Duplicate Lines Down", "Delete Line", "Change theme", "About Lenz Code", "New Window", "Go to Definition", "Peek Definition", "Go to Type Definition", "Go to Implementation", "Find Usages", "Call Hierarchy", "Call Hierarchy: Callers", "Call Hierarchy: Callees", "Type Hierarchy", "Type Hierarchy: Supertypes", "Type Hierarchy: Subtypes", "Quick Documentation", "Documentation on Hover", "Code Completion", "Parameter Info", "Show Quick Fixes…", "Next Problem", "Previous Problem", "Problems…", "Show / Hide Activity Log", "Copy Activity Log", "Clear Activity Log", "Check Project Syntax", "Cancel Project Syntax Check", "Format Document", "Format Selection", "Organize Imports", "Save Without Formatting", "Completion While Typing", "File Icons", "Inlay Hints: Types", "Inlay Hints: Parameter Names", "Semantic Highlighting", "Find Symbol (language server)…", "File Symbols (language server)", "Set Workspace Root…", "Language Server Status…", "Server Details…", "Copy Language Server Details", "Install Language Server…", "Start Installation", "Cancel Installation", "Choose Language Server Runtime…", "Maven Profiles…", "Activate the Maven Profile That Adds This File", "Restart Language Server", "Exclude Ruby Tooling Gems for This Project", "Reset LSP Settings for This Project", "Reuse Saved Declaration Index", "Rebuild Project Index", "Disable Language Server for This Folder", "Enable Language Server for This Folder", "Trust Project Tools in This Folder", "Stop Trusting Project Tools in This Folder", "Folder Trust…", "CSV: Table / Source", "CSV: Toggle Header Row", "CSV: Filter Selected Column…", "CSV: Sort Selected Column (Ascending / Descending / Source)", "CSV: Clear Filter", "CSV: Move Column Left", "CSV: Move Column Right", "CSV: Drop Selected Column", "CSV: Edit Selected Cell…", "Image Source / Rendered", "Markdown Source / Preview", "Open Markdown Preview to the Side", "Show in Source", "Follow Link", "Show / Hide Explorer", "Select Opened File in Explorer", "Explorer: Folders First", "Explorer: All by Name", "Explorer: Always Select Opened File", "Git Branches…", "New Branch…", "Checkout Tag or Revision…", "Show Local Changes", "Compare with Branch, Tag or Revision…", "Compare with Base Branch", "Show Changes Since Branch Start", "Compare with Worktree…", "Resolve Conflicts in Lenz Diff", "Annotate with Git Blame", "Inline Blame", "Close Annotations", "Narrow Annotation Gutter", "Widen Annotation Gutter", "Show Commit…", "Show Diff", "Copy Revision", "Split Right", "Split Down", "Close Split", "Widen Explorer", "Narrow Explorer", "Make Results Taller", "Make Results Shorter", "Enlarge Left / Top Pane", "Enlarge Right / Bottom Pane", "Focus Other Pane", "Move Tab to Other Pane", "Search Everywhere…", "Find Symbol…", "Find Action…", "Status details…", "Editing Preferences…", "Project Indentation: Tabs", "Project Indentation: 2 Spaces", "Project Indentation: 4 Spaces", "Project Indentation: EditorConfig and Language Defaults", "Format on Save for This Project", "SQL Dialect…", "Configure SQL Metadata…", "Connect SQL Metadata", "Refresh SQL Metadata", "Disconnect SQL Metadata", "Inspect Marked Change", "Show Change Diff", "Revert This Change", "Close Change Inspector", "SQL Dialect for This File: PostgreSQL", "SQL Dialect for This File: DuckDB", "SQL Dialect for This File: Follow Project Default", "Project SQL Dialect: PostgreSQL", "Project SQL Dialect: DuckDB", "Project SQL Dialect: Not Set", "Keymap…", "Keymap: IntelliJ (Default)", "Keymap: VS Code", "Reset All Keybindings", "Already sorted this way"]);    assert_eq!(disabled(CommandId::FoldersFirst), Some("Already sorted this way"));
     assert_eq!(disabled(CommandId::LocateFile), Some("No file is open"));
     assert_eq!(disabled(CommandId::WidenExplorer), Some("No folder or library is open"));
     assert_eq!(disabled(CommandId::TallerResults), Some("No search results are shown"));
@@ -2852,6 +2878,22 @@ fn word_motions_stop_at_word_ends_and_starts_and_home_toggles_the_indent() {
     assert_eq!(s.state().selection().unwrap().head, 0, "the document's start stays");
 }
 
+#[test]
+fn mac_word_motion_stops_before_the_value_the_colon_and_the_key_of_a_yaml_entry() {
+    let d = tempfile::tempdir().unwrap();
+    let path = write(d.path(), "c.yaml", b"     column: timestamp\n");
+    let mut s = session(d.path());
+    s.dispatch(Command::Open(path));
+    settle(&mut s, opened);
+    assert_eq!(s.on(CommandId::MacWordMotion), Some(false), "off by default");
+    s.dispatch(Command::SetMacWordMotion(true));
+    assert!(saved(d.path(), |s| s.state().mac_word_motion()), "remembered");
+    s.dispatch(Command::MoveCaret(Motion::LineEnd));
+    let mut head = |m| { s.dispatch(Command::MoveCaret(m)); s.state().selection().unwrap().head };
+    assert_eq!([head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft), head(Motion::WordLeft)], [13, 11, 5, 0], "timestamp, the colon, column, then the indent");
+    assert_eq!([head(Motion::WordRight), head(Motion::WordRight), head(Motion::WordRight)], [11, 12, 22], "column's end, the colon's, timestamp's");
+}
+
 /// Opening and closing many files keeps reloadable content within the inactive budget and releases the rest.
 #[test]
 fn repeated_opening_releases_content_beyond_the_budget() {
@@ -2960,6 +3002,44 @@ fn opening_a_folder_discovers_it_and_the_finder_ranks_its_files() {
     assert!(s.state().project().unwrap().rows().iter().any(|r| &*r.path == "src/ui"));
     s.dispatch(Command::CloseFinder);
     assert!(s.state().project().unwrap().finder().is_none());
+}
+
+#[test]
+fn always_select_opened_file_reveals_each_active_file_in_the_explorer() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("proj");
+    tree(&root, &["src/ui/view.rs", "src/data/store.rs", "a.md"]);
+    let mut s = session(d.path());
+    s.dispatch(Command::OpenRoot(root.clone()));
+    settle(&mut s, scanned);
+    let names = |s: &Session| s.state().project().unwrap().rows().iter().map(|r| r.path.to_string()).collect::<Vec<_>>();
+    let followed = |s: &Session| s.state().tree_follow().map(|(path, ticket)| (path.to_string(), ticket));
+    // Off by default: opening a file leaves the explorer as it is.
+    assert_eq!(s.on(CommandId::AlwaysSelectOpenedFile), Some(false));
+    s.dispatch(Command::Open(root.join("src/ui/view.rs")));
+    settle(&mut s, opened);
+    assert_eq!((names(&s), followed(&s)), (vec!["src".to_string(), "a.md".to_string()], None));
+    // Turned on, the active file is revealed and offered for selection at once.
+    s.dispatch(Command::SetAlwaysSelectOpenedFile(true));
+    assert_eq!(names(&s), ["src", "src/data", "src/ui", "src/ui/view.rs", "a.md"]);
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 1)));
+    // Every change of the active file follows: another file, then back to the first tab.
+    s.dispatch(Command::OpenRetained(root.join("src/data/store.rs")));
+    settle(&mut s, |s| s.state().active_in_tree().as_deref() == Some("src/data/store.rs"));
+    assert!(names(&s).contains(&"src/data/store.rs".to_string()));
+    assert_eq!(followed(&s), Some(("src/data/store.rs".into(), 2)));
+    let first = s.state().tabs().iter().find(|t| t.source().ends_with("view.rs")).unwrap().id();
+    s.dispatch(Command::ActivateTab(first));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    // Other input keeps it: the same file is not offered again.
+    s.dispatch(Command::Scroll(0));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    // Off again, a change of file leaves the explorer.
+    s.dispatch(Command::SetAlwaysSelectOpenedFile(false));
+    s.dispatch(Command::Open(root.join("a.md")));
+    settle(&mut s, |s| s.state().active_in_tree().as_deref() == Some("a.md"));
+    assert_eq!(followed(&s), Some(("src/ui/view.rs".into(), 3)));
+    assert!(saved(d.path(), |s| !s.state().always_select_opened_file()), "remembered");
 }
 
 #[test]
@@ -3345,6 +3425,8 @@ fn fake_semantic_session_with_env(dir: &Path, env: &[(&str, &str)]) -> (Session,
     let providers = dir.join("config/lenz-code/providers.json");
     let mut settings: serde_json::Value = serde_json::from_slice(&std::fs::read(&providers).unwrap()).unwrap();
     settings["providers"]["rust-analyzer"]["executable"] = serde_json::json!(script);
+    // Its folder is trusted: rust-analyzer runs a project's code.
+    settings["trusted"] = serde_json::json!([std::fs::canonicalize(dir).unwrap()]);
     std::fs::write(providers, settings.to_string()).unwrap();
     s.state.semantics.reload_runtime("rust-analyzer");
     (s, log)
@@ -3695,7 +3777,7 @@ fn decoded_decorations_from_a_restarted_provider_cannot_complete_a_new_request()
     // allowing the replacement real fake-provider process to initialize before text readiness.
     let provider = semantics::provider::for_language(highlight::Language::Rust).unwrap().0;
     let root_epoch = s.state.semantics.root_epoch();
-    s.dispatch(Completion::Semantic(semantics::Event::Resolved { root_epoch, provider, dir: d.path().to_owned(), root: Some(d.path().to_owned()), serve: provider }));
+    s.dispatch(Completion::Semantic(semantics::Event::Resolved { root_epoch, provider, dir: d.path().to_owned(), root: Some(d.path().to_owned()), serve: provider, real: None, trusted: None }));
     settle(&mut s, |s| s.state().provider().is_some_and(|p| p.status == semantics::Status::Ready));
     for release in releases { release.send(()).unwrap(); }
     settle(&mut s, |s| s.state.semantics.desired().get(&file).is_some_and(|d| d.version() == current.key().version));
@@ -4640,7 +4722,7 @@ fn rapid_changes_end_on_the_last_content_and_recheck_works_without_events() {
     settle(&mut s, |s| s.state().current_source().is_some_and(|d| source_line(d, 0) == "50"));
     // A late result for an older check does nothing.
     let id = s.state().active().unwrap().id();
-    let stale = Completion::Refreshed { tab: id, token: 0, result: Refresh::Gone("old".into()) };
+    let stale = Completion::Refreshed { tab: id, token: 0, baseline: s.refresh_baseline(id), result: Refresh::Gone("old".into()) };
     assert_eq!(s.dispatch(stale), Effect::default());
     // Recheck (focus regained) finds what notifications would have.
     s.watcher.set(Default::default());
@@ -8637,7 +8719,7 @@ fn server_menus_share_actions_and_keep_diagnostics_in_copyable_details() {
     for path in [None, Some(write(d.path(), "note.txt", b"plain text")), Some(write(d.path(), "main.py", b"def main(): pass"))] {
         if let Some(path) = path { s.dispatch(Command::Open(path)); settle(&mut s, opened); }
         let rows = s.language_server_rows();
-        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.len(), 11);
         assert_eq!(rows[0].1, Some(CommandId::ServerDetails));
         assert!(rows.iter().all(|(_, action)| action.is_some() && *action != Some(CommandId::CopyServerDetails)));
         let menu = s.menu(Some(CommandGroup::LanguageServers));
@@ -8784,6 +8866,46 @@ mod blame {
         assert_eq!(s.on(CommandId::AnnotateBlame), Some(true));
         s.dispatch(Command::SetAnnotate(false));
         assert_eq!((s.state().active().unwrap().annotation_cols(), s.annotation(t, 0).is_none()), (0, true));
+    }
+
+    #[test]
+    fn inline_blame_shows_the_caret_lines_commit_without_the_annotation_column() {
+        let r = repo();
+        put(r.path(), "a.txt", "one\ntwo\n");
+        commit_all(r.path(), "first");
+        let mut s = session(r.path());
+        s.dispatch(Command::Open(r.path().join("a.txt")));
+        settle(&mut s, opened);
+        let t = s.state().active().unwrap().id();
+        assert_eq!((s.on(CommandId::InlineBlame), s.state().caret_blame(t)), (Some(false), None), "off by default");
+        assert!(s.state().active().unwrap().blame.is_none(), "nothing is blamed while it is off");
+        s.dispatch(Command::SetInlineBlame(true));
+        settle(&mut s, blamed);
+        assert_eq!(s.state().caret_blame(t), None, "no caret yet");
+        s.dispatch(Command::Select(Selection { anchor: 0, head: 0 }));
+        let commit = format!("t, {} • first", today());
+        assert_eq!(s.state().caret_blame(t), Some((0, commit.clone())));
+        assert_eq!((s.state().active().unwrap().annotation_cols(), s.annotation(t, 0).is_none(), s.on(CommandId::AnnotateBlame)), (0, true, Some(false)), "no column");
+        assert_eq!(s.state().active().unwrap().blame_status(), None, "the status bar says nothing about it");
+        s.dispatch(Command::MoveCaret(Motion::Down));
+        assert_eq!(s.state().caret_blame(t), Some((1, commit.clone())), "it follows the caret");
+        s.dispatch(Command::Extend(Motion::Right));
+        assert_eq!(s.state().caret_blame(t), None, "not over a selection");
+        // The column reuses the attribution, and closing it leaves inline blame as it was.
+        annotate(&mut s);
+        assert_eq!(s.state().active().unwrap().annotation_cols(), ANNOTATION_COLS);
+        s.dispatch(Command::SetAnnotate(false));
+        s.dispatch(Command::MoveCaret(Motion::Left));
+        assert_eq!((s.state().active().unwrap().annotation_cols(), s.state().caret_blame(t)), (0, Some((1, commit))));
+        // A draft line not yet committed says so.
+        s.enable_text_input_for_test();
+        s.dispatch(Command::InsertText { text: "x".into(), kind: crate::text::EditKind::Typing });
+        settle(&mut s, blamed);
+        assert_eq!(s.state().caret_blame(t), Some((1, "Not committed yet".into())));
+        s.dispatch(Command::SetInlineBlame(false));
+        assert_eq!(s.state().caret_blame(t), None);
+        assert!(s.state().active().unwrap().blame.is_none(), "turned off, its attribution goes");
+        assert!(saved(r.path(), |s| s.on(CommandId::InlineBlame) == Some(false)), "remembered");
     }
 
     #[test]
@@ -9383,12 +9505,37 @@ mod git_branches {
     }
 
     #[test]
+    fn a_repository_arriving_in_an_open_folder_runs_none_of_its_programs() {
+        let e = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ran = elsewhere.path().join("ran");
+        let hook = elsewhere.path().join("fsmonitor.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut s = session(&elsewhere.path().join(".lenz-test"));
+        s.dispatch(Command::OpenRoot(e.path().to_path_buf()));
+        settle(&mut s, |s| s.state().repo_checked());
+        // extracted elsewhere, its `.git` moved in last
+        let made = tempfile::tempdir().unwrap();
+        git(made.path(), &["init", "-q", "-b", "trunk"]);
+        write(made.path(), "a.txt", b"x\n");
+        git(made.path(), &["add", "a.txt"]);
+        git(made.path(), &["commit", "-q", "-m", "a"]);
+        git(made.path(), &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        write(e.path(), "a.txt", b"y\n");
+        std::fs::rename(made.path().join(".git"), e.path().join(".git")).unwrap();
+        tick(&mut s);
+        settle(&mut s, |s| s.branch_label().is_some() && s.state.git_status.is_some() && !s.git_status_running);
+        assert!(!ran.exists(), "the arriving repository's fsmonitor hook ran");
+    }
+
+    #[test]
     fn a_worktree_whose_folder_is_gone_is_marked_and_offers_nothing() {
         let (_r, wt, mut s) = repo_session();
         std::fs::remove_dir_all(wt.path().join("second")).unwrap();
         open_branches(&mut s);
         let row = s.state().branch_rows("second").into_iter().next().unwrap();
-        assert!(row.label.ends_with(" · missing"), "{}", row.label);
+        assert!(row.detail.ends_with(" · missing"), "{}", row.detail);
         assert!(s.branch_actions(&row.target).is_empty());
     }
 
@@ -9402,21 +9549,161 @@ mod git_branches {
         let shown: Vec<(&str, &str, bool)> = rows.iter().map(|r| (r.section, r.label.as_str(), r.current)).collect();
         assert_eq!(&shown[..2], [("", "New Branch…", false), ("", "Checkout Tag or Revision…", false)]);
         assert!(shown.contains(&("Recent", "feature/x", false)));
-        for (section, label) in [("Local", "feature/x"), ("Local", "other"), ("Remote", "origin/topic"), ("Tags", "v1")] {
+        for (section, label) in [("Local", "feature/x"), ("Local", "other"), ("Remote", "topic"), ("Tags", "v1")] {
             assert!(shown.contains(&(section, label, false)), "{section} {label}: {shown:?}");
         }
         assert!(shown.contains(&("Local", "main", true)), "the current branch is marked");
         let worktrees: Vec<_> = rows.iter().filter(|r| r.section == "Worktrees").collect();
         assert_eq!(worktrees.len(), 2);
-        assert!(worktrees.iter().any(|w| w.current && w.label.starts_with("main ")));
-        assert!(worktrees.iter().any(|w| matches!(&w.target, BranchTarget::Worktree(p) if p.ends_with("second")) && w.label.starts_with("other ")));
+        assert!(worktrees.iter().any(|w| w.current && w.label == "main"));
+        assert!(worktrees.iter().any(|w| matches!(&w.target, BranchTarget::Worktree(p) if p.ends_with("second")) && w.label == "other" && w.detail.ends_with("second")));
+        // a remote branch reads by its name, its remote on the right
+        assert!(rows.iter().any(|r| r.label == "topic" && r.detail == "origin" && r.target == BranchTarget::Remote("origin/topic".into())));
         let _ = wt;
         // Filtering keeps only matching rows (any case), sections and all.
         let found: Vec<_> = s.state().branch_rows("TOP").into_iter().map(|r| r.label).collect();
-        assert_eq!(found, ["origin/topic"]);
+        assert_eq!(found, ["topic"]);
+        assert_eq!(s.state().branch_rows("origin/top").into_iter().map(|r| r.label).collect::<Vec<_>>(), ["topic"], "the remote's full name still finds it");
         assert!(s.state().branch_rows("nothing like it").is_empty());
         s.dispatch(Command::CloseBranches);
         assert!(s.state().branches().is_none());
+    }
+
+    #[test]
+    fn long_sections_show_their_first_rows_then_show_more_and_the_current_branch_first() {
+        let (r, _wt, mut s) = repo_session();
+        for i in 0..20 { git(r.path(), &["branch", &format!("a{i:02}")]); }
+        git(r.path(), &["switch", "-q", "-c", "zeta"]);
+        open_branches(&mut s);
+        let local = |s: &Session| s.state().branch_rows("").into_iter().filter(|r| r.section == "Local").collect::<Vec<_>>();
+        let rows = local(&s);
+        let all = s.state().branch_section_len("Local", "").unwrap();
+        assert!(all > crate::branches::section_cap("Local") + 1, "{all}");
+        assert_eq!(rows.len(), crate::branches::section_cap("Local") + 1, "first rows, then Show more");
+        assert!(rows[0].current && rows[0].label == "zeta", "the current branch comes first, though last by name: {:?}", rows[0]);
+        let more = rows.last().unwrap();
+        assert_eq!(more.target, BranchTarget::More("Local"));
+        assert_eq!(more.label, format!("Show {} more…", all - crate::branches::section_cap("Local")));
+        assert!(s.branch_actions(&more.target).is_empty() && s.branch_enter(&more.target).is_none(), "Show more has no actions");
+        // Typing shows every match, no section cut short.
+        assert_eq!(s.state().branch_rows("a1").iter().filter(|r| r.section == "Local").count(), 10);
+        assert_eq!(s.state().branch_section_len("Local", "a1"), None, "a filter shows what matched, not the section's size");
+        // Show more lists the rest; the index of its row is the first row it brings in.
+        let at = s.state().branch_rows("").iter().position(|r| r.target == BranchTarget::More("Local")).unwrap();
+        s.dispatch(Command::ExpandBranches("Local"));
+        let rows = s.state().branch_rows("");
+        assert_eq!(rows.iter().filter(|r| r.section == "Local").count(), all);
+        assert!(!rows.iter().any(|r| r.target == BranchTarget::More("Local")));
+        assert_eq!(rows[at].section, "Local");
+        // Closing the popup forgets it; opened again while the inventory refreshes, it stays open when it lands.
+        s.dispatch(Command::CloseBranches);
+        git(r.path(), &["branch", "zz-late"]);
+        s.dispatch(Command::OpenBranches);
+        assert!(s.state().branches().is_some_and(|v| v.loading && v.expanded.is_empty()));
+        assert_eq!(local(&s).len(), crate::branches::section_cap("Local") + 1);
+        s.dispatch(Command::ExpandBranches("Local"));
+        settle(&mut s, |s| s.state().branches().is_some_and(|v| !v.loading));
+        assert!(local(&s).iter().any(|r| r.label == "zz-late"), "the refresh landed");
+        assert_eq!(local(&s).len(), all + 1, "and the section is still open");
+    }
+
+    #[test]
+    fn a_row_fits_one_line_keeping_both_ends_of_a_long_name_and_a_folders_last_names() {
+        use crate::branches::{fit_row, BranchRow};
+        let row = |label: &str, detail: &str, target| BranchRow { section: "Local", label: label.into(), detail: detail.into(), current: false, target, favorite: false, depth: 0, open: false };
+        let long = row("feature/very-long-branch-name-that-describes-the-settings-dialog", "origin/feature/very-long-branch-name", BranchTarget::Branch("x".into()));
+        let (name, detail) = fit_row(&long, 48);
+        let width = |t: &str| lenz_content::wrap::width(t);
+        assert!(width(&name) + 2 + width(&detail) <= 48, "{name} | {detail}");
+        assert!(name.starts_with("⎇ feature/") && name.ends_with("dialog") && name.contains('…'), "{name}");
+        let worktree = row("wt/hotfix", "/home/someone/projects/checkouts/app-hotfix-42 · 3 changed", BranchTarget::Worktree("/x".into()));
+        let (name, detail) = fit_row(&worktree, 70);
+        assert_eq!(name, "⧉ wt/hotfix");
+        assert!(detail.starts_with('…') && detail.ends_with("/app-hotfix-42 · 3 changed"), "the folder gives up its start, the changes stay: {detail}");
+        // too narrow for a detail: the name alone, still one line
+        let (name, detail) = fit_row(&long, 12);
+        assert!(detail.is_empty() && width(&name) <= 12, "{name}");
+    }
+
+    #[test]
+    fn branches_under_a_shared_folder_gather_into_a_row_that_opens_and_closes() {
+        let (r, _wt, mut s) = repo_session();
+        for b in ["feature/y", "feature/z", "fix/only-one"] { git(r.path(), &["branch", b]); }
+        open_branches(&mut s);
+        let local = |s: &Session| s.state().branch_rows("").into_iter().filter(|r| r.section == "Local").collect::<Vec<_>>();
+        let rows = local(&s);
+        let folder = rows.iter().find(|r| matches!(&r.target, BranchTarget::Folder("Local", n) if n == "feature")).expect("a feature folder");
+        assert_eq!((folder.label.as_str(), folder.detail.as_str(), folder.open), ("feature/", "3", false));
+        assert!(!rows.iter().any(|r| r.label.contains("feature/x") || r.depth > 0), "its branches wait inside: {rows:?}");
+        assert!(rows.iter().any(|r| r.label == "fix/only-one" && r.depth == 0), "a folder of one is just its branch");
+        assert!(s.branch_actions(&folder.target).is_empty() && s.branch_enter(&folder.target).is_none());
+        assert_eq!(crate::branches::row_text(folder), "▸ feature/");
+        // Opened, its branches follow it one level in, named after the folder; the state outlives the popup.
+        s.dispatch(Command::ToggleBranchFolder("Local", "feature".into()));
+        let rows = local(&s);
+        let at = rows.iter().position(|r| matches!(&r.target, BranchTarget::Folder(_, n) if n == "feature")).unwrap();
+        assert!(rows[at].open && crate::branches::row_text(&rows[at]) == "▾ feature/");
+        assert_eq!(rows[at + 1..at + 4].iter().map(|r| (r.label.as_str(), r.depth)).collect::<Vec<_>>(), [("x", 1), ("y", 1), ("z", 1)]);
+        assert!(matches!(&rows[at + 1].target, BranchTarget::Branch(b) if b == "feature/x"), "the row still checks out the whole name");
+        assert_eq!(crate::branches::row_text(&rows[at + 1]), "  ⎇ x");
+        s.dispatch(Command::CloseBranches);
+        open_branches(&mut s);
+        assert!(local(&s).iter().any(|r| r.depth == 1), "still open when the popup comes back");
+        // Typing lists every match by its whole name, no folders.
+        let found = s.state().branch_rows("feature").into_iter().filter(|r| r.section == "Local").map(|r| (r.label, r.depth)).collect::<Vec<_>>();
+        assert_eq!(found, [("feature/x".to_string(), 0), ("feature/y".into(), 0), ("feature/z".into(), 0)]);
+        s.dispatch(Command::ToggleBranchFolder("Local", "feature".into()));
+        assert!(!local(&s).iter().any(|r| r.depth == 1));
+    }
+
+    #[test]
+    fn starred_branches_stay_on_top_outside_folders_and_are_kept_for_the_repository() {
+        let (r, wt, mut s) = repo_session();
+        for b in ["feature/y", "zzz"] { git(r.path(), &["branch", b]); }
+        open_branches(&mut s);
+        let zzz = s.state().branch_rows("").into_iter().find(|r| r.label == "zzz").unwrap();
+        let actions = |s: &Session, t: &BranchTarget| s.branch_actions(t).into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+        assert_eq!(actions(&s, &zzz.target).last(), Some(&"Add to Favorites"));
+        s.dispatch(Command::ToggleFavoriteBranch("refs/heads/zzz".into()));
+        s.dispatch(Command::ToggleFavoriteBranch("refs/heads/feature/x".into()));
+        s.dispatch(Command::ToggleFavoriteBranch("refs/remotes/origin/topic".into()));
+        let local: Vec<_> = s.state().branch_rows("").into_iter().filter(|r| r.section == "Local").collect();
+        assert!(local[0].current, "the current branch first");
+        assert_eq!(local[1..3].iter().map(|r| (r.label.as_str(), r.favorite, r.mark())).collect::<Vec<_>>(), [("feature/x", true, "★"), ("zzz", true, "★")], "then the starred ones, by name");
+        assert!(local.iter().any(|r| r.label == "feature/y" && r.depth == 0), "a folder of one: feature/x is starred, outside it");
+        let remote: Vec<_> = s.state().branch_rows("").into_iter().filter(|r| r.section == "Remote").collect();
+        assert!(remote[0].favorite && remote[0].label == "topic");
+        assert_eq!(actions(&s, &zzz.target).last(), Some(&"Remove from Favorites"));
+        // Saved in the settings file: another window, and another worktree of the repository, see the same stars.
+        let file = r.path().join(".lenz-test/state/lenz-code/settings.json");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(&file).is_ok_and(|t| t.contains("refs/heads/zzz")) {
+            assert!(std::time::Instant::now() < until, "the star is saved");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut other = session(&r.path().join(".lenz-test"));
+        other.dispatch(Command::OpenRoot(wt.path().join("second")));
+        settle(&mut other, |s| s.branch_label().is_some());
+        open_branches(&mut other);
+        assert!(other.state().branch_rows("").iter().any(|r| r.label == "zzz" && r.favorite), "the worktree's popup shows the repository's stars");
+        s.dispatch(Command::ToggleFavoriteBranch("refs/heads/zzz".into()));
+        assert!(!s.state().branch_rows("").iter().any(|r| r.label == "zzz" && r.favorite));
+    }
+
+    #[test]
+    fn how_far_each_branch_is_from_its_upstream_follows_the_lists() {
+        let (r, _wt, mut s) = repo_session();
+        git(r.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(r.path(), &["branch", "--set-upstream-to=origin/main", "main"]);
+        put(r.path(), "a.txt", "ahead\n");
+        commit_all(r.path(), "ahead");
+        open_branches(&mut s);
+        settle(&mut s, |s| s.state().branches().is_some_and(|v| !v.refs.track.is_empty()));
+        let main = s.state().branch_rows("").into_iter().find(|r| r.section == "Local" && r.label == "main").unwrap();
+        assert_eq!(main.detail, "↑1  origin/main");
+        assert_eq!(lenz_content::branches::Track { ahead: 2, behind: 3, gone: false }.label(), "↑2 ↓3");
+        assert_eq!(lenz_content::branches::Track { gone: true, ..Default::default() }.label(), "gone");
+        assert_eq!(lenz_content::branches::Track::default().label(), "");
     }
 
     #[test]
@@ -9428,11 +9715,11 @@ mod git_branches {
             let row = rows.iter().find(|r| r.label == label || r.label.starts_with(&format!("{label} "))).unwrap();
             s.branch_actions(&row.target).into_iter().map(|(l, _)| l).collect::<Vec<_>>()
         };
-        assert_eq!(actions("other"), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here"]);
-        assert_eq!(actions("main"), ["New Branch from Here…", "Compare with Working Tree"], "the current branch is not checked out again");
+        assert_eq!(actions("other"), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here", "Add to Favorites"]);
+        assert_eq!(actions("main"), ["New Branch from Here…", "Compare with Working Tree", "Add to Favorites"], "the current branch is not checked out again");
         let enter = |label: &str| s.branch_enter(&rows.iter().find(|r| r.label == label || r.label.starts_with(&format!("{label} "))).unwrap().target);
         assert_eq!((enter("main"), enter("other"), enter("v1")), (None, Some(BranchAction::Checkout), Some(BranchAction::Checkout)), "Enter never opens a prompt");
-        assert_eq!(actions("origin/topic"), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here"]);
+        assert_eq!(actions("topic"), ["Checkout", "New Branch from Here…", "Compare with Working Tree", "Show Changes Since Branching from Here", "Add to Favorites"]);
         assert_eq!(actions("v1"), ["Checkout", "New Branch from Here…", "Compare with Working Tree"]);
         let second = rows.iter().find(|r| matches!(&r.target, BranchTarget::Worktree(p) if p.ends_with("second"))).unwrap();
         assert_eq!(
@@ -9526,7 +9813,7 @@ mod git_branches {
         let diff = |t: &BranchTarget, a| GitDiff::of(t, a);
         assert_eq!(diff(&target("v1"), BranchAction::CompareWithWorkingTree), Some(GitDiff::Revision("refs/tags/v1".into())));
         assert_eq!(diff(&target("other"), BranchAction::ChangesSinceBranching), Some(GitDiff::BranchChanges(Some("refs/heads/other".into()))));
-        assert_eq!(diff(&target("origin/topic"), BranchAction::CompareWithWorkingTree), Some(GitDiff::Revision("refs/remotes/origin/topic".into())));
+        assert_eq!(diff(&target("topic"), BranchAction::CompareWithWorkingTree), Some(GitDiff::Revision("refs/remotes/origin/topic".into())));
         assert_eq!(diff(&target("other"), BranchAction::Checkout), None);
         let second = wt.path().join("second");
         let launch = s.git_diff_launch(&GitDiff::Worktree(second.clone()), &exe, false).unwrap();
@@ -9619,6 +9906,10 @@ mod git_branches {
         git(r.path(), &["switch", "-q", "feature/x"]);
         git(r.path(), &["branch", "-q", "-D", "main"]);
         assert_eq!(args(&s, &GitDiff::BaseBranch, &exe), Ok(vec!["refs/remotes/origin/main".to_string()]), "else the remote's default");
+        // A file named like the base goes by its commit, as Revision does.
+        put(r.path(), "refs/remotes/origin/main", "a file\n");
+        let sha = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(args(&s, &GitDiff::BaseBranch, &exe), Ok(vec![sha]));
         let lone = repo();
         put(lone.path(), "a.txt", "a\n");
         commit_all(lone.path(), "1");
@@ -9626,6 +9917,11 @@ mod git_branches {
         let mut s = session(&lone.path().join(".lenz-test"));
         s.dispatch(Command::OpenRoot(lone.path().to_path_buf()));
         settle(&mut s, |s| s.branch_label().is_some());
+        assert_eq!(args(&s, &GitDiff::BaseBranch, &exe), Err("Compare with Base Branch: no main or master branch to compare with".into()));
+        // The repository writes origin/HEAD: one naming a Lenz Diff subcommand is no base branch.
+        let sha = git(lone.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        put(lone.path(), ".git/pr", format!("{sha}\n"));
+        put(lone.path(), ".git/refs/remotes/origin/HEAD", "ref: pr\n");
         assert_eq!(args(&s, &GitDiff::BaseBranch, &exe), Err("Compare with Base Branch: no main or master branch to compare with".into()));
     }
 
@@ -9777,6 +10073,21 @@ mod git_branches {
         assert_eq!(s.validate_revision("nope"), Err("No commit named \"nope\"".into()));
         checkout(&mut s, Target::Branch("no-such-branch".into()));
         assert!(s.status_message().contains("no-such-branch"), "git's own words: {}", s.status_message());
+    }
+
+    #[test]
+    fn a_tag_row_checks_out_its_tag_though_a_branch_shares_its_short_name() {
+        let (r, _wt, mut s) = repo_session();
+        let tagged = git(r.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(r.path(), &["tag", "heads/main"]);
+        put(r.path(), "a.txt", "moved on\n");
+        commit_all(r.path(), "main moves on");
+        let target = BranchTarget::Tag("heads/main".into()).checkout().unwrap();
+        assert_eq!(target, Target::Detached("refs/tags/heads/main".into()));
+        checkout(&mut s, target);
+        assert_eq!(git(r.path(), &["rev-parse", "HEAD"]).trim(), tagged, "the tag's commit, not main's");
+        // What is typed stays as typed.
+        assert_eq!(BranchTarget::Revision("v1".into()).checkout(), Some(Target::Detached("v1".into())));
     }
 
     #[test]
@@ -10448,8 +10759,10 @@ fn lenz_reader_folders_move_to_lenz_code_once_and_never_lose_settings() {
     let saved = |dir: &std::path::Path| serde_json::json!({ "pyright": { "executable": dir.join("servers/node_modules/.bin/pyright-langserver") }, "other": "/usr/bin/lenz-reader/x" }).to_string();
     std::fs::write(old.join("providers.json"), saved(&old)).unwrap();
     std::fs::write(old.join("projects/p.json"), serde_json::json!([old.join("scratch-files/1.txt")]).to_string()).unwrap();
+    std::fs::set_permissions(old.join("providers.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
     let new = super::code_folder(&base);
     assert_eq!(std::fs::read_to_string(new.join("providers.json")).unwrap(), saved(&new));
+    assert_eq!(std::fs::metadata(new.join("providers.json")).unwrap().permissions().mode() & 0o777, 0o600, "a private file stays private");
     assert_eq!(std::fs::read_to_string(new.join("projects/p.json")).unwrap(), serde_json::json!([new.join("scratch-files/1.txt")]).to_string());
     assert!(!new.join("providers.json.moving").exists());
     // Both: the new one is used and the old one left alone.
@@ -10468,3 +10781,5 @@ fn lenz_reader_folders_move_to_lenz_code_once_and_never_lose_settings() {
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(kept, base.join("lenz-reader"));
 }
+
+mod workspace_edit;
