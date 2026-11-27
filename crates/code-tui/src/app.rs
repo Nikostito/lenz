@@ -2345,10 +2345,11 @@ impl App {
                     (Prompt::OpenFolder | Prompt::OpenFolderInProjectTab, Some(ChoiceTarget::Path(path))) => Some(path),
                     _ => None,
                 };
+                // Nothing typed opens only a recent project chosen from the list; a typed path is taken exactly, spaces included.
+                let picked = chosen.is_some();
                 let path = chosen.unwrap_or_else(|| self.resolve_path(&input));
                 let target = if kind == Prompt::Open { code_core::open_path::Kind::File } else { code_core::open_path::Kind::Folder };
-                // Nothing typed opens only a recent project chosen from the list.
-                if (input.trim().is_empty() && !path.is_dir()) || target.validate(path.clone()).is_err() {
+                if (input.is_empty() && !picked) || target.validate(path.clone()).is_err() {
                     self.modal.as_mut().unwrap().error = Some("Enter an existing file or folder path".into());
                 } else {
                     self.close_modal();

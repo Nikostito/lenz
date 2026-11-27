@@ -2054,13 +2054,17 @@ fn draw_start(frame: &mut ratatui::Frame, app: &App, items: &[StartItem], geomet
     if w == 0 || pane.height == 0 { return; }
     let x = pane.x + (pane.width - w) / 2;
     let bottom = pane.bottom();
-    let mut y = pane.y.saturating_add(1.min(pane.height.saturating_sub(1)));
+    // A short pane gives its rows to the commands: the name and tagline only show with room for the Start rows too.
+    let compact = (pane.height as usize) < items.len().min(4) + 6;
+    let mut y = if compact { pane.y } else { pane.y.saturating_add(1) };
     let buf = frame.buffer_mut();
     let put = |buf: &mut Buffer, y: u16, x: u16, text: &str, width: u16, st: Style| { if y < bottom && width > 0 { buf.set_stringn(x, y, text, width as usize, st); } };
-    put(buf, y, x, code_core::chrome::APP_NAME, w, style(p.fg, p.bg).add_modifier(Modifier::BOLD));
-    y = y.saturating_add(1);
-    put(buf, y, x, code_core::start::TAGLINE, w, style(p.dim, p.bg));
-    y = y.saturating_add(2);
+    if !compact {
+        put(buf, y, x, code_core::chrome::APP_NAME, w, style(p.fg, p.bg).add_modifier(Modifier::BOLD));
+        y = y.saturating_add(1);
+        put(buf, y, x, code_core::start::TAGLINE, w, style(p.dim, p.bg));
+        y = y.saturating_add(2);
+    }
     let home = code_core::start::home();
     let selected = app.session.state().start_selected();
     let mut section = None;

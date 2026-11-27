@@ -73,7 +73,8 @@ shows the **welcome screen**: **Open Folder…**, **Open Folder in New Project T
 with their shortcuts, then **Recent
 projects** and **Recent files**, each with a coloured badge of its initials, its name and where it lives (`~` for
 your home folder, shortened from the left when narrow), and a tip. A click, or ↑/↓ and Enter, runs the command or
-opens the project or file ([terminal](tui.md)).
+opens the project or file ([terminal](tui.md)). A terminal too short for all of it leaves out the name and tagline so the
+commands stay on screen.
 
 **Open Recent Folder…** shows **Open Recent Project**: each project's name, then its path after a folder icon and,
 for a git repository, its checked-out branch after a branch icon (`detached` and the commit when no branch is checked
