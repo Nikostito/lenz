@@ -493,6 +493,8 @@ pub enum Command {
     CancelProjectSyntax,
     /// Format the active document, or organize its imports, through its language server (one undoable edit).
     Format(FormatKind),
+    /// Move the start screen's keyboard selection to the next (or previous) item, wrapping.
+    StepStart { forward: bool },
     /// Save without the project's format-on-save.
     SaveWithoutFormatting { tab: TabId },
     /// Move the popup's selection by rows (wrapping), or to a row.
@@ -1481,7 +1483,7 @@ impl StartItem {
     pub fn heading(&self) -> Option<&'static str> {
         match self {
             Self::Command(_) => None,
-            Self::RecentFolder(_) => Some("Recent folders"),
+            Self::RecentFolder(_) => Some("Recent projects"),
             Self::RecentFile(_) => Some("Recent files"),
         }
     }
@@ -1781,6 +1783,8 @@ pub struct Effect {
 
 /// The state adapters present.
 pub struct State {
+    /// The start screen's keyboard selection (see [`State::start_selected`]).
+    start_selected: usize,
     terminal: crate::terminal::State,
     presentation: Option<Box<presentation::Presentation>>,
     comparison: Option<SavedComparison>,
@@ -2422,8 +2426,12 @@ impl State {
         if self.project.is_some() || !self.tabs.is_empty() || self.loading.is_some() {
             return Vec::new();
         }
-        [CommandId::Open, CommandId::OpenFolder].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
+        [CommandId::OpenFolder, CommandId::Open, CommandId::NewDocument].into_iter().map(StartItem::Command).chain(self.recent.iter().cloned().map(StartItem::RecentFolder))
             .chain(self.recent_alone.iter().cloned().map(StartItem::RecentFile)).collect()
+    }
+    /// The start item the keys have chosen (Up/Down move it, Enter runs it), within the items there are.
+    pub fn start_selected(&self) -> usize {
+        self.start_selected.min(self.recent.len() + self.recent_alone.len() + 2)
     }
     /// The tree lists each folder's folders before its files.
     pub fn folders_first(&self) -> bool {
@@ -3149,6 +3157,7 @@ impl Session {
             comparison_seq: 0,
             id: crate::close::SessionId::allocate(), external_seq: 0, external_pending: None, reconcile_seq: 0, reconcile: None, close_seq: 0, closing: None, closed: false, last_close: None, projects_info: crate::projects::Info { count: 1, position: 0, layout: crate::projects::Layout::Tabs },
             state: State {
+                start_selected: 0,
                 terminal: crate::terminal::State::default(),
                 presentation: None,
                 comparison: None,
@@ -5702,6 +5711,13 @@ impl Session {
             Command::CheckProjectSyntax => self.check_project_syntax(),
             Command::CancelProjectSyntax => self.cancel_project_syntax("Cancelled"),
             Command::Format(kind) => match self.state.active { Some(tab) => self.format_document(tab, kind, false), None => Effect::default() },
+            Command::StepStart { forward } => {
+                let count = self.state.start_items().len();
+                if count == 0 { return Effect::default(); }
+                let at = self.state.start_selected().min(count - 1);
+                self.state.start_selected = if forward { (at + 1) % count } else { (at + count - 1) % count };
+                Effect { repaint: true, ..Effect::default() }
+            }
             Command::SaveWithoutFormatting { tab } => self.save(tab),
             Command::MoveCompletion(by) => self.move_completion(by),
             Command::SelectCompletion(row) => self.select_completion(row),

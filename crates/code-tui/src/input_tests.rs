@@ -3312,27 +3312,35 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents() {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
     terminal.draw(|f| a.draw(f)).unwrap();
     let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-    for shown in ["Open File…  Ctrl+O", "Open Folder…", "Recent folders", &root.display().to_string(), "Recent files", &lone.display().to_string()] {
+    for shown in ["Lenz Code", "Open Folder…", "Open File…", "Ctrl+O", "New File", "Ctrl+N", "Recent projects", "proj", "Recent files", "lone.txt", "Tip:"] {
         assert!(screen.contains(shown), "{shown} on the start screen");
     }
+    assert!(screen.contains(&dir.path().display().to_string()), "where each recent place lives");
     let start = a.layout.panes[0].start.clone();
-    assert_eq!(start.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2, 3]);
-    // Open File… and Open Folder… ask for a path; a recent folder opens.
+    assert_eq!(start.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    // Open Folder… and Open File… ask for a path; a recent folder opens.
     click(&mut a, start[0].1.x, start[0].1.y);
-    assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::Open);
-    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
-    click(&mut a, start[1].1.x, start[1].1.y);
     assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::OpenFolder);
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    click(&mut a, start[1].1.x, start[1].1.y);
+    assert_eq!(a.modal.as_ref().unwrap().kind, Prompt::Open);
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     // A recent file opens; closing it returns to the start screen.
-    click(&mut a, start[3].1.x, start[3].1.y);
+    click(&mut a, start[4].1.x, start[4].1.y);
     settle(&mut a, |a| a.session.state().active().is_some_and(|t| t.source() == lone && t.loaded()));
     draw(&mut a, 100, 24);
     assert!(a.layout.panes[0].start.is_empty());
     key(&mut a, KeyCode::F(4), KeyModifiers::CONTROL);
     draw(&mut a, 100, 24);
-    assert_eq!(a.layout.panes[0].start.len(), 4);
-    click(&mut a, start[2].1.x, start[2].1.y);
+    assert_eq!(a.layout.panes[0].start.len(), 5);
+    // The keys: Up wraps to the last row, Down steps on; Enter opens the chosen recent project.
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(a.session.state().start_selected(), 4);
+    for _ in 0..4 { key(&mut a, KeyCode::Down, KeyModifiers::NONE); }
+    assert_eq!(a.session.state().start_selected(), 3);
+    let chosen: String = { let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap(); t.draw(|f| a.draw(f)).unwrap(); let row = a.layout.panes[0].start[3].1; (row.x..row.right()).map(|x| t.backend().buffer()[(x, row.y)].symbol().to_owned()).collect() };
+    assert!(chosen.starts_with('›') && chosen.contains("proj"), "the chosen row is marked: {chosen:?}");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     settle(&mut a, |a| a.session.state().project().is_some_and(|p| p.root() == root));
     draw(&mut a, 100, 24);
     assert!(a.layout.panes[0].start.is_empty(), "the open folder replaces the start screen");
@@ -4722,4 +4730,43 @@ fn format_shortcut_expands_selected_pasted_json_and_undo_restores_it() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "only the draft changes");
     key(&mut a, KeyCode::Char('z'), KeyModifiers::CONTROL);
     assert_eq!(text(&a), original);
+}
+
+#[test]
+fn open_recent_filters_and_open_folder_suggests_completes_and_opens_through_the_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = dir.path().join("code");
+    let roots: Vec<_> = ["lenz-api", "billing", "lenz-docs"].iter().map(|n| { let p = code.join(n); std::fs::create_dir_all(&p).unwrap(); p }).collect();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(dir.path().join("state/recent.json"), serde_json::to_string(&roots[..2]).unwrap()).unwrap();
+    let mut a = App::with_text_input(config(dir.path()), None, false);
+    draw(&mut a, 100, 24);
+    // Open Recent Project: a name with where it lives; typing filters by name or location; Ctrl+Enter asks for a new
+    // project tab on the choice instead of replacing this one.
+    a.run(CommandId::OpenRecent);
+    assert_eq!(a.choices().iter().map(|c| (c.label.as_str(), c.detail.as_deref().unwrap_or_default().starts_with("recent · "))).collect::<Vec<_>>(), [("lenz-api", true), ("billing", true)]);
+    a.handle(Event::Paste("bill".into()));
+    assert_eq!(a.choices().iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["billing"]);
+    key(&mut a, KeyCode::Enter, KeyModifiers::CONTROL);
+    assert!(a.modal.is_none() && a.new_view && a.new_view_root.as_deref() == Some(roots[1].as_path()));
+    assert!(a.session.state().project().is_none(), "this project tab stays as it was");
+    a.new_view = false;
+    // Open Folder: the recent projects until something is typed, then the folders the typed path names.
+    a.run(CommandId::OpenFolder);
+    assert_eq!(a.choices().len(), 2);
+    a.handle(Event::Paste(format!("{}/len", code.display())));
+    assert_eq!(a.choices().iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["lenz-api/", "lenz-docs/"]);
+    // Tab completes the chosen folder (Down chose the second); Enter opens the typed folder, first in the list.
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(a.modal.as_ref().unwrap().input, format!("{}/", roots[2].display()));
+    assert_eq!(a.choices()[0].detail.as_deref().map(|d| d.starts_with("open · ")), Some(true));
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    settle(&mut a, |a| a.session.state().project().is_some_and(|p| p.root() == roots[2]));
+    // A path that names nothing keeps the prompt open with its reason.
+    a.run(CommandId::OpenFolder);
+    a.handle(Event::Paste(format!("{}/nothing-here", code.display())));
+    assert!(a.choices().is_empty());
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(a.modal.as_ref().and_then(|m| m.error.as_deref()), Some("Enter an existing file or folder path"));
 }

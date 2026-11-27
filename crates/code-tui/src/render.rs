@@ -1832,6 +1832,10 @@ impl App {
                     "Enter / → open · Esc closes"
                 } else if matches!(modal.kind, Prompt::Menu(Some(_))) {
                     "Enter runs · ← back · Esc closes"
+                } else if modal.kind == Prompt::RecentRoots {
+                    code_core::start::RECENT_HINT
+                } else if matches!(modal.kind, Prompt::OpenFolder | Prompt::OpenFolderInProjectTab) {
+                    "Enter open · Tab complete · Ctrl+Enter new project tab · ↑↓ choose · Esc close"
                 } else {
                     "Enter accepts · Esc closes · ↑↓ selects · Tab field"
                 });
@@ -1945,30 +1949,68 @@ fn strip_area(text: Rect, area: Rect) -> Rect {
 }
 
 /// Nothing open: the start screen's commands, then each group of recents under its heading, each a click target.
+/// The welcome screen: a centred column with the name, the tagline, each section's heading over a rule, its rows
+/// (a badge, the label, and a shortcut or location at the right edge; the keys' choice raised) and the tip. Each row is
+/// a click target; rows past the pane's bottom are left out.
 fn draw_start(frame: &mut ratatui::Frame, app: &App, items: &[StartItem], geometry: &mut PaneGeometry, p: &Palette) {
-    let area = geometry.text;
-    let area = Rect::new(area.x.saturating_add(2), area.y.saturating_add(1), area.width.saturating_sub(2), area.height.saturating_sub(1));
-    let (mut offset, mut heading) = (0, None);
+    let pane = geometry.text;
+    let w = pane.width.saturating_sub(4).min(76);
+    if w == 0 || pane.height == 0 { return; }
+    let x = pane.x + (pane.width - w) / 2;
+    let bottom = pane.bottom();
+    let mut y = pane.y.saturating_add(1.min(pane.height.saturating_sub(1)));
+    let buf = frame.buffer_mut();
+    let put = |buf: &mut Buffer, y: u16, x: u16, text: &str, width: u16, st: Style| { if y < bottom && width > 0 { buf.set_stringn(x, y, text, width as usize, st); } };
+    put(buf, y, x, code_core::chrome::APP_NAME, w, style(p.fg, p.bg).add_modifier(Modifier::BOLD));
+    y = y.saturating_add(1);
+    put(buf, y, x, code_core::start::TAGLINE, w, style(p.dim, p.bg));
+    y = y.saturating_add(2);
+    let home = code_core::start::home();
+    let selected = app.session.state().start_selected();
+    let mut section = None;
+    let colors = code_core::start::badge_colors(p);
     for (i, item) in items.iter().enumerate() {
-        let label = match item {
-            StartItem::Command(id) => app.session.key_hint(*id).map_or_else(|| id.label().to_string(), |key| format!("{}  {key}", id.label())),
-            StartItem::RecentFolder(path) | StartItem::RecentFile(path) => path.display().to_string(),
+        let heading = item.heading().unwrap_or("Start");
+        if section != Some(heading) {
+            if section.is_some() { y = y.saturating_add(1); }
+            let rule = "─".repeat((w as usize).saturating_sub(heading.width() + 1));
+            put(buf, y, x, heading, w, style(p.dim, p.bg));
+            put(buf, y, x + heading.width() as u16 + 1, &rule, w.saturating_sub(heading.width() as u16 + 1), style(p.border, p.bg));
+            y = y.saturating_add(1);
+            section = Some(heading);
+        }
+        if y >= bottom { break; }
+        let chosen = i == selected;
+        let bg = if chosen { p.selected_bg } else { p.bg };
+        let row = Rect::new(x, y, w, 1);
+        fill(buf, row, style(p.fg, bg));
+        if chosen { put(buf, y, x, "›", 1, style(p.accent, bg).add_modifier(Modifier::BOLD)); }
+        let label = item.label();
+        let (badge, badge_style) = match item {
+            StartItem::Command(CommandId::OpenFolder) => (" ▸ ".to_string(), style(p.accent, bg)),
+            StartItem::Command(CommandId::NewDocument) => (" + ".to_string(), style(p.accent, bg)),
+            StartItem::Command(_) => (" ≡ ".to_string(), style(p.accent, bg)),
+            _ => (format!("{:^3}", code_core::start::initials(&label)), style(p.bg, colors[code_core::start::tint(&label) % colors.len()]).add_modifier(Modifier::BOLD)),
         };
-        // Each group of recents under a blank row and its heading.
-        if item.heading() != heading {
-            heading = item.heading();
-            if let Some(h) = heading {
-                line(frame.buffer_mut(), row(area, offset + 1), h, style(p.dim, p.bg));
-                offset += 2;
-            }
-        }
-        let at = row(area, offset);
-        let at = Rect { width: at.width.min(label.width() as u16), ..at };
-        line(frame.buffer_mut(), at, &label, style(p.accent, p.bg));
-        if !at.is_empty() {
-            geometry.start.push((i, at));
-        }
-        offset += 1;
+        put(buf, y, x + 2, &badge, 3.min(w.saturating_sub(2)), badge_style);
+        let label_style = if matches!(item, StartItem::Command(_)) { style(p.accent, bg) } else { style(p.fg, bg).add_modifier(Modifier::BOLD) };
+        let label_x = x + 6;
+        put(buf, y, label_x, &label, w.saturating_sub(6), label_style);
+        let detail = item.command().and_then(|id| app.session.key_hint(id)).or_else(|| item.location(home.as_deref())).unwrap_or_default();
+        let room = (w as usize).saturating_sub(6 + label.width() + 3);
+        let detail = if detail.width() <= room { detail } else if room < 2 { String::new() } else {
+            let tail: String = detail.chars().rev().scan(0, |used, c| { *used += c.to_string().width(); (*used < room).then_some(c) }).collect::<Vec<_>>().into_iter().rev().collect();
+            format!("…{tail}")
+        };
+        if !detail.is_empty() { put(buf, y, x + w - 1 - detail.width() as u16, &detail, detail.width() as u16, style(p.dim, bg)); }
+        geometry.start.push((i, row));
+        y = y.saturating_add(1);
+    }
+    y = y.saturating_add(1);
+    for line in wrap(code_core::start::TIP, w as usize, usize::MAX) {
+        if y >= bottom { break; }
+        put(buf, y, x, &line, w, style(p.dim, p.bg));
+        y = y.saturating_add(1);
     }
 }
 

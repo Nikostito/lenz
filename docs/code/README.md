@@ -34,9 +34,18 @@ cargo test --release -p code-core -- --ignored --nocapture open_perf
 cargo test --release -p code-core --test semantics -- --ignored --nocapture   # real rust-analyzer, if installed
 ```
 
-Started with nothing to open (from home or `/`, as a desktop launcher does), a window shows **Open File…**, **Open
-Folder…**, the recent folders and the files recently opened without a folder; a click runs the command or opens the
-folder or file ([terminal](tui.md)).
+Started with nothing to open (from home or `/`, as a desktop launcher does), and in every new project tab, a window
+shows the **welcome screen**: **Open Folder…**, **Open File…** and **New File** with their shortcuts, then **Recent
+projects** and **Recent files**, each with a coloured badge of its initials, its name and where it lives (`~` for
+your home folder, shortened from the left when narrow), and a tip. A click, or ↑/↓ and Enter, runs the command or
+opens the project or file ([terminal](tui.md)).
+
+**Open Recent Folder…** shows **Open Recent Project**: each project's name with its location, filtered as you type (by
+name or location). Enter opens it in this project tab; **Ctrl+Enter** opens it in a new [project tab](#project-tabs).
+In the terminal, **Open Folder…** and **Open Folder in New Project Tab…** list the recent projects until you type, then
+the folders the typed path names (`~/` and relative paths work; hidden folders once a `.` is typed): ↑/↓ choose, Tab
+completes the chosen folder into the path, Enter opens the chosen folder, and Ctrl+Enter opens it in a new project tab.
+The desktop's Open Folder… uses the system's folder chooser.
 
 Keys (the default IntelliJ keymap; see [Keymaps](#keymaps)): Ctrl+O open, Ctrl+R/F5 reload, Ctrl+F4 close, Ctrl+A select
 all, Ctrl+C copy, Shift+arrows/Home/End select, Ctrl+Left/Right move by word (word ends and starts; Shift selects),

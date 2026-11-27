@@ -39,6 +39,7 @@ pub mod recovery;
 pub mod reconcile;
 pub mod project;
 pub mod projects;
+pub mod start;
 pub mod postgres_assistance;
 pub mod search;
 pub mod selection;

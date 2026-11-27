@@ -104,7 +104,7 @@ pub enum Modal {
     /// The theme chooser: "system" then each theme ID, and the highlighted one.
     Themes { ids: Vec<(String, String)>, at: usize },
     /// Recent folders, most recent first.
-    Recent { at: usize },
+    Recent { query: String, at: usize },
     ScratchFiles { files: Vec<PathBuf>, at: usize },
     /// An in-window destination prompt; the originating tab stays captured until acceptance.
     SaveAs { tab: code_core::tabs::TabId, dir: PathBuf, input: String, selected: bool, error: Option<String> },
@@ -252,6 +252,11 @@ pub struct ReaderView {
     pub(crate) sticky_hits: Vec<(Bounds<Pixels>, u8, usize)>,
     /// The start screen's rows as last painted, by their index in the core's start items.
     pub(crate) start_hits: Vec<(Bounds<Pixels>, usize)>,
+    /// The welcome-screen row under the pointer.
+    start_hover: Option<usize>,
+    /// The welcome screen's rows as last laid out.
+    #[cfg(all(test, feature = "test-support"))]
+    start_drawn: Vec<StartRow>,
     /// The focused pane's underlines and strikethroughs as last drawn (row, display range, colour, modifier bits).
     pub(crate) marks_drawn: Vec<(f32, std::ops::Range<usize>, u32, u8)>,
     /// The focused pane's fold marks as last drawn (row, collapsed): text rows below the sticky band, then the sticky
@@ -755,7 +760,7 @@ impl ReaderView {
 
     pub fn new(session: Session, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let (font, notice) = lenz_gpui::pick_mono(cx, fonts().font_family.as_deref());
-        let mut view = Self { session, frame: None, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
+        let mut view = Self { session, frame: None, focus: cx.focus_handle(), font, rows: 0, tree_rows: 0, results_focus: false, log_focus: false, log_scroll: 0, results_scroll: 0, panel_list_y: f32::MAX, panel_list_w: f32::MAX, panel_list_rows: 0, tab_hits: Vec::new(), nav_hover: None, modal_hover: None, preview_hover: None, app_menu_hover: false, commands_hover: false, icon_font: None, logos: Default::default(), logo_px: 0, logo_uploads: Default::default(), about_upload: Default::default(), make_config: std::rc::Rc::new(Config::from_env), text_bounds: None, panes: Vec::new(), layout: Layout::default(), drag: None, tab_drop: None, hover_divider: None, link: None, caret_rest: (None, None), caret_seen: None, caret_shown: true, caret_blink: None, doc_popup: None, completion_doc: None, completion_doc_building: None, completion_doc_drawn: None, completion_drawn: None, signature_drawn: None, code_actions_drawn: None, doc_rest: (None, None), doc_grace: None, height: 600.0, panel_top: f32::MAX, split_at: 0.0, char_w: font_size() * 0.6, width: 800.0, dragging: false, gutter_hover: None, text_hover: false, preview_drag: false, themes_started: false, modal: None, double_shift: Default::default(), navigation_drawn: None, modal_scroll: Default::default(), modal_wheel: Default::default(), wheel: Default::default(), wheel_tab: [None; 2], tab_scroll: Default::default(), tab_scroll_max: Default::default(), tab_scroll_seen: [None; 2], tab_scroll_manual: [false; 2], modal_seen: Default::default(), tree_sel: None, tree_scroll: 0, tree_wheel: 0.0, results_wheel: 0.0, tree_reveal: false, reveal_seen: 0, tree_focus: false, tree_shown: true, launched: Vec::new(), pending_explorer: None, sidebar_w: 0.0, image: [None, None], uploads: Default::default(), markdown: [None, None], reading: None, find_focus: None, find_replace: false, sent_size: [(0, 0); 2], source: source::Cache::default(), source_geometry: [None, None], sticky_hits: Vec::new(), start_hits: Vec::new(), start_hover: None, #[cfg(all(test, feature = "test-support"))] start_drawn: Vec::new(), marks_drawn: Vec::new(), fold_marks_drawn: Vec::new(), crumb_hits: Vec::new(), crumb_focus: None, ann_hover: None, #[cfg(feature = "test-support")] opened_windows: Vec::new(), #[cfg(feature = "test-support")] exe: None, input_state: Default::default(), csv_ui: Default::default(), terminal_ui: Default::default(), #[cfg(test)] painted_annotations: Vec::new(), #[cfg(test)] painted_badges: Vec::new(), #[cfg(feature = "test-support")] painted_markers: Vec::new(), #[cfg(feature = "test-support")] painted_inline: Vec::new(), #[cfg(feature = "test-support")] painted_scrollbars: Vec::new(), #[cfg(feature = "test-support")] painted_problem_bounds: Default::default(), #[cfg(feature = "test-support")] painted_completion_doc: None };
         view.layout = view.session.state().layout();
         cx.on_app_quit(|view, cx| {
             view.remember_explorer();
@@ -1410,7 +1415,7 @@ impl ReaderView {
                     }
                 }
                 InterfaceAction::OpenRecent => {
-                    self.modal = Some(Modal::Recent { at: 0 });
+                    self.modal = Some(Modal::Recent { query: String::new(), at: 0 });
                     cx.notify();
                 }
                 InterfaceAction::FindFile => self.open_navigation(code_core::navigation::Scope::Files, cx),
@@ -1734,6 +1739,13 @@ impl ReaderView {
         }
         if self.terminal_key(ev, window, cx) { return; }
         if self.activity_key(ev, window, cx) { return; }
+        // The welcome screen: Up/Down choose a row, Enter runs it.
+        if !self.tree_focus && !self.results_focus && !self.log_focus && self.find_focus.is_none() && !ctrl && !k.modifiers.alt
+            && matches!(key, "up" | "down" | "enter") && !self.session.state().start_items().is_empty()
+        {
+            if key == "enter" { return self.run_start_item(self.session.state().start_selected(), window, cx); }
+            return self.dispatch(Command::StepStart { forward: key == "down" }, cx);
+        }
         // A focused find box takes its own keys before the keymap (Alt+Enter lists every match there, not Quick Fix);
         // keys it does not use go on.
         if self.find_focus.is_some() && self.crumb_focus.is_none() && !(key == "escape" && self.session.state().documentation().is_some()) && self.find_key(ev, cx) {
@@ -1976,9 +1988,9 @@ impl ReaderView {
             Some(Modal::ScratchFiles { files, at }) => {
                 if let Some(path) = files.get(at) { self.dispatch(Command::OpenScratch(path.clone()), cx); }
             }
-            Some(Modal::Recent { at }) => {
-                if let Some(root) = self.session.state().recent().get(at).cloned() {
-                    self.open_root(root, cx);
+            Some(Modal::Recent { query, at }) => {
+                if let Some(project) = self.recent_projects(&query).into_iter().nth(at) {
+                    self.open_root(project.path, cx);
                 }
             }
             Some(Modal::Siblings { pane, crumb, query, at }) => {
@@ -2034,7 +2046,7 @@ impl ReaderView {
         }
         match &mut self.modal {
             Some(Modal::Navigation { .. }) => return,
-            Some(Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::Recent { at }) => *at = row,
+            Some(Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at }) => *at = row,
             Some(Modal::ScratchFiles { at, .. }) => match row.checked_sub(1) { Some(i) => *at = i, None => return },
             Some(Modal::Themes { at, .. }) => match row.checked_sub(THEME_HEADER_ROWS) {
                 Some(i) => *at = i,
@@ -2044,7 +2056,7 @@ impl ReaderView {
                 Some(i) if i < self.session.keymap().rows().len() => *at = i,
                 _ => return,
             },
-            Some(Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } | Modal::Branches { at, .. }) => match row.checked_sub(FINDER_HEADER_ROWS) {
+            Some(Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } | Modal::Branches { at, .. } | Modal::Recent { at, .. }) => match row.checked_sub(FINDER_HEADER_ROWS) {
                 Some(i) => *at = i,
                 None => return,
             },
@@ -2480,6 +2492,34 @@ impl ReaderView {
             }
             return cx.notify();
         }
+        // Open Recent Project: typing filters, Up/Down move, Enter opens here, Ctrl+Enter in a new project tab.
+        if let Some(Modal::Recent { query, at }) = self.modal.clone() {
+            let found = self.recent_projects(&query);
+            let last = found.len().saturating_sub(1);
+            let at = at.min(last);
+            let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+            let typed = ev.keystroke.key_char.clone().filter(|_| !ctrl);
+            let set = |query: String, at: usize| Some(Modal::Recent { query, at });
+            match key {
+                "escape" => self.modal = None,
+                "up" => self.modal = set(query, at.saturating_sub(1)),
+                "down" => self.modal = set(query, (at + 1).min(last)),
+                "home" => self.modal = set(query, 0),
+                "end" => self.modal = set(query, last),
+                "enter" if ctrl => {
+                    self.modal = None;
+                    if let Some(project) = found.into_iter().nth(at) { cx.emit(ProjectRequest::OpenFolder(project.path)); }
+                }
+                "enter" => {
+                    self.modal = set(query, at);
+                    self.modal_accept(window, cx);
+                }
+                "backspace" => self.modal = set(query.chars().take(query.chars().count().saturating_sub(1)).collect(), 0),
+                _ => if let Some(text) = typed { self.modal = set(query + &text, 0); },
+            }
+            cx.notify();
+            return;
+        }
         // A list of places: typing filters, Up/Down move, Enter goes there, Delete forgets, Escape back to the text.
         if let Some(Modal::Places { list, query, at }) = self.modal.clone() {
             let rows = self.session.state().place_rows(list, &query);
@@ -2684,14 +2724,13 @@ impl ReaderView {
         }
         let len = match &self.modal {
             // Handled above.
-            Some(Modal::StatusDetails { .. } | Modal::Navigation { .. } | Modal::Search { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::Context { .. } | Modal::GoTo { .. } | Modal::Siblings { .. } | Modal::Places { .. } | Modal::Mnemonic | Modal::Branches { .. } | Modal::BranchMenu { .. } | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::NewScratch { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. } | Modal::Keymap { .. }) => 0,
+            Some(Modal::StatusDetails { .. } | Modal::Navigation { .. } | Modal::Search { .. } | Modal::Declarations { .. } | Modal::Root { .. } | Modal::SqlMetadata { .. } | Modal::Context { .. } | Modal::GoTo { .. } | Modal::Siblings { .. } | Modal::Places { .. } | Modal::Recent { .. } | Modal::Mnemonic | Modal::Branches { .. } | Modal::BranchMenu { .. } | Modal::NewBranch { .. } | Modal::Revision { .. } | Modal::Create { .. } | Modal::PasteEntry { .. } | Modal::SaveAs { .. } | Modal::NewScratch { .. } | Modal::RenameTerminal { .. } | Modal::Relocate { .. } | Modal::ConfirmDelete { .. } | Modal::Keymap { .. }) => 0,
             Some(Modal::ServerRuntime { .. }) => self.modal_rows().len().saturating_sub(FINDER_HEADER_ROWS),
             Some(Modal::LanguageServer { .. }) => self.server_rows().len(),
             Some(Modal::Commands { .. }) => CommandId::ALL.len(),
             Some(Modal::AppMenu { .. }) => self.session.menu(None).len(),
             Some(Modal::CommandGroup { group, .. }) => self.session.menu(Some(*group)).len(),
             Some(Modal::Themes { ids, .. }) => ids.len(),
-            Some(Modal::Recent { .. }) => self.session.state().recent().len(),
             Some(Modal::ScratchFiles { files, .. }) => files.len().max(1),
             None => 0,
         };
@@ -2702,7 +2741,7 @@ impl ReaderView {
             _ => Vec::new(),
         }.iter().map(|row| row.target == MenuTarget::Separator).collect();
         let Some(modal) = &mut self.modal else { return };
-        let (Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::ServerRuntime { at, .. } | Modal::Themes { at, .. } | Modal::Recent { at } | Modal::ScratchFiles { at, .. }) = modal else { return };
+        let (Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::ServerRuntime { at, .. } | Modal::Themes { at, .. } | Modal::ScratchFiles { at, .. }) = modal else { return };
         // The finder's results may have changed since the highlight moved.
         *at = (*at).min(len.saturating_sub(1));
         let past = |to: usize, back: bool| match separators.get(to) {
@@ -3803,13 +3842,7 @@ impl ReaderView {
         self.crumb_focus = None;
         // A start screen row: its command, or its recent folder opened.
         if let Some(&(_, i)) = self.start_hits.iter().find(|h| h.0.contains(&ev.position)) {
-            match self.session.state().start_items().into_iter().nth(i) {
-                Some(StartItem::Command(id)) => self.run(id, window, cx),
-                Some(StartItem::RecentFolder(root)) => self.open_root(root, cx),
-                Some(StartItem::RecentFile(path)) => self.open(path, cx),
-                None => {}
-            }
-            return cx.notify();
+            return self.run_start_item(i, window, cx);
         }
         // A sticky line: its pane gets the keys and the caret goes to the line (Back returns).
         if let Some(&(_, pane, line)) = self.sticky_hits.iter().find(|h| h.0.contains(&ev.position) && self.session.state().presentation_shown(h.1).is_some_and(|tab| self.current_source_geometry(tab))) {
@@ -4173,7 +4206,29 @@ impl ReaderView {
         }
     }
 
+    /// The welcome screen's rows as last laid out (the first pane's), for tests.
+    #[cfg(all(test, feature = "test-support"))]
+    fn start_rows(&self) -> Vec<StartRow> { self.start_drawn.clone() }
+
+    /// The recent projects Open Recent Project lists for `query`.
+    fn recent_projects(&self, query: &str) -> Vec<code_core::start::RecentProject> {
+        code_core::start::recent_projects(self.session.state().recent(), query, code_core::start::home().as_deref())
+    }
+
+    /// Run welcome-screen row `i`: its command, or its recent project or file opened.
+    fn run_start_item(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match self.session.state().start_items().into_iter().nth(i) {
+            Some(StartItem::Command(id)) => self.run(id, window, cx),
+            Some(StartItem::RecentFolder(root)) => self.open_root(root, cx),
+            Some(StartItem::RecentFile(path)) => self.open(path, cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let start_hover = if self.modal.is_none() { self.start_hits.iter().find(|h| h.0.contains(&ev.position)).map(|h| h.1) } else { None };
+        if start_hover != self.start_hover { self.start_hover = start_hover; cx.notify(); }
         if self.modal.is_none() && self.input_state.capture.is_some() { self.link = None; self.doc_rest = (None, None); return; }
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
         let over = self.annotation_at(ev.position);
@@ -5232,6 +5287,8 @@ impl ReaderView {
                 let group = match m { Modal::CommandGroup { group, .. } => Some(*group), _ => None };
                 self.session.menu(group).into_iter().enumerate().filter_map(|(row, r)| match r.target { MenuTarget::Run(id) => Some((row, id)), _ => None }).collect()
             }
+            // Open Recent Project: each project's location, where a menu shows a shortcut.
+            Some(Modal::Recent { query, .. }) => return self.recent_projects(query).into_iter().enumerate().map(|(i, r)| (i + FINDER_HEADER_ROWS, r.location)).collect(),
             _ => Vec::new(),
         };
         ids.into_iter().filter_map(|(row, id)| self.key_hint(id).map(|key| (row, key))).collect()
@@ -5326,6 +5383,20 @@ impl ReaderView {
             let bounds = Bounds { origin: gpui::point(px((self.width - mw) / 2.0), px((self.height - h) / 2.0)), size: gpui::size(px(mw), px(h)) };
             return Some(ModalLayout { bounds, lines, first, visible, at, footer, heading: Some(heading), query: Some(query.clone()), body_top, shortcuts: Vec::new() });
         }
+        if let Some(Modal::Recent { query, .. }) = &self.modal {
+            let footer = wrap(code_core::start::RECENT_HINT, self.columns(mw - 24.0));
+            lines.retain(|(row, ..)| *row >= FINDER_HEADER_ROWS);
+            let body_top = 2.0 * line_h() + 40.0;
+            let cap = (self.height - 16.0).clamp(0.0, 480.0);
+            let visible = (((cap - body_top - (footer.len() as f32 * line_h() + 20.0)).max(0.0) / line_h()).floor() as usize).min(lines.len());
+            let start = lines.iter().position(|(i, _, _)| *i == at).unwrap_or(0);
+            let end = lines.iter().rposition(|(i, _, _)| *i == at).map_or(0, |i| i + 1);
+            let first = self.modal_first(at, start..end, lines.len(), visible);
+            let h = (body_top + (visible + footer.len()) as f32 * line_h() + 20.0).min(cap);
+            let bounds = Bounds { origin: gpui::point(px((self.width - mw) / 2.0), px((self.height - h) / 2.0)), size: gpui::size(px(mw), px(h)) };
+            let shortcuts = self.modal_shortcuts();
+            return Some(ModalLayout { bounds, lines, first, visible, at, footer, heading: Some("Open Recent Project".into()), query: Some(query.clone()), body_top, shortcuts });
+        }
         if matches!(self.modal, Some(Modal::Themes { .. })) {
             let h = (self.height - 16.0).clamp(0.0, 400.0);
             let visible = (((h - 8.0).max(0.0) / line_h()).floor() as usize).min(lines.len());
@@ -5402,7 +5473,13 @@ impl ReaderView {
                 else { rows.extend(files.iter().map(|p| (p.file_name().unwrap_or_default().to_string_lossy().into_owned(), None))); }
                 rows
             },
-            Some(Modal::Recent { .. }) => self.session.state().recent().iter().map(|r| (r.display().to_string(), None)).collect(),
+            Some(Modal::Recent { query, .. }) => {
+                let mut rows = vec![(format!("› {query}"), None), (code_core::start::RECENT_HINT.to_string(), None)];
+                let found = self.recent_projects(query);
+                if found.is_empty() { rows.push((if self.session.state().recent().is_empty() { "No recent projects yet: Open Folder… adds one" } else { "No recent project matches" }.to_string(), Some("No match"))); }
+                rows.extend(found.into_iter().map(|r| (r.name, None)));
+                rows
+            }
             Some(Modal::Keymap { capture, .. }) => {
                 let hint = if *capture {
                     "Press the new shortcut (Esc cancels); its command keeps its menu entry either way".to_string()
@@ -5847,31 +5924,63 @@ impl Render for ReaderView {
                 row.fg.insert(0, (shown.clone(), state.palette().syntax.link));
                 Some((row.y, shown))
             });
-            // Nothing open: the start screen's commands and recent folders, each a click target.
+            // Nothing open: the welcome screen, a centred column. Its commands and recent projects and files are click
+            // targets; the keys' choice is raised, and the pointer's lightly.
             let items = if tab.is_none() && g.pane == 0 { state.start_items() } else { Vec::new() };
-            let (mut start, mut row, mut heading) = (Vec::new(), 0.0, None);
-            for (i, item) in items.iter().enumerate() {
-                let label = match item {
-                    StartItem::Command(id) => self.key_hint(*id).map_or_else(|| id.label().to_string(), |key| format!("{}  {key}", id.label())),
-                    StartItem::RecentFolder(path) | StartItem::RecentFile(path) => path.display().to_string(),
-                };
-                // Each group of recents under a blank row and its heading.
-                if item.heading() != heading {
-                    heading = item.heading();
-                    if let Some(h) = heading {
-                        start.push((row + 1.0, h.to_string(), false));
-                        row += 2.0;
+            let mut start = Vec::new();
+            if !items.is_empty() {
+                let (pw, ph) = (f32::from(g.text.size.width), f32::from(g.text.size.height));
+                let w = (pw - 48.0).clamp(0.0, 680.0);
+                let x = ((pw - w) / 2.0).max(24.0);
+                let mut y = (ph * 0.08).clamp(16.0, 80.0);
+                let row_h = line_h() + 10.0;
+                start.push(StartRow { kind: StartKind::Title, x, y, w, label: code_core::chrome::APP_NAME.into(), detail: String::new() });
+                y += 2.0 * line_h() + 6.0;
+                start.push(StartRow { kind: StartKind::Text, x, y, w, label: code_core::start::TAGLINE.into(), detail: String::new() });
+                y += 2.0 * line_h();
+                let home = code_core::start::home();
+                let selected = state.start_selected();
+                let mut section = None;
+                for (i, item) in items.iter().enumerate() {
+                    let heading = item.heading().unwrap_or("Start");
+                    if section != Some(heading) {
+                        if section.is_some() { y += line_h() * 0.75; }
+                        start.push(StartRow { kind: StartKind::Heading, x, y, w, label: heading.into(), detail: String::new() });
+                        y += line_h() + 6.0;
+                        section = Some(heading);
                     }
+                    let label = item.label();
+                    let detail = item.command().and_then(|id| self.key_hint(id)).or_else(|| item.location(home.as_deref())).unwrap_or_default();
+                    // The location gives way first: shortened from its start so the folder nearest the item stays.
+                    let room = ((w - 64.0 - (lenz_content::wrap::width(&label) as f32 + 3.0) * self.char_w) / self.char_w).floor().max(0.0) as usize;
+                    let detail = if lenz_content::wrap::width(&detail) <= room { detail } else if room < 2 { String::new() } else {
+                        let tail: String = detail.chars().rev().scan(0, |used, c| { *used += lenz_content::wrap::width(&c.to_string()); (*used < room).then_some(c) }).collect::<Vec<_>>().into_iter().rev().collect();
+                        format!("…{tail}")
+                    };
+                    // Only what the pane shows takes clicks: a row past its edge would cover the panel below.
+                    if y + row_h <= ph && w > 0.0 {
+                        let at = gpui::point(g.text.origin.x + px(x), g.text.origin.y + px(y));
+                        start_hits.push((Bounds { origin: at, size: gpui::size(px(w), px(row_h)) }, i));
+                    }
+                    let badge = match item {
+                        StartItem::Command(CommandId::OpenFolder) => "▸".to_string(),
+                        StartItem::Command(CommandId::NewDocument) => "+".to_string(),
+                        StartItem::Command(_) => "≡".to_string(),
+                        StartItem::RecentFolder(_) | StartItem::RecentFile(_) => code_core::start::initials(&label),
+                    };
+                    let tint = match item { StartItem::Command(_) => None, _ => Some(code_core::start::tint(&label)) };
+                    start.push(StartRow { kind: StartKind::Item { selected: i == selected, hover: self.start_hover == Some(i), badge, tint }, x, y, w, label, detail });
+                    y += row_h;
                 }
-                // Only what the pane shows takes clicks: a row past its edge would cover the panel below.
-                let (top, width) = (24.0 + row * line_h(), (lenz_content::wrap::width(&label) as f32 * self.char_w).min(f32::from(g.text.size.width) - 24.0));
-                if top + line_h() <= f32::from(g.text.size.height) && width > 0.0 {
-                    let at = gpui::point(g.text.origin.x + px(24.0), g.text.origin.y + px(top));
-                    start_hits.push((Bounds { origin: at, size: gpui::size(px(width), px(line_h())) }, i));
+                y += line_h();
+                for line in wrap(code_core::start::TIP, ((w / self.char_w).floor() as usize).max(1)) {
+                    if y + line_h() > ph { break; }
+                    start.push(StartRow { kind: StartKind::Text, x, y, w, label: line, detail: String::new() });
+                    y += line_h();
                 }
-                start.push((row, label, true));
-                row += 1.0;
             }
+            #[cfg(all(test, feature = "test-support"))]
+            if g.pane == 0 { self.start_drawn = start.clone(); }
             let hint = match tab {
                 Some(t) if state.presentation_view(t.id()).is_some() || state.loading().is_some() => None,
                 None if !start.is_empty() => None,
@@ -6361,9 +6470,7 @@ impl Render for ReaderView {
                                 if let Some(hint) = f.hint {
                                     lenz_gpui::text(window, cx, m, tx + 24.0, ty + 24.0, hint, palette.dim);
                                 }
-                                for (row, label, target) in &f.start {
-                                    lenz_gpui::text(window, cx, m, tx + 24.0, ty + 24.0 + row * m.line_h, label, if *target { palette.accent } else { palette.dim });
-                                }
+                                paint_start(window, cx, m, &palette, tx, ty, char_w, &f.start);
                                 for (i, row) in f.rows.iter().enumerate() {
                                     paint_source_row(window, cx, m, &palette, text, tx, tw, f.hscroll, row, f.relative_caret, f.row_parts.get(i).map_or(&[], Vec::as_slice));
                                 }
@@ -6538,7 +6645,7 @@ impl Render for ReaderView {
                                         lenz_gpui::fill(window, mx + 12.0, fy, fw, line_h() + 8.0, palette.accent);
                                         lenz_gpui::fill(window, mx + 13.0, fy + 1.0, (fw - 2.0).max(0.0), line_h() + 6.0, palette.bg);
                                         let shown = navigation::tail(query, ((fw - 20.0) / char_w).max(0.0) as usize);
-                                        lenz_gpui::text(window, cx, m, mx + 20.0, fy + 4.0, if query.is_empty() { "Filter branches…" } else { &shown }, if query.is_empty() { palette.dim } else { palette.fg });
+                                        lenz_gpui::text(window, cx, m, mx + 20.0, fy + 4.0, if query.is_empty() { if l.heading.as_deref() == Some("Open Recent Project") { "Filter projects…" } else { "Filter branches…" } } else { &shown }, if query.is_empty() { palette.dim } else { palette.fg });
                                         lenz_gpui::fill(window, mx + 20.0 + lenz_content::wrap::width(&shown) as f32 * char_w, fy + 4.0, 2.0, line_h(), palette.caret);
                                     }
                                 }
@@ -6783,8 +6890,8 @@ struct PaneFrame {
     pending: bool,
     unshowable: Option<String>,
     hint: Option<&'static str>,
-    /// The start screen's rows: row, text, and whether it is a click target (not a heading).
-    start: Vec<(f32, String, bool)>,
+    /// The welcome screen's rows, in pixels from the text area's corner.
+    start: Vec<StartRow>,
     /// Blame annotations: row, label, age shade (`None`: not committed), of the hovered commit.
     ann: Vec<(f32, String, Option<f32>, bool)>,
     /// The scrollbar's thumb (start, size) and each marked track cell with its mark's kind.
@@ -6803,6 +6910,69 @@ fn native_x(window: &Window, metrics: Metrics<'_>, row: &TextRow, parts: &[(std:
     debug_assert!(text.len() <= 6144);
     let run = gpui::TextRun { len: text.len(), font: metrics.font.clone(), color: gpui::Hsla::default(), background_color: None, underline: None, strikethrough: None };
     origin + f32::from(window.text_system().shape_line(text.to_owned().into(), px(metrics.font_size), &[run], None).x_for_index(at - range.start))
+}
+
+/// What a welcome-screen row is.
+#[derive(Clone, Debug, PartialEq)]
+enum StartKind {
+    Title,
+    Text,
+    Heading,
+    /// A command or recent place: its badge (a glyph, or the name's initials on `tint`), raised when chosen.
+    Item { selected: bool, hover: bool, badge: String, tint: Option<usize> },
+}
+
+/// A welcome-screen row: where it sits (pixels from the text area's corner), its text and its quieter detail (a
+/// shortcut or a location, right-aligned).
+#[derive(Clone, Debug, PartialEq)]
+struct StartRow { kind: StartKind, x: f32, y: f32, w: f32, label: String, detail: String }
+
+/// Paint the welcome screen: the name large, the tagline and tip dim, each section's heading over a rule, and each
+/// row with its badge, its label and its detail at the right edge.
+#[allow(clippy::too_many_arguments)]
+fn paint_start(window: &mut Window, cx: &mut App, m: Metrics<'_>, p: &lenz_content::theme::Palette, tx: f32, ty: f32, char_w: f32, rows: &[StartRow]) {
+    for row in rows {
+        let (x, y) = (tx + row.x, ty + row.y);
+        match &row.kind {
+            StartKind::Title => {
+                let bold = gpui::Font { weight: gpui::FontWeight::BOLD, ..m.font.clone() };
+                let big = Metrics { font: &bold, font_size: m.font_size * 1.9, line_h: m.line_h * 1.9, num_w: m.num_w };
+                lenz_gpui::text(window, cx, big, x, y, &row.label, p.fg);
+            }
+            StartKind::Text => lenz_gpui::text(window, cx, m, x, y, &row.label, p.dim),
+            StartKind::Heading => {
+                lenz_gpui::text(window, cx, m, x, y, &row.label, p.dim);
+                let after = (lenz_content::wrap::width(&row.label) as f32 + 1.0) * char_w;
+                lenz_gpui::fill(window, x + after, y + m.line_h / 2.0, (row.w - after).max(0.0), 1.0, p.border);
+            }
+            StartKind::Item { selected, hover, badge, tint } => {
+                let h = m.line_h + 10.0;
+                if *selected || *hover {
+                    let bg = if *selected { p.selected_bg } else { p.header_bg };
+                    window.paint_quad(gpui::fill(Bounds { origin: gpui::point(px(x), px(y)), size: gpui::size(px(row.w), px(h)) }, rgb(bg)).corner_radii(px(6.0)));
+                }
+                // The badge: the name's initials on a colour of its own, or a command's glyph in an outline.
+                let (bx, by, bs) = (x + 8.0, y + (h - 22.0) / 2.0, 22.0);
+                let badge_bounds = Bounds { origin: gpui::point(px(bx), px(by)), size: gpui::size(px(bs), px(bs)) };
+                let fg = match tint {
+                    Some(k) => {
+                        let colors = code_core::start::badge_colors(p);
+                        window.paint_quad(gpui::fill(badge_bounds, rgb(colors[k % colors.len()])).corner_radii(px(5.0)));
+                        p.bg
+                    }
+                    None => {
+                        window.paint_quad(gpui::outline(badge_bounds, rgb(p.accent), gpui::BorderStyle::Solid).corner_radii(px(5.0)));
+                        p.accent
+                    }
+                };
+                let bw = lenz_content::wrap::width(badge) as f32 * char_w;
+                lenz_gpui::text(window, cx, m, bx + (bs - bw) / 2.0, y + (h - m.line_h) / 2.0, badge, fg);
+                lenz_gpui::text(window, cx, m, x + 40.0, y + (h - m.line_h) / 2.0, &row.label, if tint.is_some() { p.fg } else { p.accent });
+                let dw = lenz_content::wrap::width(&row.detail) as f32 * char_w;
+                lenz_gpui::text(window, cx, m, x + row.w - 12.0 - dw, y + (h - m.line_h) / 2.0, &row.detail, p.dim);
+            }
+        }
+    }
 }
 
 fn display_number(number: u32, relative_caret: Option<usize>) -> u32 {
@@ -7017,7 +7187,8 @@ impl Modal {
     pub fn at(&self) -> usize {
         match self {
             Modal::Navigation { at } => *at,
-            Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } | Modal::Recent { at } => *at,
+            Modal::Commands { at } | Modal::AppMenu { at } | Modal::CommandGroup { at, .. } | Modal::LanguageServer { at } => *at,
+            Modal::Recent { at, .. } => *at + FINDER_HEADER_ROWS,
             Modal::ScratchFiles { at, .. } => *at + 1,
             Modal::Themes { at, .. } => *at + THEME_HEADER_ROWS,
             Modal::ServerRuntime { at, .. } | Modal::Siblings { at, .. } | Modal::Places { at, .. } => *at + FINDER_HEADER_ROWS,

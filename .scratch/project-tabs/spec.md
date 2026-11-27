@@ -35,6 +35,18 @@ Several projects in one window (GUI) or terminal (TUI), each a **Project Tab** (
   alone). Format on Save now formats XML files too.
 - A plain-text document whose text starts like JSON or XML formats as that on request; Save never guesses.
 
+## Welcome screen and opening projects
+
+- `code_core::start` owns the shared presentation: names and `~` locations, badge initials and colour choice, the
+  welcome copy, the filtered recent-project list and the Open Folder prompt's folder suggestions (one bounded
+  directory read per typed input, cached by the terminal adapter). The start screen's keyboard selection is core
+  state (`Command::StepStart`, `State::start_selected`).
+- GUI: a centred welcome column (title, tagline, sections with rules, badged rows with right-aligned shortcut or
+  location, hover and keyboard highlight, tip); Open Recent Project as a finder (heading, filter, location column,
+  hint footer, Ctrl+Enter for a new project tab). Open Folder keeps the system folder chooser.
+- TUI: the same welcome column in cells; the Recent prompt filtered with locations; Open Folder prompts list recent
+  projects, then live folder suggestions with Tab completion and Ctrl+Enter.
+
 ## Verification (2026-11-27, Linux container, no display)
 
 - Core: `projects` unit tests, catalog/availability and title tests, XML formatter tests, Format Selection /

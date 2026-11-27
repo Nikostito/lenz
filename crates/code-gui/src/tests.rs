@@ -840,23 +840,30 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents(cx: &mut TestAppC
     v.simulate_resize(size(px(900.0), px(600.0)));
     draw(&mut v);
     let hits = f.view.read_with(&v, |v, _| v.start_hits.clone());
-    assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [0, 1, 2, 3], "Open File…, Open Folder…, the recent folder and file");
+    assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [0, 1, 2, 3, 4], "Open Folder…, Open File…, New File, the recent project and file");
     assert!(hits.windows(2).all(|w| w[0].0.origin.y < w[1].0.origin.y), "one row each, top to bottom");
-    // Open File… and Open Folder… ask the platform for a file and for a folder.
+    // The welcome screen as painted: the name, the rows' labels and where the recent places live.
+    let rows = f.view.read_with(&v, |v, _| v.start_rows());
+    for shown in ["Lenz Code", "Open Folder…", "Open File…", "New File", "Recent projects", "proj", "Recent files", "lone.txt"] {
+        assert!(rows.iter().any(|r| r.label == shown), "{shown} on the welcome screen: {rows:?}");
+    }
+    assert!(rows.iter().any(|r| r.label == "Open File…" && r.detail == "Ctrl+O"), "a command shows its shortcut");
+    assert!(rows.iter().any(|r| r.label == "proj" && f.dir.path().join("one").ends_with(r.detail.trim_start_matches('…'))), "a project shows where it lives: {rows:?}");
+    // Open Folder… and Open File… ask the platform for a folder and for a file.
     v.simulate_click(hits[0].0.center(), Modifiers::default());
-    assert!(cx.did_prompt_for_paths());
-    cx.simulate_path_prompt_response(|options| {
-        assert!(options.files && !options.directories);
-        None
-    });
-    v.simulate_click(hits[1].0.center(), Modifiers::default());
     assert!(cx.did_prompt_for_paths());
     cx.simulate_path_prompt_response(|options| {
         assert!(options.directories && !options.files);
         None
     });
+    v.simulate_click(hits[1].0.center(), Modifiers::default());
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.files && !options.directories);
+        None
+    });
     // A recent file opens; closing it returns to the start screen.
-    v.simulate_click(hits[3].0.center(), Modifiers::default());
+    v.simulate_click(hits[4].0.center(), Modifiers::default());
     drop(v);
     settle(cx, &f, active_is("lone.txt"));
     let mut v = visual(cx, &f);
@@ -864,9 +871,9 @@ fn an_empty_window_starts_on_open_file_open_folder_and_recents(cx: &mut TestAppC
     assert!(f.view.read_with(&v, |v, _| v.start_hits.is_empty()));
     v.simulate_keystrokes("ctrl-f4");
     draw(&mut v);
-    assert_eq!(f.view.read_with(&v, |v, _| v.start_hits.len()), 4);
+    assert_eq!(f.view.read_with(&v, |v, _| v.start_hits.len()), 5);
     // A recent folder opens, and the start screen gives way to it.
-    v.simulate_click(hits[2].0.center(), Modifiers::default());
+    v.simulate_click(hits[3].0.center(), Modifiers::default());
     settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root() == one));
     draw(&mut v);
     assert!(f.view.read_with(&v, |v, _| v.start_hits.is_empty()));
@@ -1711,8 +1718,10 @@ fn folders_open_through_the_command_menu_recent_list_and_narrow_windows(cx: &mut
     let recent_at = menu.iter().position(|(text,_)| text == CommandId::OpenRecent.label()).unwrap();
     for _ in 0..recent_at { v.simulate_keystrokes("down"); }
     v.simulate_keystrokes("enter");
-    let recent = f.view.read_with(&v, |v, _| v.modal_rows());
-    assert_eq!(recent.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), [root.display().to_string(), missing.display().to_string()]);
+    let (recent, locations) = f.view.read_with(&v, |v, _| (v.modal_rows(), v.modal_shortcuts()));
+    let name = |p: &std::path::Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(recent[FINDER_HEADER_ROWS..].iter().map(|r| r.0.clone()).collect::<Vec<_>>(), [name(&root), name(&missing)]);
+    assert_eq!(locations.len(), 2, "each with where it lives");
     v.simulate_keystrokes("escape");
     choose_menu_command(&mut v,&f,CommandId::FindFile);
     assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::Navigation { .. })), "Find File from the menu");
@@ -4904,10 +4913,13 @@ fn clicks_pick_rows_in_the_command_menu_recent_folders_and_theme_chooser(cx: &mu
     v.simulate_keystrokes("f10");
     let recent = CommandId::ALL.iter().position(|&c| c == CommandId::OpenRecent).unwrap();
     click_modal_row(&f, &mut v, recent);
-    assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::Recent { at: 0 })));
-    // Recent folders, newest first: a click on the older one opens it.
-    assert!(f.view.read_with(&v, |v, _| v.modal_rows()[1].0.ends_with("one/proj")));
-    click_modal_row(&f, &mut v, 1);
+    assert!(matches!(f.view.read_with(&v, |v, _| v.modal.clone()), Some(Modal::Recent { at: 0, .. })));
+    // Recent projects, newest first, after the filter and hint rows: each name with where it lives; a click on the
+    // older one opens it.
+    let (rows, locations) = f.view.read_with(&v, |v, _| (v.modal_rows(), v.modal_shortcuts()));
+    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["proj", "proj"]);
+    assert!(locations.iter().any(|(row, at)| *row == FINDER_HEADER_ROWS + 1 && at.ends_with("one")), "{locations:?}");
+    click_modal_row(&f, &mut v, FINDER_HEADER_ROWS + 1);
     assert!(f.view.read_with(&v, |v, _| v.modal.is_none()));
     drop(v);
     settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root().ends_with("one/proj")));
@@ -8146,4 +8158,54 @@ fn side_by_side_clicks_reach_the_right_projects_controls_and_unsaved_projects_as
     assert_eq!(host.update(cx, |h, _, _| h.views()[0].clone()).unwrap(), second, "the other project remains");
     assert_eq!(std::fs::read(f.dir.path().join("alpha.txt")).unwrap(), b"saved\n");
     assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+}
+
+/// The welcome screen through the keys, and Open Recent Project's filter and Ctrl+Enter (a new project tab).
+#[gpui::test]
+fn the_welcome_screen_and_open_recent_project_work_through_the_keys(cx: &mut TestAppContext) {
+    let f = fixture_setup(cx, None, &[], true);
+    let one = project(&f.dir.path().join("alpha"), &["a.rs"]);
+    let two = project(&f.dir.path().join("billing"), &["b.rs"]);
+    // Remember both as recent projects, then come back to the welcome screen with a fresh project tab.
+    for root in [&one, &two] {
+        f.view.update(cx, |v, cx| v.open_root(root.clone(), cx));
+        settle(cx, &f, |v| scanned(v) && v.session().state().project().is_some_and(|p| p.root() == root.as_path()));
+    }
+    let host = f.window.downcast::<ProjectsWindow>().unwrap();
+    let mut v = visual(cx, &f);
+    v.simulate_resize(size(px(1000.0), px(700.0)));
+    host.update(&mut v, |h, window, cx| h.open(None, window, cx)).unwrap();
+    draw(&mut v);
+    let fresh = host.update(&mut v, |h, _, _| h.views()[1].clone()).unwrap();
+    // The welcome screen: commands, then recent projects with their initials; each row a click target.
+    let items = fresh.read_with(&v, |view, _| view.session().state().start_items());
+    assert_eq!(items[..3], [StartItem::Command(CommandId::OpenFolder), StartItem::Command(CommandId::Open), StartItem::Command(CommandId::NewDocument)]);
+    assert_eq!(fresh.read_with(&v, |view, _| view.start_hits.len()), items.len());
+    // Down three times reaches the first recent project; Enter opens it in this tab.
+    v.simulate_keystrokes("down down down");
+    assert_eq!(fresh.read_with(&v, |view, _| view.session().state().start_selected()), 3);
+    v.simulate_keystrokes("enter");
+    for _ in 0..500 { cx.run_until_parked(); fresh.update(cx, |view, cx| view.poll(cx)); if fresh.read_with(cx, |view, _| view.session().state().project().is_some()) { break; } std::thread::sleep(std::time::Duration::from_millis(5)); }
+    assert_eq!(fresh.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(two.clone()), "the newest recent project");
+    // Open Recent Project: typing filters by name or location; Ctrl+Enter opens the choice in a new project tab.
+    let mut v = VisualTestContext::from_window(f.window, cx);
+    let focus = fresh.read_with(&v, |view, _| view.focus_handle());
+    v.update(|w, cx| focus.focus(w, cx));
+    v.update(|window, cx| fresh.update(cx, |view, cx| view.run(CommandId::OpenRecent, window, cx)));
+    assert!(matches!(fresh.read_with(&v, |view, _| view.modal.clone()), Some(Modal::Recent { .. })));
+    v.simulate_input("alp");
+    let rows = fresh.read_with(&v, |view, _| view.modal_rows());
+    assert_eq!(rows[0].0, "› alp");
+    // The fixture's projects are both named `proj`: "alp" matches the one living under alpha by its location.
+    assert_eq!(rows[FINDER_HEADER_ROWS..].iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["proj"]);
+    assert!(fresh.read_with(&v, |view, _| view.modal_shortcuts()).iter().any(|(_, at)| at.ends_with("alpha")));
+    draw(&mut v);
+    v.simulate_keystrokes("ctrl-enter");
+    cx.run_until_parked();
+    let (count, active) = host.update(cx, |h, _, _| (h.views().len(), h.projects().active())).unwrap();
+    assert_eq!((count, active), (3, 2), "a new project tab, with the keys");
+    let third = host.update(cx, |h, _, _| h.views()[2].clone()).unwrap();
+    for _ in 0..500 { cx.run_until_parked(); third.update(cx, |view, cx| view.poll(cx)); if third.read_with(cx, |view, _| view.session().state().project().is_some()) { break; } std::thread::sleep(std::time::Duration::from_millis(5)); }
+    assert_eq!(third.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(one));
+    assert_eq!(fresh.read_with(cx, |view, _| view.session().state().project().map(|p| p.root().to_owned())), Some(two), "the other tab keeps its project");
 }
